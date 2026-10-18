@@ -7,8 +7,6 @@ One small Rust binary, any OpenAI-compatible model, your data stays on your serv
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/blueswansconsulting/open-rust-chatbot/badge)](https://scorecard.dev/viewer/?uri=github.com/blueswansconsulting/open-rust-chatbot)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Live demo:** [electriciansranked.com](https://electriciansranked.com) (bottom-right bubble)
-
 ## Why
 
 - **Your model, your data.** Works with OpenAI, OpenRouter, Groq, or a local Ollama. No per-seat SaaS fees, no chat logs on someone else's servers.
