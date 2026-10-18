@@ -394,3 +394,58 @@ fn rate_limit_wait_is_human_readable() {
     assert_eq!(open_rust_chatbot::human_wait(45_000), "45 seconds");
     assert_eq!(open_rust_chatbot::human_wait(60_000), "about 1 minute");
 }
+
+#[tokio::test]
+async fn openclaw_bridge_blip_is_retried_once_and_policy_errors_are_not() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let bridge = axum::Router::new().route(
+        "/bridge",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let counter = counter.clone();
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let msg = body["message"].as_str().unwrap_or_default().to_owned();
+                if msg.contains("forbidden") {
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(json!({"error": "no"})),
+                    );
+                }
+                if n == 0 {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": "blip"})),
+                    );
+                }
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(json!({"text": "Recovered."})),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_url = format!("http://{}/bridge", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
+
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "openclaw"),
+        ("OPENCLAW_BRIDGE_URL", &bridge_url),
+        ("OPENCLAW_BRIDGE_TOKEN", "t"),
+    ])
+    .await;
+    let mut ws = connect(&addr, ORIGIN).await.unwrap();
+    ws.send(Message::Text("hello".into())).await.unwrap();
+    assert_eq!(text_of(&until_done(&mut ws).await), "Recovered.");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    ws.send(Message::Text("forbidden please".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut ws).await;
+    assert_eq!(frames[0]["type"], "error");
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "403 is not retried");
+}
