@@ -263,8 +263,11 @@ impl Config {
         if limits.max_connections_per_ip == 0
             || limits.max_connections_total == 0
             || limits.max_messages_per_window == 0
+            || limits.idle_timeout.is_zero()
+            || limits.max_session.is_zero()
+            || limits.rate_window.is_zero()
         {
-            errors.push("connection and message limits must be greater than zero".into());
+            errors.push("connection, message and timeout limits must be greater than zero".into());
         }
 
         let config = Config {
@@ -337,6 +340,17 @@ mod tests {
         assert!(
             !is_local("http://localhost.evil.com") && !is_local("http://127.0.0.1.evil.com:80")
         );
+    }
+
+    #[test]
+    fn zero_timeouts_are_rejected() {
+        let err = Config::from_pairs(&[
+            ("DEV_MODE", "true"),
+            ("MOCK_LLM", "true"),
+            ("IDLE_TIMEOUT_SECONDS", "0"),
+        ])
+        .unwrap_err();
+        assert!(err.0[0].contains("greater than zero"));
     }
 
     #[test]
