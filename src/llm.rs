@@ -225,6 +225,83 @@ pub(crate) fn openclaw_prompt(messages: &[Message]) -> String {
     )
 }
 
+/// Maps chat history onto Responses API input: the system prompt becomes `instructions`
+/// (system-role items are rejected), tool calls and results become function items.
+pub(crate) fn responses_input(messages: &[Message]) -> (String, Vec<Value>) {
+    let mut instructions = String::new();
+    let mut input = Vec::new();
+    for m in messages {
+        match m.role {
+            Role::System => instructions.push_str(&m.content),
+            Role::User => input.push(json!({ "role": "user", "content": m.content })),
+            Role::Assistant => {
+                if !m.content.is_empty() {
+                    input.push(json!({ "role": "assistant", "content": m.content }));
+                }
+                for c in &m.tool_calls {
+                    input.push(json!({ "type": "function_call", "call_id": c.id, "name": c.name, "arguments": Value::Object(c.arguments.clone()).to_string() }));
+                }
+            }
+            Role::Tool => input.push(json!({ "type": "function_call_output", "call_id": m.tool_call_id.clone().unwrap_or_default(), "output": m.content })),
+        }
+    }
+    (instructions, input)
+}
+
+/// Parses a Responses API SSE stream. Text arrives as `response.output_text.delta`; function
+/// calls as completed `function_call` output items. A stream that ends without
+/// `response.completed` is a failure (usage-limit errors can arrive mid-stream).
+pub(crate) fn responses_stream(response: reqwest::Response) -> EventStream {
+    Box::pin(async_stream::stream! {
+        let mut bytes = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        loop {
+            let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next()).await {
+                Ok(Some(Ok(c))) => c,
+                Ok(Some(Err(e))) => { yield Err(format!("stream read failed: {}", e.without_url())); return; }
+                Ok(None) => { yield Err("stream ended before response.completed".into()); return; }
+                Err(_) => { yield Err("stream stalled".into()); return; }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let Some(data) = line.trim().strip_prefix("data:") else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(data.trim()) else { continue };
+                match v["type"].as_str().unwrap_or_default() {
+                    "response.output_text.delta" => {
+                        if let Some(delta) = v["delta"].as_str().filter(|d| !d.is_empty()) {
+                            yield Ok(LlmEvent::Token(delta.to_owned()));
+                        }
+                    }
+                    "response.output_item.done" if v["item"]["type"] == "function_call" => {
+                        let item = &v["item"];
+                        let arguments = item["arguments"].as_str()
+                            .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                            .and_then(|a| a.as_object().cloned())
+                            .unwrap_or_default();
+                        yield Ok(LlmEvent::ToolCall(ToolCall {
+                            id: item["call_id"].as_str().unwrap_or_default().to_owned(),
+                            name: item["name"].as_str().unwrap_or_default().to_owned(),
+                            arguments,
+                        }));
+                    }
+                    "response.completed" => return,
+                    "response.failed" | "response.incomplete" | "error" => {
+                        let code = v["response"]["error"]["code"].as_str()
+                            .or_else(|| v["response"]["incomplete_details"]["reason"].as_str())
+                            .or_else(|| v["code"].as_str())
+                            .unwrap_or("unknown");
+                        yield Err(format!("responses error: {code}"));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+}
+
 fn retryable(status: reqwest::StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
 }
@@ -236,6 +313,50 @@ impl Llm {
 
     pub fn supports_tools(&self) -> bool {
         self.config.supports_tools()
+    }
+
+    /// Responses API call billed to the signed-in visitor's ChatGPT plan. No retries: usage is
+    /// the visitor's, and the docs ask clients not to retry plan-usage errors blindly.
+    async fn responses(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        model: &str,
+        token: &str,
+    ) -> Result<EventStream, String> {
+        let (instructions, input) = responses_input(messages);
+        let mut body = json!({ "model": model, "instructions": instructions, "input": input, "store": false, "stream": true });
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(
+                tools
+                    .iter()
+                    .map(|t| json!({ "type": "function", "name": t.name, "description": t.description, "parameters": t.parameters }))
+                    .collect(),
+            );
+        }
+        let request = self
+            .http
+            .post("https://api.openai.com/v1/responses")
+            .bearer_auth(token)
+            .json(&body);
+        let response = tokio::time::timeout(HEADERS_TIMEOUT, request.send())
+            .await
+            .map_err(|_| "timed out waiting for the model".to_owned())?
+            .map_err(|e| format!("request failed: {}", e.without_url()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = tokio::time::timeout(Duration::from_secs(10), response.text())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            return Err(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                text.chars().take(300).collect::<String>()
+            ));
+        }
+        Ok(responses_stream(response))
     }
 
     async fn openclaw(
@@ -291,9 +412,14 @@ impl Llm {
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
+        visitor_token: Option<&str>,
     ) -> Result<EventStream, String> {
         let (base_url, api_key, model, max_tokens) = match &self.config {
             LlmConfig::Mock { token_delay } => return Ok(mock_stream(messages, *token_delay)),
+            LlmConfig::ChatGpt { model, .. } => {
+                let token = visitor_token.ok_or("visitor is not signed in")?;
+                return self.responses(messages, tools, model, token).await;
+            }
             LlmConfig::OpenClaw {
                 bridge_url,
                 token,
@@ -437,6 +563,61 @@ mod tests {
         assert_eq!(call.arguments["query"], "hours");
     }
 
+    #[test]
+    fn responses_input_moves_system_to_instructions_and_maps_tools() {
+        let mut args = Map::new();
+        args.insert("query".into(), json!("hours"));
+        let mut call = Message::new(Role::Assistant, "");
+        call.tool_calls.push(ToolCall {
+            id: "call_1".into(),
+            name: "search_knowledge_base".into(),
+            arguments: args,
+        });
+        let mut result = Message::new(Role::Tool, "{\"found\":true}");
+        result.tool_call_id = Some("call_1".into());
+        let (instructions, input) = responses_input(&[
+            Message::new(Role::System, "SYS"),
+            Message::new(Role::User, "hi"),
+            call,
+            result,
+        ]);
+        assert_eq!(instructions, "SYS");
+        assert_eq!(input[0], json!({"role": "user", "content": "hi"}));
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["arguments"], "{\"query\":\"hours\"}");
+        assert_eq!(
+            input[2],
+            json!({"type": "function_call_output", "call_id": "call_1", "output": "{\"found\":true}"})
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_yields_text_tool_calls_and_requires_completion() {
+        let ok = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"search_knowledge_base\",\"arguments\":\"{\\\"query\\\":\\\"x\\\"}\"}}\n\ndata: {\"type\":\"response.completed\"}\n\n";
+        let events: Vec<_> = responses_stream(sse(ok)).collect().await;
+        assert_eq!(events[0], Ok(LlmEvent::Token("Hi".into())));
+        assert!(
+            matches!(&events[1], Ok(LlmEvent::ToolCall(c)) if c.id == "call_1" && c.arguments["query"] == "x")
+        );
+        assert_eq!(events.len(), 2);
+
+        let limit = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"subscription_sharing_usage_limit_exceeded\"}}}\n\n";
+        let events: Vec<_> = responses_stream(sse(limit)).collect().await;
+        assert_eq!(
+            events,
+            vec![Err(
+                "responses error: subscription_sharing_usage_limit_exceeded".into()
+            )]
+        );
+
+        let truncated: Vec<_> = responses_stream(sse(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n",
+        ))
+        .collect()
+        .await;
+        assert!(truncated.last().unwrap().is_err());
+    }
+
     #[tokio::test]
     async fn sse_error_event_is_an_error_not_an_empty_reply() {
         let events: Vec<_> = sse_stream(sse("data: {\"error\":{\"message\":\"overloaded\"}}\n\n"))
@@ -454,14 +635,18 @@ mod tests {
             reqwest::Client::new(),
         );
         let q: Vec<_> = llm
-            .stream(&[Message::new(Role::User, "When are you open?")], &[])
+            .stream(&[Message::new(Role::User, "When are you open?")], &[], None)
             .await
             .unwrap()
             .collect()
             .await;
         assert!(matches!(&q[0], Ok(LlmEvent::ToolCall(c)) if c.name == "search_knowledge_base"));
         let e: Vec<_> = llm
-            .stream(&[Message::new(Role::User, "I'm sam@example.com")], &[])
+            .stream(
+                &[Message::new(Role::User, "I'm sam@example.com")],
+                &[],
+                None,
+            )
             .await
             .unwrap()
             .collect()

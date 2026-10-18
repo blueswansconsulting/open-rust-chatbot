@@ -47,6 +47,12 @@ pub enum LlmConfig {
         purpose: String,
         timeout_seconds: u64,
     },
+    /// Experimental: each visitor signs in with ChatGPT and replies use their own plan.
+    /// Loopback-only (OpenAI requires a 127.0.0.1 redirect), so it suits local use.
+    ChatGpt {
+        model: String,
+        data_dir: String,
+    },
 }
 
 impl LlmConfig {
@@ -172,6 +178,19 @@ impl Config {
             }
             LlmConfig::Mock {
                 token_delay: Duration::from_millis(env.num("MOCK_TOKEN_DELAY_MS", 20, &mut errors)),
+            }
+        } else if env.get("LLM_PROVIDER").as_deref() == Some("chatgpt") {
+            let host = env.get("HOST").unwrap_or_else(|| "127.0.0.1".into());
+            if host != "127.0.0.1" {
+                errors.push("LLM_PROVIDER=chatgpt only works with HOST=127.0.0.1: Sign in with ChatGPT requires a loopback redirect, so it cannot serve public websites".into());
+            }
+            LlmConfig::ChatGpt {
+                model: env
+                    .get("CHATGPT_MODEL")
+                    .unwrap_or_else(|| "gpt-5.6-luna".into()),
+                data_dir: env
+                    .get("CHATGPT_DATA_DIR")
+                    .unwrap_or_else(|| ".orc-data".into()),
             }
         } else if env.get("LLM_PROVIDER").as_deref() == Some("openclaw") {
             let bridge_url = env.get("OPENCLAW_BRIDGE_URL").unwrap_or_default();
@@ -377,6 +396,18 @@ mod tests {
             ("OPENCLAW_BRIDGE_TOKEN", "t"),
         ]);
         assert!(!Config::from_pairs(&full).unwrap().llm.supports_tools());
+    }
+
+    #[test]
+    fn chatgpt_sign_in_is_loopback_only() {
+        let base = [
+            ("ALLOWED_ORIGINS", "https://a.example"),
+            ("LLM_PROVIDER", "chatgpt"),
+        ];
+        assert!(Config::from_pairs(&base).is_ok());
+        let mut public = base.to_vec();
+        public.push(("HOST", "0.0.0.0"));
+        assert!(Config::from_pairs(&public).unwrap_err().0[0].contains("loopback"));
     }
 
     #[test]

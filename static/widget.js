@@ -152,6 +152,8 @@
     var typing = null;
     var waiting = false;
     var greeted = false;
+    var lastText = null;
+    var awaitingSignIn = false;
 
     function scroll() {
       messages.scrollTop = messages.scrollHeight;
@@ -202,6 +204,39 @@
       scroll();
     }
 
+    // "Sign in with ChatGPT" mode: the visitor's own ChatGPT plan pays for their replies.
+    function signInCard(path) {
+      if (awaitingSignIn) return;
+      awaitingSignIn = true;
+      var wrap = el('div', 'orc-card');
+      wrap.appendChild(el('div', 'orc-card-title', 'Sign in to chat'));
+      wrap.appendChild(el('div', 'orc-card-line', 'This assistant uses your own ChatGPT plan. Sign in with ChatGPT to continue.'));
+      var button = el('button', 'orc-card-action', 'Sign in with ChatGPT');
+      button.type = 'button';
+      button.addEventListener('click', function () {
+        var url = new URL(path, serverOrigin);
+        if (url.origin !== serverOrigin) return;
+        window.open(url.href, 'orc-signin', 'width=520,height=720');
+      });
+      wrap.appendChild(button);
+      messages.appendChild(wrap);
+      scroll();
+    }
+
+    window.addEventListener('message', function (event) {
+      if (event.origin !== serverOrigin || !event.data || event.data.type !== 'orc-signed-in') return;
+      if (!awaitingSignIn) return;
+      awaitingSignIn = false;
+      append('assistant', "You're signed in.");
+      // Reconnect so the new socket carries the sign-in cookie, then resend the question.
+      if (ws) ws.close();
+      ws = null;
+      if (lastText) {
+        setWaiting(true);
+        send(lastText);
+      }
+    });
+
     function onFrame(event) {
       var frame;
       try {
@@ -225,6 +260,9 @@
         current = null;
         setWaiting(false);
         append('error', String(frame.message));
+      } else if (frame.type === 'auth_required') {
+        current = null;
+        signInCard(String(frame.url || '/auth/chatgpt/start'));
       } else if (frame.type === 'card' && frame.card) {
         current = null;
         leadCard(frame.card);
@@ -246,6 +284,8 @@
           });
           socket.addEventListener('message', onFrame);
           socket.addEventListener('close', function () {
+            // A socket we replaced on purpose (after sign-in) must not touch the new one's state.
+            if (ws !== socket) return;
             // Never replay messages from a failed attempt on a later connection.
             queue = [];
             // Confirm buttons belong to the old session; the server has forgotten those cards.
@@ -257,7 +297,7 @@
               append('error', opened ? 'Connection lost. Please try again.' : 'Could not connect. Please try again.');
             }
             current = null;
-            if (ws === socket) ws = null;
+            ws = null;
           });
         },
         function () {
@@ -310,6 +350,7 @@
       if (!text || waiting) return;
       append('user', text);
       input.value = '';
+      lastText = text;
       setWaiting(true);
       send(text);
     });
