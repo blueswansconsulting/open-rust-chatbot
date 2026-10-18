@@ -67,7 +67,10 @@
       a.href = url.href;
       a.textContent = raw;
       a.rel = 'noopener noreferrer nofollow';
-      if (url.host !== location.host) a.target = '_blank';
+      var bare = function (h) {
+        return h.replace(/^www\./, '');
+      };
+      if (bare(url.host) !== bare(location.host)) a.target = '_blank';
       parts.push(a);
       last = match.index + raw.length;
       URL_RE.lastIndex = last;
@@ -124,8 +127,11 @@
     header.appendChild(closeBtn);
 
     var messages = el('div', 'orc-messages');
-    messages.setAttribute('aria-live', 'polite');
     messages.setAttribute('data-testid', 'orc-messages');
+    // Screen readers hear each finished reply once, not every streamed word.
+    var announcer = el('div', 'orc-sr-only');
+    announcer.setAttribute('aria-live', 'polite');
+    announcer.setAttribute('role', 'status');
 
     var inputRow = el('form', 'orc-input-row');
     var input = el('input', 'orc-input');
@@ -141,9 +147,11 @@
     panel.appendChild(header);
     panel.appendChild(messages);
     panel.appendChild(inputRow);
+    panel.appendChild(announcer);
     root.appendChild(panel);
     root.appendChild(bubble);
-    document.body.appendChild(root);
+    // First in the page so keyboard users reach the chat without tabbing through every link.
+    document.body.insertBefore(root, document.body.firstChild);
 
     var ws = null;
     var connecting = false;
@@ -152,6 +160,15 @@
     var typing = null;
     var waiting = false;
     var greeted = false;
+    var replyTimer = null;
+    var REPLY_TIMEOUT_MS = 45000;
+
+    function announce(text) {
+      announcer.textContent = '';
+      setTimeout(function () {
+        announcer.textContent = text;
+      }, 50);
+    }
 
     function scroll() {
       messages.scrollTop = messages.scrollHeight;
@@ -168,6 +185,18 @@
     function setWaiting(value) {
       waiting = value;
       sendBtn.disabled = value;
+      clearTimeout(replyTimer);
+      if (value) {
+        // Never leave the visitor watching typing dots forever.
+        replyTimer = setTimeout(function () {
+          if (!waiting) return;
+          setWaiting(false);
+          current = null;
+          append('error', "Sorry, no reply came back. Please try again.");
+          announce("Sorry, no reply came back. Please try again.");
+          if (ws) ws.close();
+        }, REPLY_TIMEOUT_MS);
+      }
       if (value && !typing) {
         typing = el('div', 'orc-typing');
         typing.setAttribute('aria-label', 'Assistant is typing');
@@ -187,6 +216,10 @@
       wrap.appendChild(el('div', 'orc-card-title', submitted ? 'Details sent' : 'Send these details to the team?'));
       [lead.name, lead.email, lead.phone, lead.message].forEach(function (line) {
         if (line) wrap.appendChild(el('div', 'orc-card-line', String(line)));
+      });
+      // Only the newest card can be confirmed.
+      messages.querySelectorAll('.orc-card-action').forEach(function (b) {
+        b.disabled = true;
       });
       if (!submitted) {
         var confirm = el('button', 'orc-card-action', 'Confirm and send');
@@ -218,13 +251,17 @@
         current.textContent += String(frame.value);
         scroll();
       } else if (frame.type === 'done') {
-        if (current) linkify(current);
+        if (current) {
+          linkify(current);
+          announce(current.textContent);
+        }
         current = null;
         setWaiting(false);
       } else if (frame.type === 'error') {
         current = null;
         setWaiting(false);
         append('error', String(frame.message));
+        announce(String(frame.message));
       } else if (frame.type === 'card' && frame.card) {
         current = null;
         leadCard(frame.card);
@@ -281,6 +318,7 @@
     function open() {
       panel.dataset.open = 'true';
       bubble.setAttribute('aria-expanded', 'true');
+      bubble.setAttribute('aria-label', 'Close chat');
       if (!greeted) {
         greeted = true;
         append('assistant', TEXT.greeting);
@@ -292,6 +330,7 @@
     function close() {
       panel.dataset.open = 'false';
       bubble.setAttribute('aria-expanded', 'false');
+      bubble.setAttribute('aria-label', 'Open chat');
       bubble.focus();
     }
 
@@ -301,8 +340,18 @@
       else open();
     });
     closeBtn.addEventListener('click', close);
-    panel.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape') close();
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && panel.dataset.open === 'true') close();
+    });
+    window.addEventListener('offline', function () {
+      if (panel.dataset.open !== 'true' && !waiting) return;
+      if (waiting) {
+        setWaiting(false);
+        current = null;
+      }
+      append('error', "You're offline. Check your connection and try again.");
+      announce("You're offline.");
+      if (ws) ws.close();
     });
     inputRow.addEventListener('submit', function (e) {
       e.preventDefault();

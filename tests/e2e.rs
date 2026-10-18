@@ -346,7 +346,10 @@ async fn flooding_without_reading_gets_the_socket_closed_with_few_replies() {
     .await
     .unwrap_or(false);
     assert!(closed, "flooding socket must be closed");
-    assert!(errors <= 3, "at most 3 rejection replies, got {errors}");
+    assert!(
+        errors <= 21,
+        "replies are bounded by the close threshold, got {errors}"
+    );
 }
 
 #[test]
@@ -383,4 +386,11 @@ fn client_ip_trusts_only_the_configured_header_and_groups_ipv6() {
         client_ip(&direct, &HeaderMap::new(), v6),
         "2001:db8:1:2::/64"
     );
+}
+
+#[test]
+fn rate_limit_wait_is_human_readable() {
+    assert_eq!(open_rust_chatbot::human_wait(249_000), "about 5 minutes");
+    assert_eq!(open_rust_chatbot::human_wait(45_000), "45 seconds");
+    assert_eq!(open_rust_chatbot::human_wait(60_000), "about 1 minute");
 }

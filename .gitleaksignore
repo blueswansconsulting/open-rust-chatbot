@@ -1,0 +1,2 @@
+# Test fixtures, not secrets (reviewed 2026-10-18).
+c1516a4c311709eb4ada02969da454d6beef1969:src/config.rs:generic-api-key:405

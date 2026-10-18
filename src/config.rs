@@ -416,7 +416,7 @@ mod tests {
             ("ALLOWED_ORIGINS", "https://a.example"),
             ("LLM_API_KEY", "k"),
             ("LEAD_WEBHOOK_URL", "https://hooks.example/x"),
-            ("LEAD_WEBHOOK_SECRET", "0123456789abcdef0123456789abcdef"),
+            ("LEAD_WEBHOOK_SECRET", "0123456789abcdef0123456789abcdef"), // gitleaks:allow (test fixture)
         ])
         .unwrap();
         assert!(c.lead_capture && c.system_prompt.contains("propose_lead"));
