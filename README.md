@@ -64,6 +64,9 @@ Run it behind a TLS reverse proxy (Caddy, nginx, Traefik or Cloudflare). The pro
 enforces header timeouts. Set `TRUST_PROXY_HEADERS=true` so rate limits use the real visitor IP, and
 `CLIENT_IP_HEADER=cf-connecting-ip` if Cloudflare is in front.
 
+The server also works behind a sub-path (for example Caddy `handle_path /chat/* { reverse_proxy chatbot:8787 }`):
+embed `https://your-domain.com/chat/widget.js` and the widget uses `/chat/ws` and `/chat/widget.css` automatically.
+
 If your site sends a Content-Security-Policy, allow the chatbot's origin in `script-src`, `style-src`
 and `connect-src` (as `wss://chat.your-domain.com`).
 
@@ -76,7 +79,7 @@ and `connect-src` (as `wss://chat.your-domain.com`).
     subtitle: 'Usually replies instantly',
     greeting: 'Hi! Need an electrician? Ask me anything.',
     placeholder: 'Type your question...',
-    // serverUrl: 'https://chat.your-domain.com',   // only if the script is served from elsewhere
+    // serverUrl: 'https://your-domain.com/chat',  // only if the script is served from elsewhere (may include a path)
     // turnstileToken: () => getFreshTurnstileToken(), // if TURNSTILE_SECRET_KEY is set (tokens are single-use)
   };
 </script>

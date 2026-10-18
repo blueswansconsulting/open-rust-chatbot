@@ -3,6 +3,7 @@
  * Embed:  <script src="https://chat.example.com/widget.js" defer></script>
  * Optional config, set before the script tag:
  *   window.openRustChatbot = { title, subtitle, greeting, placeholder, serverUrl, turnstileToken };
+ * serverUrl may include a path when the server is behind a sub-path, e.g. https://example.com/chat
  * turnstileToken may be a string or a function returning a fresh token (or a Promise of one);
  * Turnstile tokens are single-use, so use a function if the visitor may reconnect.
  *
@@ -15,13 +16,20 @@
 
   var options = window.openRustChatbot || {};
   var script = document.currentScript;
+  // The server may live at a sub-path (e.g. https://example.com/chat/widget.js), so derive the
+  // base from where this script was loaded: <base>/ws and <base>/widget.css.
   var serverOrigin;
+  var serverBase;
   try {
-    serverOrigin = new URL(options.serverUrl || (script && script.src) || location.href).origin;
+    var src = new URL(options.serverUrl || (script && script.src) || location.origin + '/widget.js');
+    serverOrigin = src.origin;
+    var path = options.serverUrl ? src.pathname : src.pathname.replace(/\/[^\/]*$/, '');
+    serverBase = serverOrigin + path.replace(/\/+$/, '');
   } catch (e) {
     serverOrigin = location.origin;
+    serverBase = serverOrigin;
   }
-  var wsBase = (serverOrigin.indexOf('https:') === 0 ? 'wss:' : 'ws:') + '//' + new URL(serverOrigin).host + '/ws';
+  var wsBase = serverBase.replace(/^http/, 'ws') + '/ws';
 
   function wsUrl() {
     var token = options.turnstileToken;
@@ -99,7 +107,7 @@
     if (!document.querySelector('link[data-orc-stylesheet]')) {
       var link = document.createElement('link');
       link.rel = 'stylesheet';
-      link.href = serverOrigin + '/widget.css';
+      link.href = serverBase + '/widget.css';
       link.setAttribute('data-orc-stylesheet', '');
       document.head.appendChild(link);
     }
