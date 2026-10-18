@@ -16,6 +16,19 @@ const MAX_TOOL_HOPS: usize = 4;
 const MAX_PENDING_LEADS: usize = 5;
 pub const GENERIC_ERROR: &str = "Sorry, something went wrong. Please try again in a moment.";
 
+/// Follow-ups like "how often do I need one?" only make sense with the previous question, so
+/// knowledge-base search uses the visitor's last question as well as the current one.
+fn retrieval_query(history: &[Message], current: &str) -> String {
+    let previous = history
+        .iter()
+        .rev()
+        .filter(|m| m.role == Role::User && m.content != current)
+        .map(|m| m.content.as_str())
+        .next()
+        .unwrap_or_default();
+    format!("{previous} {current}")
+}
+
 pub fn trim_history(history: &[Message], max_messages: usize) -> Vec<Message> {
     let Some((system, rest)) = history.split_first() else {
         return Vec::new();
@@ -171,7 +184,7 @@ impl ChatSession {
         let excerpts: Vec<String> = self
             .shared
             .kb
-            .search(text, 3)
+            .search(&retrieval_query(&self.history, text), 3)
             .iter()
             .map(|c| format!("[{}] {}", c.header_path.join(" > "), c.text))
             .collect();
@@ -341,6 +354,20 @@ mod tests {
         let out = trim_history(&h, 12);
         assert_eq!(out[1].content, "q");
         assert_eq!(out.len(), 15);
+    }
+
+    #[test]
+    fn retrieval_query_includes_the_previous_question() {
+        let h = vec![
+            Message::new(Role::System, "s"),
+            Message::new(Role::User, "I need an EICR in Croydon"),
+            Message::new(Role::Assistant, "ok"),
+            Message::new(Role::User, "How often do I need one?"),
+        ];
+        assert_eq!(
+            retrieval_query(&h, "How often do I need one?"),
+            "I need an EICR in Croydon How often do I need one?"
+        );
     }
 
     #[test]
