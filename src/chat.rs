@@ -25,6 +25,10 @@ pub fn trim_history(history: &[Message], max_messages: usize) -> Vec<Message> {
     while start < rest.len() && rest[start].role != Role::User {
         start += 1;
     }
+    // ...but never drop the visitor's current question, however long its tool exchange is.
+    if let Some(current) = rest.iter().rposition(|m| m.role == Role::User) {
+        start = start.min(current);
+    }
     std::iter::once(system.clone())
         .chain(rest[start..].iter().cloned())
         .collect()
@@ -190,7 +194,10 @@ impl ChatSession {
         self.history.push(Message::new(Role::Assistant, reply));
         self.history = trim_history(&self.history, max_history);
 
-        if let Some(email) = EMAIL_IN_TEXT.find(text) {
+        let email = EMAIL_IN_TEXT
+            .find(text)
+            .filter(|_| self.shared.config.lead_capture);
+        if let Some(email) = email {
             let mut arguments = serde_json::Map::new();
             arguments.insert("name".into(), json!("Website visitor"));
             arguments.insert("email".into(), json!(email.as_str()));
@@ -232,7 +239,17 @@ impl ChatSession {
             "tool_call",
             json!({ "session": self.session_id, "tool": call.name }),
         );
-        let content = match tools::execute(&self.shared.kb, call) {
+        let offered = self
+            .shared
+            .tool_definitions
+            .iter()
+            .any(|t| t.name == call.name);
+        let outcome = if offered {
+            tools::execute(&self.shared.kb, call)
+        } else {
+            ToolOutcome::Result(json!({ "error": format!("unknown tool {}", call.name) }))
+        };
+        let content = match outcome {
             ToolOutcome::Result(v) => v,
             // The model never learns it can confirm; only the visitor's button can.
             ToolOutcome::LeadProposed(lead) => match self.offer_lead(lead, tx) {
@@ -310,6 +327,20 @@ mod tests {
         ];
         let out: Vec<_> = trim_history(&h, 3).into_iter().map(|m| m.content).collect();
         assert_eq!(out, vec!["s", "u2"]);
+    }
+
+    #[test]
+    fn trim_never_drops_the_current_question_during_long_tool_exchanges() {
+        let mut h = vec![
+            Message::new(Role::System, "s"),
+            Message::new(Role::User, "q"),
+        ];
+        for _ in 0..13 {
+            h.push(Message::new(Role::Tool, "t"));
+        }
+        let out = trim_history(&h, 12);
+        assert_eq!(out[1].content, "q");
+        assert_eq!(out.len(), 15);
     }
 
     #[test]

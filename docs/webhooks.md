@@ -6,13 +6,19 @@ When a visitor presses **Confirm and send**, the server POSTs to `LEAD_WEBHOOK_U
 POST /your/endpoint
 Content-Type: application/json
 X-ORC-Timestamp: 1760000000
-X-ORC-Signature: sha256=5d41402abc4b2a76b9719d911017c592...
+X-ORC-Signature: sha256=<64 hex characters>
 
 {"type":"lead","bot":"Sparky","lead":{"leadId":"…","name":"Sam","email":"sam@example.com","phone":"07700 900123","message":"Need a rewire quote"},"submittedAt":"2026-10-18T12:00:00.000Z"}
 ```
 
 `phone` and `message` are omitted when empty. Any 2xx response counts as delivered. 429 and 5xx
 responses and network errors are retried twice; other 4xx responses are not retried.
+
+**Deduplicate on `leadId`.** If a delivery times out after your endpoint received it, the visitor may
+confirm again and you will get the same lead twice.
+
+**Treat every field as untrusted visitor input.** Escape it before showing it in HTML or email, and
+never use it in a query or command without parameterising it.
 
 ## Verifying the signature
 
@@ -40,7 +46,10 @@ export function verify(rawBody, timestamp, signature, secret) {
 import hashlib, hmac, time
 
 def verify(raw_body: bytes, timestamp: str, signature: str, secret: str) -> bool:
-    if abs(time.time() - int(timestamp)) > 300:
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            return False
+    except (TypeError, ValueError):
         return False
     mac = hmac.new(secret.encode(), timestamp.encode() + b"." + raw_body, hashlib.sha256)
     return hmac.compare_digest("sha256=" + mac.hexdigest(), signature)

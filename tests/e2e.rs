@@ -323,3 +323,68 @@ async fn openclaw_bridge_gets_kb_context_and_server_offers_lead_card() {
     );
     assert!(sent.contains("untrusted"), "{sent}");
 }
+
+#[tokio::test]
+async fn flooding_without_reading_gets_the_socket_closed_with_few_replies() {
+    let addr = serve(&[("RATE_LIMIT_MESSAGES", "2")]).await;
+    let mut ws = connect(&addr, ORIGIN).await.unwrap();
+    for _ in 0..500 {
+        if ws.send(Message::Text("x".into())).await.is_err() {
+            break;
+        }
+    }
+    let mut errors = 0;
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(t))) => {
+                    if t.contains("\"error\"") {
+                        errors += 1;
+                    }
+                }
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(closed, "flooding socket must be closed");
+    assert!(errors <= 3, "at most 3 rejection replies, got {errors}");
+}
+
+#[test]
+fn client_ip_trusts_only_the_configured_header_and_groups_ipv6() {
+    use axum::http::HeaderMap;
+    use open_rust_chatbot::client_ip;
+    let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", "1.1.1.1, 203.0.113.9".parse().unwrap());
+    headers.insert("cf-connecting-ip", "198.51.100.7".parse().unwrap());
+
+    let direct = Config::from_pairs(&[("DEV_MODE", "true"), ("MOCK_LLM", "true")]).unwrap();
+    assert_eq!(client_ip(&direct, &headers, peer), "10.0.0.1");
+
+    let proxied = Config::from_pairs(&[
+        ("DEV_MODE", "true"),
+        ("MOCK_LLM", "true"),
+        ("TRUST_PROXY_HEADERS", "true"),
+    ])
+    .unwrap();
+    assert_eq!(client_ip(&proxied, &headers, peer), "203.0.113.9");
+
+    let cloudflare = Config::from_pairs(&[
+        ("DEV_MODE", "true"),
+        ("MOCK_LLM", "true"),
+        ("TRUST_PROXY_HEADERS", "true"),
+        ("CLIENT_IP_HEADER", "CF-Connecting-IP"),
+    ])
+    .unwrap();
+    assert_eq!(client_ip(&cloudflare, &headers, peer), "198.51.100.7");
+
+    let v6: SocketAddr = "[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:5000".parse().unwrap();
+    assert_eq!(
+        client_ip(&direct, &HeaderMap::new(), v6),
+        "2001:db8:1:2::/64"
+    );
+}

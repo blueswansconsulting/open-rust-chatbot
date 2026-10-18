@@ -3,6 +3,8 @@
  * Embed:  <script src="https://chat.example.com/widget.js" defer></script>
  * Optional config, set before the script tag:
  *   window.openRustChatbot = { title, subtitle, greeting, placeholder, serverUrl, turnstileToken };
+ * turnstileToken may be a string or a function returning a fresh token (or a Promise of one);
+ * Turnstile tokens are single-use, so use a function if the visitor may reconnect.
  *
  * Security: every piece of text from the server or visitor is rendered with textContent, never innerHTML.
  */
@@ -19,8 +21,14 @@
   } catch (e) {
     serverOrigin = location.origin;
   }
-  var wsUrl = (serverOrigin.indexOf('https:') === 0 ? 'wss:' : 'ws:') + '//' + new URL(serverOrigin).host + '/ws';
-  if (options.turnstileToken) wsUrl += '?ts=' + encodeURIComponent(options.turnstileToken);
+  var wsBase = (serverOrigin.indexOf('https:') === 0 ? 'wss:' : 'ws:') + '//' + new URL(serverOrigin).host + '/ws';
+
+  function wsUrl() {
+    var token = options.turnstileToken;
+    return Promise.resolve(typeof token === 'function' ? token() : token).then(function (t) {
+      return t ? wsBase + '?ts=' + encodeURIComponent(t) : wsBase;
+    });
+  }
 
   var TEXT = {
     title: options.title || 'Chat with us',
@@ -34,6 +42,42 @@
     if (className) node.className = className;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+
+  var URL_RE = /https?:\/\/[^\s<>"']+/g;
+
+  // Turns http(s) URLs in a finished message into links, using DOM nodes only (never innerHTML).
+  function linkify(node) {
+    var text = node.textContent || '';
+    var parts = [];
+    var last = 0;
+    var match;
+    URL_RE.lastIndex = 0;
+    while ((match = URL_RE.exec(text))) {
+      var raw = match[0].replace(/[.,;:!?)\]]+$/, '');
+      var url;
+      try {
+        url = new URL(raw);
+      } catch (e) {
+        continue;
+      }
+      if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
+      parts.push(document.createTextNode(text.slice(last, match.index)));
+      var a = document.createElement('a');
+      a.href = url.href;
+      a.textContent = raw;
+      a.rel = 'noopener noreferrer nofollow';
+      if (url.host !== location.host) a.target = '_blank';
+      parts.push(a);
+      last = match.index + raw.length;
+      URL_RE.lastIndex = last;
+    }
+    if (!parts.length) return;
+    parts.push(document.createTextNode(text.slice(last)));
+    node.textContent = '';
+    parts.forEach(function (p) {
+      node.appendChild(p);
+    });
   }
 
   function chatIcon() {
@@ -102,6 +146,7 @@
     document.body.appendChild(root);
 
     var ws = null;
+    var connecting = false;
     var queue = [];
     var current = null;
     var typing = null;
@@ -173,6 +218,7 @@
         current.textContent += String(frame.value);
         scroll();
       } else if (frame.type === 'done') {
+        if (current) linkify(current);
         current = null;
         setWaiting(false);
       } else if (frame.type === 'error') {
@@ -186,26 +232,50 @@
     }
 
     function connect() {
-      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-      ws = new WebSocket(wsUrl);
-      ws.addEventListener('open', function () {
-        while (queue.length) ws.send(queue.shift());
-      });
-      ws.addEventListener('message', onFrame);
-      ws.addEventListener('close', function () {
-        if (waiting) {
+      if (connecting || (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) return;
+      connecting = true;
+      wsUrl().then(
+        function (url) {
+          connecting = false;
+          var socket = new WebSocket(url);
+          ws = socket;
+          var opened = false;
+          socket.addEventListener('open', function () {
+            opened = true;
+            while (queue.length) socket.send(queue.shift());
+          });
+          socket.addEventListener('message', onFrame);
+          socket.addEventListener('close', function () {
+            // Never replay messages from a failed attempt on a later connection.
+            queue = [];
+            // Confirm buttons belong to the old session; the server has forgotten those cards.
+            messages.querySelectorAll('.orc-card-action').forEach(function (b) {
+              b.disabled = true;
+            });
+            if (waiting || !opened) {
+              setWaiting(false);
+              append('error', opened ? 'Connection lost. Please try again.' : 'Could not connect. Please try again.');
+            }
+            current = null;
+            if (ws === socket) ws = null;
+          });
+        },
+        function () {
+          connecting = false;
+          queue = [];
           setWaiting(false);
-          append('error', 'Connection lost. Please try again.');
+          append('error', 'Could not connect. Please try again.');
         }
-        current = null;
-        ws = null;
-      });
+      );
     }
 
     function send(payload) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+        return;
+      }
+      queue.push(payload);
       connect();
-      if (ws.readyState === WebSocket.OPEN) ws.send(payload);
-      else queue.push(payload);
     }
 
     function open() {
@@ -219,14 +289,20 @@
       input.focus();
     }
 
-    bubble.addEventListener('click', function () {
-      if (panel.dataset.open === 'true') panel.dataset.open = 'false';
-      else open();
-    });
-    closeBtn.addEventListener('click', function () {
+    function close() {
       panel.dataset.open = 'false';
       bubble.setAttribute('aria-expanded', 'false');
       bubble.focus();
+    }
+
+    bubble.setAttribute('aria-expanded', 'false');
+    bubble.addEventListener('click', function () {
+      if (panel.dataset.open === 'true') close();
+      else open();
+    });
+    closeBtn.addEventListener('click', close);
+    panel.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') close();
     });
     inputRow.addEventListener('submit', function (e) {
       e.preventDefault();

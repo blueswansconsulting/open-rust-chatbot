@@ -44,6 +44,8 @@ const WIDGET_JS: &str = include_str!("../static/widget.js");
 const WIDGET_CSS: &str = include_str!("../static/widget.css");
 const DEMO_HTML: &str = include_str!("../static/demo.html");
 const MAX_WS_FRAME_BYTES: usize = 16 * 1024;
+const MAX_REJECTION_REPLIES: usize = 3;
+const MAX_REJECTED_FRAMES: usize = 20;
 // tungstenite preallocates 128 KiB per socket by default; chat frames are tiny.
 const WS_BUFFER_BYTES: usize = 4 * 1024;
 
@@ -76,7 +78,10 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
             limits.max_connections_per_ip,
         ),
         llm: llm::Llm::new(config.llm.clone(), http.clone()),
-        tool_definitions: tools::definitions(),
+        tool_definitions: tools::definitions()
+            .into_iter()
+            .filter(|t| config.lead_capture || t.name != "propose_lead")
+            .collect(),
         open_connections: AtomicUsize::new(0),
         kb,
         http,
@@ -139,34 +144,52 @@ async fn security_headers(req: Request, next: Next) -> Response {
     res
 }
 
-fn client_ip(config: &Config, headers: &HeaderMap, peer: SocketAddr) -> String {
+/// The rate-limit key for a visitor. Only the one header named by CLIENT_IP_HEADER is trusted,
+/// and only when TRUST_PROXY_HEADERS=true. IPv6 clients are grouped by /64, since one
+/// connection usually controls a whole /64.
+pub fn client_ip(config: &Config, headers: &HeaderMap, peer: SocketAddr) -> String {
+    let mut ip = peer.ip();
     if config.trust_proxy_headers {
-        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-        // The right-most X-Forwarded-For entry is the one our own proxy appended.
-        if let Some(ip) = header("x-forwarded-for")
-            .and_then(|xff| xff.split(',').map(str::trim).rfind(|s| !s.is_empty()))
-        {
-            return ip.to_owned();
-        }
-        if let Some(ip) = header("cf-connecting-ip") {
-            return ip.trim().to_owned();
+        let value = headers
+            .get(config.client_ip_header.as_str())
+            .and_then(|v| v.to_str().ok());
+        // For X-Forwarded-For the right-most entry is the one our own proxy appended.
+        let candidate = value.and_then(|v| v.split(',').map(str::trim).rfind(|s| !s.is_empty()));
+        if let Some(parsed) = candidate.and_then(|c| c.parse::<std::net::IpAddr>().ok()) {
+            ip = parsed;
         }
     }
-    peer.ip().to_string()
+    match ip {
+        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().unwrap().to_string(),
+        v4 => v4.to_string(),
+    }
 }
 
-async fn verify_turnstile(http: &reqwest::Client, token: &str, secret: &str, ip: &str) -> bool {
-    let res = http
+async fn verify_turnstile(shared: &Shared, token: &str, secret: &str, ip: &str) -> bool {
+    let res = shared
+        .http
         .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
         .timeout(Duration::from_secs(10))
         .form(&[("secret", secret), ("response", token), ("remoteip", ip)])
         .send()
         .await;
     match res {
-        Ok(r) if r.status().is_success() => r
-            .json::<serde_json::Value>()
-            .await
-            .is_ok_and(|v| v["success"] == true),
+        // Also require the token to have been issued on one of our own sites.
+        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.is_ok_and(|v| {
+            v["success"] == true
+                && v["hostname"].as_str().is_some_and(|host| {
+                    shared.config.allowed_origins.iter().any(|origin| {
+                        origin
+                            .split("://")
+                            .nth(1)
+                            .is_some_and(|h| h.split(':').next() == Some(host))
+                    })
+                })
+        }),
         _ => false,
     }
 }
@@ -207,14 +230,8 @@ async fn ws_upgrade(
         Err(rejection) => return rejection.into_response(),
     };
     let ip = client_ip(&shared.config, &headers, peer);
-    if let Some(secret) = &shared.config.turnstile_secret {
-        let Some(token) = query.get("ts").filter(|t| !t.is_empty() && t.len() < 4096) else {
-            return reject(StatusCode::FORBIDDEN, "verification required");
-        };
-        if !verify_turnstile(&shared.http, token, secret, &ip).await {
-            return reject(StatusCode::FORBIDDEN, "verification failed");
-        }
-    }
+    // Claim connection slots before any outbound verification call, so unauthenticated
+    // upgrade floods are capped by the same limits as real chats.
     if shared.open_connections.fetch_add(1, Ordering::SeqCst)
         >= shared.config.limits.max_connections_total
     {
@@ -229,6 +246,14 @@ async fn ws_upgrade(
         shared: shared.clone(),
         ip,
     };
+    if let Some(secret) = &shared.config.turnstile_secret {
+        let Some(token) = query.get("ts").filter(|t| !t.is_empty() && t.len() < 4096) else {
+            return reject(StatusCode::FORBIDDEN, "verification required");
+        };
+        if !verify_turnstile(&shared, token, secret, &slot.ip).await {
+            return reject(StatusCode::FORBIDDEN, "verification failed");
+        }
+    }
     let session_id = uuid::Uuid::new_v4().to_string();
     ws.max_message_size(MAX_WS_FRAME_BYTES)
         .max_frame_size(MAX_WS_FRAME_BYTES)
@@ -262,34 +287,43 @@ async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String)
         }
     });
 
-    let idle = shared.config.limits.idle_timeout;
+    let limits = &shared.config.limits;
+    let session_deadline = tokio::time::Instant::now() + limits.max_session;
+    let mut idle_deadline = tokio::time::Instant::now() + limits.idle_timeout;
+    // Rejected frames (rate-limited or sent mid-reply) get a few error replies, then the socket
+    // is closed, so a client that floods without reading cannot grow the outgoing queue.
+    let mut rejected = 0usize;
     loop {
-        let msg = match tokio::time::timeout(idle, inbound.next()).await {
+        let deadline = idle_deadline.min(session_deadline);
+        let msg = match tokio::time::timeout_at(deadline, inbound.next()).await {
             Ok(Some(Ok(msg))) => msg,
-            _ => break, // idle timeout, protocol error, or client gone
+            _ => break, // idle or lifetime limit, protocol error, or client gone
         };
         let text = match msg {
             WsMessage::Text(t) => t.to_string(),
             WsMessage::Close(_) => break,
             WsMessage::Binary(_) => break, // the widget never sends binary
-            _ => continue,
+            _ => continue,                 // pings do not count as activity
         };
-        if let MessageResult::RateLimited { retry_after_ms } =
-            shared.rate_limiter.record_message(&slot.ip, now_ms())
-        {
-            let message = format!(
+        idle_deadline = tokio::time::Instant::now() + limits.idle_timeout;
+        let error = match shared.rate_limiter.record_message(&slot.ip, now_ms()) {
+            MessageResult::RateLimited { retry_after_ms } => Some(format!(
                 "You're sending messages too quickly. Try again in {}s.",
                 retry_after_ms.div_ceil(1000)
-            );
-            let _ = out_tx.send(json!({ "type": "error", "message": message }).to_string());
-            continue;
-        }
-        // A full queue means the visitor is flooding while a reply is in progress.
-        if msg_tx.try_send(text).is_err() {
-            let _ = out_tx.send(
-                json!({ "type": "error", "message": "Please wait for the current reply." })
-                    .to_string(),
-            );
+            )),
+            MessageResult::Ok => match msg_tx.try_send(text) {
+                Ok(()) => None,
+                Err(_) => Some("Please wait for the current reply.".to_owned()),
+            },
+        };
+        if let Some(message) = error {
+            rejected += 1;
+            if rejected > MAX_REJECTED_FRAMES {
+                break;
+            }
+            if rejected <= MAX_REJECTION_REPLIES {
+                let _ = out_tx.send(json!({ "type": "error", "message": message }).to_string());
+            }
         }
     }
 

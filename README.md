@@ -7,8 +7,6 @@ One small Rust binary, any OpenAI-compatible model, your data stays on your serv
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/blueswansconsulting/open-rust-chatbot/badge)](https://scorecard.dev/viewer/?uri=github.com/blueswansconsulting/open-rust-chatbot)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-<!-- TODO before launch: demo GIF of the widget answering from the knowledge base and capturing a lead -->
-
 **Live demo:** [electriciansranked.com](https://electriciansranked.com) (bottom-right bubble)
 
 ## Why
@@ -45,7 +43,7 @@ Then add this to your website, just before `</body>`:
 
 - **Knowledge base from Markdown.** Write `# Headings` and paragraphs about your business; the bot searches it before answering and is told never to guess.
 - **Streaming replies** over WebSockets, rendered safely (`textContent` only, never `innerHTML`).
-- **Lead capture with visitor consent.** The bot proposes a card with the visitor's details; nothing is sent until they press *Confirm and send*. Confirmed leads go to your webhook, signed with HMAC-SHA256.
+- **Lead capture with visitor consent.** The bot proposes a card with the visitor's details; nothing is sent until they press *Confirm and send*. Confirmed leads go to your webhook, signed with HMAC-SHA256. Without a webhook, lead capture is switched off so leads are never silently lost.
 - **Any OpenAI-compatible model,** plus an [OpenClaw](https://github.com/openclaw/openclaw) gateway bridge.
 - **Abuse protection:** exact-origin allowlist, per-IP and global connection caps, message rate limits, message size limits, idle timeouts, optional Cloudflare Turnstile.
 - **Themeable:** override the `.orc-*` CSS classes, or set title, subtitle, greeting and placeholder text.
@@ -60,7 +58,16 @@ Then add this to your website, just before `</body>`:
 | Ollama (local) | `http://localhost:11434/v1` | `llama3.1` | not needed |
 | OpenClaw bridge | set `LLM_PROVIDER=openclaw` | — | `OPENCLAW_BRIDGE_TOKEN` |
 
-Models must support tool calling for knowledge-base search and lead cards. With the OpenClaw bridge (text only), the server retrieves knowledge-base excerpts itself and offers the lead card when a visitor types an email address.
+Models must support tool calling for knowledge-base search and lead cards. With the OpenClaw bridge (text only), the server retrieves knowledge-base excerpts itself and offers the lead card when a visitor types an email address. **The bridge agent must have no tools**, because every visitor is untrusted.
+
+### Deploying
+
+Run it behind a TLS reverse proxy (Caddy, nginx, Traefik or Cloudflare). The proxy terminates HTTPS and
+enforces header timeouts. Set `TRUST_PROXY_HEADERS=true` so rate limits use the real visitor IP, and
+`CLIENT_IP_HEADER=cf-connecting-ip` if Cloudflare is in front.
+
+If your site sends a Content-Security-Policy, allow the chatbot's origin in `script-src`, `style-src`
+and `connect-src` (as `wss://chat.your-domain.com`).
 
 ## Customising the widget
 
@@ -72,7 +79,7 @@ Models must support tool calling for knowledge-base search and lead cards. With 
     greeting: 'Hi! Need an electrician? Ask me anything.',
     placeholder: 'Type your question...',
     // serverUrl: 'https://chat.your-domain.com',   // only if the script is served from elsewhere
-    // turnstileToken: '...',                         // if TURNSTILE_SECRET_KEY is set
+    // turnstileToken: () => getFreshTurnstileToken(), // if TURNSTILE_SECRET_KEY is set (tokens are single-use)
   };
 </script>
 <script src="https://chat.your-domain.com/widget.js" defer></script>
@@ -113,7 +120,7 @@ If you need a full support inbox, use a bigger platform. If you want a small, au
 
 ## Roadmap
 
-- Prebuilt binaries and a multi-arch image on every release
+- Prebuilt binaries and a multi-arch (amd64 + arm64) image on every release
 - Multiple knowledge-base files and hot reload
 - Optional conversation transcripts to a webhook
 - Widget translations

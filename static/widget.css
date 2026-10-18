@@ -160,3 +160,4 @@
   outline: 2px solid #116149; outline-offset: 2px;
 }
 .orc-input-row { margin: 0; }
+.orc-msg a { color: inherit; text-decoration: underline; word-break: break-all; }

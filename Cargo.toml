@@ -2,7 +2,7 @@
 name = "open-rust-chatbot"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Self-hosted AI chatbot widget for any website: one small Rust binary, any OpenAI-compatible model."
 license = "MIT"
 repository = "https://github.com/blueswansconsulting/open-rust-chatbot"
