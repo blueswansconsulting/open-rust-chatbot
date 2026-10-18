@@ -44,7 +44,8 @@ const WIDGET_JS: &str = include_str!("../static/widget.js");
 const WIDGET_CSS: &str = include_str!("../static/widget.css");
 const DEMO_HTML: &str = include_str!("../static/demo.html");
 const MAX_WS_FRAME_BYTES: usize = 16 * 1024;
-const MAX_REJECTION_REPLIES: usize = 3;
+// Every rejected frame gets an error reply (so the widget never waits forever), and a socket
+// that keeps sending rejected frames is closed, which bounds the replies queued for it.
 const MAX_REJECTED_FRAMES: usize = 20;
 // tungstenite preallocates 128 KiB per socket by default; chat frames are tiny.
 const WS_BUFFER_BYTES: usize = 4 * 1024;
@@ -308,8 +309,8 @@ async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String)
         idle_deadline = tokio::time::Instant::now() + limits.idle_timeout;
         let error = match shared.rate_limiter.record_message(&slot.ip, now_ms()) {
             MessageResult::RateLimited { retry_after_ms } => Some(format!(
-                "You're sending messages too quickly. Try again in {}s.",
-                retry_after_ms.div_ceil(1000)
+                "You're sending messages too quickly. Please try again in {}.",
+                human_wait(retry_after_ms)
             )),
             MessageResult::Ok => match msg_tx.try_send(text) {
                 Ok(()) => None,
@@ -321,9 +322,7 @@ async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String)
             if rejected > MAX_REJECTED_FRAMES {
                 break;
             }
-            if rejected <= MAX_REJECTION_REPLIES {
-                let _ = out_tx.send(json!({ "type": "error", "message": message }).to_string());
-            }
+            let _ = out_tx.send(json!({ "type": "error", "message": message }).to_string());
         }
     }
 
@@ -332,4 +331,15 @@ async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String)
     drop(out_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
     drop(slot);
+}
+
+/// "about 4 minutes" rather than "249s".
+pub fn human_wait(ms: u64) -> String {
+    let secs = ms.div_ceil(1000);
+    if secs < 60 {
+        format!("{secs} seconds")
+    } else {
+        let mins = secs.div_ceil(60);
+        format!("about {mins} minute{}", if mins == 1 { "" } else { "s" })
+    }
 }

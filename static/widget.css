@@ -161,3 +161,14 @@
 }
 .orc-input-row { margin: 0; }
 .orc-msg a { color: inherit; text-decoration: underline; word-break: break-all; }
+
+.orc-sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+@media (max-width: 480px) {
+  /* 16px stops iOS Safari zooming the page when the input is tapped. */
+  .orc-input { font-size: 16px; }
+  /* dvh keeps the input above the iOS toolbar and keyboard. */
+  .orc-panel { height: calc(100dvh - 6rem); max-height: calc(100dvh - 6rem); }
+}

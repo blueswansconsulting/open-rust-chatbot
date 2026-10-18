@@ -5,12 +5,15 @@ pub struct KnowledgeChunk {
     pub id: String,
     pub header_path: Vec<String>,
     pub text: String,
-    // Pre-tokenised header + text so search does no allocation per chunk.
+    // Pre-tokenised so search does no allocation per chunk.
     tokens: Vec<String>,
+    header_tokens: Vec<String>,
 }
 
 pub struct KnowledgeBase {
     chunks: Vec<KnowledgeChunk>,
+    /// Inverse document frequency per token: rare words (place names, "eicr") count for more.
+    idf: std::collections::HashMap<String, f64>,
 }
 
 const DEFAULT_CHUNK_WORDS: usize = 512;
@@ -37,12 +40,27 @@ fn tokens(text: &str) -> Vec<String> {
 
 fn chunk(id: String, header_path: Vec<String>, text: String) -> KnowledgeChunk {
     let tokens = tokens(&format!("{} {}", header_path.join(" "), text));
+    let header_tokens = self::tokens(&header_path.join(" "));
     KnowledgeChunk {
         id,
         header_path,
         text,
         tokens,
+        header_tokens,
     }
+}
+
+/// Common words that say nothing about which section answers a question.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "you", "your", "are", "can", "what", "which", "who", "how", "when",
+    "where", "why", "does", "did", "with", "this", "that", "there", "have", "has", "had", "was",
+    "were", "will", "would", "should", "could", "about", "from", "into", "our", "out", "any",
+    "all", "get", "got", "need", "want", "please", "help", "tell", "know", "find", "some", "them",
+    "they", "their", "then", "than", "also", "just", "not", "but", "its", "it's", "i'm", "use",
+];
+
+fn is_stopword(token: &str) -> bool {
+    STOPWORDS.contains(&token)
 }
 
 pub fn parse_markdown_knowledge(
@@ -107,7 +125,19 @@ pub fn parse_markdown_knowledge(
 
 impl KnowledgeBase {
     pub fn new(chunks: Vec<KnowledgeChunk>) -> Self {
-        Self { chunks }
+        let mut df: std::collections::HashMap<String, usize> = Default::default();
+        for c in &chunks {
+            let unique: std::collections::HashSet<&String> = c.tokens.iter().collect();
+            for t in unique {
+                *df.entry(t.clone()).or_default() += 1;
+            }
+        }
+        let n = chunks.len() as f64;
+        let idf = df
+            .into_iter()
+            .map(|(t, d)| (t, (1.0 + n / d as f64).ln()))
+            .collect();
+        Self { chunks, idf }
     }
 
     pub fn from_markdown(markdown: &str) -> Self {
@@ -122,26 +152,40 @@ impl KnowledgeBase {
         Ok(Self::from_markdown(&std::fs::read_to_string(path)?))
     }
 
+    /// Ranks chunks by the IDF-weighted query words they contain (stopwords ignored), with a
+    /// bonus when the words appear in the chunk's heading.
     pub fn search(&self, query: &str, limit: usize) -> Vec<&KnowledgeChunk> {
-        let query_tokens: std::collections::HashSet<String> = tokens(query).into_iter().collect();
-        let mut scored: Vec<(usize, usize, &KnowledgeChunk)> = self
+        let query_tokens: std::collections::HashSet<String> = tokens(query)
+            .into_iter()
+            .filter(|t| !is_stopword(t))
+            .collect();
+        let mut scored: Vec<(f64, usize, &KnowledgeChunk)> = self
             .chunks
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                (
-                    c.tokens
-                        .iter()
-                        .filter(|t| query_tokens.contains(*t))
-                        .count(),
-                    i,
-                    c,
-                )
+                let score: f64 = query_tokens
+                    .iter()
+                    .map(|q| {
+                        let tf = c.tokens.iter().filter(|t| *t == q).count();
+                        if tf == 0 {
+                            return 0.0;
+                        }
+                        let idf = self.idf.get(q).copied().unwrap_or(0.0);
+                        let heading = if c.header_tokens.contains(q) {
+                            2.0
+                        } else {
+                            1.0
+                        };
+                        idf * (1.0 + (tf as f64).ln()) * heading
+                    })
+                    .sum();
+                (score, i, c)
             })
-            .filter(|(score, _, _)| *score > 0)
+            .filter(|(score, _, _)| *score > 0.0)
             .collect();
-        // Stable by original order on ties, matching Array.prototype.sort.
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        // Stable by original order on ties.
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.into_iter().take(limit).map(|(_, _, c)| c).collect()
     }
 }
@@ -149,6 +193,27 @@ impl KnowledgeBase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rare_words_and_headings_beat_common_words() {
+        let kb = KnowledgeBase::from_markdown(
+            "# Getting quotes\nYou can get quotes. You tell us what you need and you get quotes from you know who.\n\
+             # Electricians in Leeds\nWe list electricians in Leeds.\n\
+             # Electricians in York\nWe list electricians in York.",
+        );
+        assert_eq!(
+            kb.search("Do you cover Leeds?", 1)[0].header_path,
+            vec!["Electricians in Leeds"]
+        );
+        assert_eq!(
+            kb.search("how do I get quotes", 1)[0].header_path,
+            vec!["Getting quotes"]
+        );
+        assert!(
+            kb.search("you and the", 3).is_empty(),
+            "stopwords alone match nothing"
+        );
+    }
 
     #[test]
     fn keeps_header_path_per_section() {
