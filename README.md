@@ -67,8 +67,14 @@ enforces header timeouts. Set `TRUST_PROXY_HEADERS=true` so rate limits use the 
 The server also works behind a sub-path (for example Caddy `handle_path /chat/* { reverse_proxy chatbot:8787 }`):
 embed `https://your-domain.com/chat/widget.js` and the widget uses `/chat/ws` and `/chat/widget.css` automatically.
 
-If your site sends a Content-Security-Policy, allow the chatbot's origin in `script-src`, `style-src`
-and `connect-src` (as `wss://chat.your-domain.com`).
+If your site sends a Content-Security-Policy, allow the chatbot's origin in `script-src` and `style-src`,
+and in `connect-src` as **both** `https://chat.your-domain.com` (the widget checks `/availability` before
+showing its button) and `wss://chat.your-domain.com`. If `connect-src` blocks the check, the button
+never appears and the browser console says why.
+
+The chat button only appears while the chat can answer: the widget checks `/availability`, which
+reports down after repeated model outages seen by more than one visitor. `/health` is a plain liveness
+check for your container or load balancer.
 
 ## Customising the widget
 

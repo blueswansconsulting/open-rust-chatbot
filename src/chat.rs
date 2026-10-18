@@ -29,11 +29,20 @@ fn retrieval_query(history: &[Message], current: &str) -> String {
     format!("{previous} {current}")
 }
 
-/// Errors that mean the model is unreachable (5xx, 429, timeouts, network, auth), as opposed to
-/// a request the provider refused because of its content.
+/// Errors that mean the model is unreachable: network/transport failures, timeouts, 5xx, 429
+/// and auth failures. Anything else (rejected input, tool loops, empty or filtered replies)
+/// could be caused by a visitor and must not mark the chat as down.
 pub fn is_availability_failure(detail: &str) -> bool {
-    const REQUEST_ERRORS: [&str; 5] = ["HTTP 400", "HTTP 403", "HTTP 404", "HTTP 413", "HTTP 422"];
-    !REQUEST_ERRORS.iter().any(|code| detail.contains(code))
+    const OUTAGE_MARKERS: [&str; 7] = [
+        "request failed",
+        "stream read failed",
+        "timed out",
+        "stalled",
+        "HTTP 5",
+        "HTTP 429",
+        "HTTP 401",
+    ];
+    OUTAGE_MARKERS.iter().any(|m| detail.contains(m))
 }
 
 pub fn trim_history(history: &[Message], max_messages: usize) -> Vec<Message> {
@@ -85,6 +94,8 @@ pub struct ChatSession {
     history: Vec<Message>,
     pending_leads: HashMap<String, Lead>,
     turns: usize,
+    /// Rate-limit key of the visitor (IP or /64), used by the availability breaker.
+    client: String,
 }
 
 impl ChatSession {
@@ -96,7 +107,13 @@ impl ChatSession {
             history: vec![system],
             pending_leads: HashMap::new(),
             turns: 0,
+            client: String::new(),
         }
+    }
+
+    pub fn with_client(mut self, client: String) -> Self {
+        self.client = client;
+        self
     }
 
     pub async fn handle_message(&mut self, text: &str, tx: &Sender) {
@@ -125,10 +142,10 @@ impl ChatSession {
         self.turns += 1;
         let result = self.run_turn(text, tx).await;
         match &result {
-            Ok(()) => self.shared.record_model_result(true),
+            Ok(()) => self.shared.record_model_result(true, &self.client),
             // Only outages count, so a visitor can't hide the bot by sending rejected input.
             Err(detail) if is_availability_failure(detail) => {
-                self.shared.record_model_result(false)
+                self.shared.record_model_result(false, &self.client)
             }
             Err(_) => {}
         }
@@ -389,10 +406,16 @@ mod tests {
     #[test]
     fn only_outages_count_towards_the_breaker() {
         assert!(is_availability_failure("bridge HTTP 503"));
+        assert!(is_availability_failure(
+            "bridge request failed: connection refused"
+        ));
         assert!(is_availability_failure("timed out waiting for the model"));
         assert!(is_availability_failure("HTTP 401: invalid key"));
         assert!(!is_availability_failure("bridge HTTP 403"));
         assert!(!is_availability_failure("HTTP 400: bad request"));
+        assert!(!is_availability_failure("too many tool hops"));
+        assert!(!is_availability_failure("bridge returned no text"));
+        assert!(!is_availability_failure("provider error: content filtered"));
     }
 
     #[test]

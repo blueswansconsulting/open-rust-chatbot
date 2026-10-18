@@ -292,29 +292,53 @@
     }
 
     // ---- Availability -------------------------------------------------------------------
-    // The button only shows while the chat works. If the connection drops mid-chat the visitor
-    // gets an apology, the input pauses, and the widget reconnects by itself.
+    // The button only shows while the chat can answer. If the connection drops mid-chat the
+    // visitor gets one apology, the input pauses, and the widget reconnects by itself; it only
+    // says "reconnected" once a new connection has actually opened.
     var available = false;
+    var refused = false; // the server keeps refusing connections although it is up
     var outage = false;
+    var lostReply = false;
+    var connectFailures = 0;
+    var healthFailures = 0;
     var recoveryTimer = null;
     var recoveryDelay = 0;
     var healthTimer = null;
+    var warnedUnreachable = false;
+    var closingOnPurpose = null;
+    var generation = 0;
     var HEALTH_RECHECK_MS = 120000;
+    var HEALTH_RECHECK_DOWN_MS = 30000;
     var MSG_LOST_REPLY = "Sorry, we lost the connection before your reply arrived. We're reconnecting now.";
     var MSG_DROPPED = "Sorry, the chat connection has dropped. We're trying to reconnect.";
+    var MSG_OFFLINE = "Sorry, you seem to be offline. We'll reconnect when your connection is back.";
+    var MSG_CANT_CONNECT = "Sorry, the chat can't connect right now. Please try again later.";
+    var MSG_NOT_SENT = "Sorry, we couldn't send your message because the chat can't connect right now. Please try again later.";
     var MSG_BACK = "You're reconnected. Please send your message again.";
     var MSG_BACK_IDLE = "You're reconnected. Carry on whenever you're ready.";
 
+    function say(role, text) {
+      append(role, text);
+      announce(text);
+    }
+
     function checkHealth() {
+      var url = serverBase + '/availability';
       var controller = typeof AbortController === 'function' ? new AbortController() : null;
       var timer = setTimeout(function () {
         if (controller) controller.abort();
       }, 5000);
-      return fetch(serverBase + '/health', { cache: 'no-store', credentials: 'omit', signal: controller && controller.signal })
+      return fetch(url, { cache: 'no-store', credentials: 'omit', signal: controller && controller.signal })
         .then(function (r) {
           return r.ok;
         })
         .catch(function () {
+          // Usually the server is down, but a host site's Content-Security-Policy can also block
+          // this request; say so once so site owners can find it.
+          if (!warnedUnreachable) {
+            warnedUnreachable = true;
+            if (window.console) console.warn('open-rust-chatbot: could not reach ' + url + '. If the chat never appears, allow it in your Content-Security-Policy connect-src.');
+          }
           return false;
         })
         .then(function (ok) {
@@ -324,86 +348,120 @@
     }
 
     function setAvailable(ok) {
-      available = ok;
-      // Never yank the panel away from someone mid-conversation; just hide the button when idle.
-      root.hidden = !ok && panel.dataset.open !== 'true';
+      available = ok && !refused;
+      // Never yank the panel away mid-conversation; the button hides once the panel is closed.
+      root.hidden = !available && panel.dataset.open !== 'true';
     }
 
-    function setInputPaused(paused) {
+    function pauseInput(paused) {
       input.disabled = paused;
       sendBtn.disabled = paused || waiting;
       input.placeholder = paused ? 'Reconnecting…' : TEXT.placeholder;
     }
 
     function startOutage(message) {
+      available = false;
       if (!outage) {
         outage = true;
         recoveryDelay = 0;
-        append('error', message);
-        announce(message);
+        say('error', message);
       }
-      setInputPaused(true);
+      pauseInput(true);
       scheduleRecovery();
+    }
+
+    function stopOutage() {
+      clearTimeout(recoveryTimer);
+      outage = false;
+      pauseInput(false);
     }
 
     function scheduleRecovery() {
       clearTimeout(recoveryTimer);
       recoveryDelay = Math.min(recoveryDelay ? recoveryDelay * 2 : 2000, 30000);
       recoveryTimer = setTimeout(function () {
-        if (typeof navigator !== 'undefined' && navigator.onLine === false) return scheduleRecovery();
+        if (!outage) return;
+        if (navigator.onLine === false || document.visibilityState === 'hidden') return scheduleRecovery();
         checkHealth().then(function (ok) {
+          if (!outage) return;
           if (!ok) return scheduleRecovery();
-          endOutage();
+          connect(); // "reconnected" is only announced once this socket actually opens
         });
       }, recoveryDelay);
     }
 
-    function endOutage() {
-      clearTimeout(recoveryTimer);
-      setAvailable(true);
+    function onConnected() {
+      connectFailures = 0;
+      refused = false;
       if (!outage) return;
-      outage = false;
-      setInputPaused(false);
-      var msg = lostReply ? MSG_BACK : MSG_BACK_IDLE;
+      stopOutage();
+      setAvailable(true);
+      say('assistant', lostReply ? MSG_BACK : MSG_BACK_IDLE);
       lostReply = false;
-      append('assistant', msg);
-      announce(msg);
     }
 
-    var lostReply = false;
+    // The socket closed before it ever opened. If the chat is down, that's an outage; if it's
+    // up, the server refused us (not an allowed site, too busy, verification failed), so stop
+    // retrying, say so once, and hide the button after repeated refusals.
+    function onConnectFailed(wasWaiting, gen) {
+      checkHealth().then(function (ok) {
+        if (gen !== generation) return;
+        if (!ok) {
+          lostReply = lostReply || wasWaiting;
+          if (panel.dataset.open === 'true' || wasWaiting) startOutage(wasWaiting ? MSG_LOST_REPLY : MSG_DROPPED);
+          else setAvailable(false);
+          return;
+        }
+        connectFailures++;
+        var wasOutage = outage;
+        if (outage) stopOutage();
+        lostReply = false;
+        if (wasWaiting || wasOutage || connectFailures === 1) say('error', wasWaiting ? MSG_NOT_SENT : MSG_CANT_CONNECT);
+        if (connectFailures >= 3) {
+          refused = true;
+          setAvailable(false);
+        }
+      });
+    }
 
-    // An unexpected close: if a reply was in flight it is lost; otherwise only treat it as an
-    // outage if the server is really unreachable (idle timeouts close sockets harmlessly).
-    function onUnexpectedClose(wasWaiting) {
+    // An open socket closed unexpectedly. A reply in flight is lost; otherwise it's only an
+    // outage if the chat is really unavailable (servers close idle sockets harmlessly).
+    function onDropped(wasWaiting, gen) {
       if (wasWaiting) {
         lostReply = true;
         startOutage(MSG_LOST_REPLY);
         return;
       }
       checkHealth().then(function (ok) {
-        if (!ok && panel.dataset.open === 'true') startOutage(MSG_DROPPED);
-        else if (!ok) setAvailable(false);
+        if (gen !== generation || ok) return;
+        if (panel.dataset.open === 'true') startOutage(MSG_DROPPED);
+        else setAvailable(false);
       });
     }
 
-    function watchHealth() {
+    function watchHealth(now) {
       clearTimeout(healthTimer);
       healthTimer = setTimeout(function () {
         if (document.visibilityState === 'hidden' || outage) return watchHealth();
         checkHealth().then(function (ok) {
-          if (ok) setAvailable(true);
-          else if (panel.dataset.open === 'true') startOutage(MSG_DROPPED);
-          else setAvailable(false);
+          if (ok) {
+            healthFailures = 0;
+            setAvailable(true);
+          } else if (++healthFailures >= 2) {
+            // A live socket is better evidence than one failed check; it will report problems.
+            var socketOpen = ws && ws.readyState === WebSocket.OPEN;
+            if (panel.dataset.open !== 'true') setAvailable(false);
+            else if (!socketOpen) startOutage(MSG_DROPPED);
+          }
           watchHealth();
         });
-      }, available ? HEALTH_RECHECK_MS : 30000);
+      }, now ? 0 : available ? HEALTH_RECHECK_MS : HEALTH_RECHECK_DOWN_MS);
     }
-
-    var closingOnPurpose = null;
 
     function connect() {
       if (connecting || (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) return;
       connecting = true;
+      var gen = ++generation;
       wsUrl().then(
         function (url) {
           connecting = false;
@@ -412,10 +470,13 @@
           var opened = false;
           socket.addEventListener('open', function () {
             opened = true;
+            onConnected();
             while (queue.length) socket.send(queue.shift());
           });
           socket.addEventListener('message', onFrame);
           socket.addEventListener('close', function () {
+            if (ws !== socket) return;
+            ws = null;
             // Never replay messages from a failed attempt on a later connection.
             queue = [];
             // Confirm buttons belong to the old session; the server has forgotten those cards.
@@ -425,20 +486,21 @@
             var wasWaiting = waiting;
             if (waiting) setWaiting(false);
             current = null;
-            if (ws === socket) ws = null;
             if (closingOnPurpose === socket) {
               closingOnPurpose = null;
               return;
             }
-            onUnexpectedClose(wasWaiting);
+            if (opened) onDropped(wasWaiting, gen);
+            else onConnectFailed(wasWaiting, gen);
           });
         },
         function () {
+          // e.g. a Turnstile token callback failed
           connecting = false;
           queue = [];
           var wasWaiting = waiting;
           setWaiting(false);
-          onUnexpectedClose(wasWaiting);
+          onConnectFailed(wasWaiting, gen);
         }
       );
     }
@@ -466,12 +528,12 @@
 
     function close() {
       panel.dataset.open = 'false';
+      bubble.setAttribute('aria-expanded', 'false');
+      bubble.setAttribute('aria-label', 'Open chat');
       if (!available) {
         root.hidden = true;
         return;
       }
-      bubble.setAttribute('aria-expanded', 'false');
-      bubble.setAttribute('aria-label', 'Open chat');
       bubble.focus();
     }
 
@@ -496,15 +558,18 @@
         closingOnPurpose = ws;
         ws.close();
       }
-      startOutage(wasWaiting ? MSG_LOST_REPLY : "Sorry, you seem to be offline. We'll reconnect when your connection is back.");
+      startOutage(wasWaiting ? MSG_LOST_REPLY : MSG_OFFLINE);
     });
     window.addEventListener('online', function () {
       if (outage) {
         recoveryDelay = 0;
         scheduleRecovery();
       } else {
-        checkHealth().then(setAvailable);
+        watchHealth(true);
       }
+    });
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible' && !outage) watchHealth(true);
     });
 
     checkHealth().then(function (ok) {

@@ -63,30 +63,39 @@ pub struct Shared {
 }
 
 /// Circuit breaker for the model: the widget hides its button while the chat can't answer.
+/// It opens only after repeated outages seen by at least two different visitors, so one
+/// visitor can't hide the bot for everyone.
 #[derive(Default)]
 struct ModelHealth {
     consecutive_failures: u32,
+    failing_clients: std::collections::HashSet<String>,
     last_failure: Option<std::time::Instant>,
 }
 
 const MODEL_FAILURES_BEFORE_DOWN: u32 = 3;
+const DISTINCT_CLIENTS_BEFORE_DOWN: usize = 2;
 
 impl Shared {
-    pub fn record_model_result(&self, ok: bool) {
+    pub fn record_model_result(&self, ok: bool, client: &str) {
         let mut h = self.model_health.lock().unwrap();
         if ok {
             *h = ModelHealth::default();
         } else {
             h.consecutive_failures += 1;
+            if h.failing_clients.len() < 64 {
+                h.failing_clients.insert(client.to_owned());
+            }
             h.last_failure = Some(std::time::Instant::now());
         }
     }
 
-    /// Down after repeated failures; after the cooldown it reports up again so one real
+    /// Down after repeated outages; after the cooldown it reports up again so one real
     /// request can test the model (a success resets it, a failure trips it again).
     pub fn chat_available(&self) -> bool {
         let h = self.model_health.lock().unwrap();
-        h.consecutive_failures < MODEL_FAILURES_BEFORE_DOWN
+        let tripped = h.consecutive_failures >= MODEL_FAILURES_BEFORE_DOWN
+            && h.failing_clients.len() >= DISTINCT_CLIENTS_BEFORE_DOWN;
+        !tripped
             || h.last_failure
                 .is_none_or(|t| t.elapsed() >= self.config.limits.model_failure_cooldown)
     }
@@ -134,7 +143,8 @@ pub fn app(state: Arc<Shared>) -> Router {
         )
         .layer(CompressionLayer::new());
     let mut router = Router::new()
-        .route("/health", get(health))
+        .route("/health", get(|| async { Json(json!({ "ok": true })) }))
+        .route("/availability", get(availability))
         .route("/ws", get(ws_upgrade))
         .merge(assets);
     if !state.config.production {
@@ -145,8 +155,10 @@ pub fn app(state: Arc<Shared>) -> Router {
         .with_state(state)
 }
 
-/// Readable from any site (the widget checks it before showing its button) and never cached.
-async fn health(State(shared): State<Arc<Shared>>) -> Response {
+/// Whether the chat can answer right now. `/health` stays a plain liveness check so container
+/// health checks don't restart the server during a model outage. Readable from any site (the
+/// widget checks it before showing its button) and never cached.
+async fn availability(State(shared): State<Arc<Shared>>) -> Response {
     let ok = shared.chat_available();
     let status = if ok {
         StatusCode::OK
@@ -332,7 +344,7 @@ async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String)
 
     // One worker per socket keeps a visitor's messages strictly in order.
     let worker_tx = out_tx.clone();
-    let mut session = ChatSession::new(shared.clone(), session_id);
+    let mut session = ChatSession::new(shared.clone(), session_id).with_client(slot.ip.clone());
     let worker = tokio::spawn(async move {
         while let Some(text) = msg_rx.recv().await {
             session.handle_message(&text, &worker_tx).await;
