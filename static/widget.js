@@ -297,6 +297,9 @@
     // says "reconnected" once a new connection has actually opened.
     var available = false;
     var refused = false; // the server keeps refusing connections although it is up
+    var refusedAt = 0;
+    var lastCheckAt = 0;
+    var REFUSAL_COOLDOWN_MS = 300000;
     var outage = false;
     var lostReply = false;
     var connectFailures = 0;
@@ -311,6 +314,7 @@
     var HEALTH_RECHECK_DOWN_MS = 30000;
     var MSG_LOST_REPLY = "Sorry, we lost the connection before your reply arrived. We're reconnecting now.";
     var MSG_DROPPED = "Sorry, the chat connection has dropped. We're trying to reconnect.";
+    var MSG_UNAVAILABLE = "Sorry, the chat isn't available right now. We'll keep trying and let you know when it's back.";
     var MSG_OFFLINE = "Sorry, you seem to be offline. We'll reconnect when your connection is back.";
     var MSG_CANT_CONNECT = "Sorry, the chat can't connect right now. Please try again later.";
     var MSG_NOT_SENT = "Sorry, we couldn't send your message because the chat can't connect right now. Please try again later.";
@@ -324,6 +328,7 @@
 
     function checkHealth() {
       var url = serverBase + '/availability';
+      lastCheckAt = Date.now();
       var controller = typeof AbortController === 'function' ? new AbortController() : null;
       var timer = setTimeout(function () {
         if (controller) controller.abort();
@@ -408,7 +413,7 @@
         if (gen !== generation) return;
         if (!ok) {
           lostReply = lostReply || wasWaiting;
-          if (panel.dataset.open === 'true' || wasWaiting) startOutage(wasWaiting ? MSG_LOST_REPLY : MSG_DROPPED);
+          if (panel.dataset.open === 'true' || wasWaiting) startOutage(wasWaiting ? MSG_LOST_REPLY : MSG_UNAVAILABLE);
           else setAvailable(false);
           return;
         }
@@ -419,6 +424,7 @@
         if (wasWaiting || wasOutage || connectFailures === 1) say('error', wasWaiting ? MSG_NOT_SENT : MSG_CANT_CONNECT);
         if (connectFailures >= 3) {
           refused = true;
+          refusedAt = Date.now();
           setAvailable(false);
         }
       });
@@ -446,6 +452,11 @@
         checkHealth().then(function (ok) {
           if (ok) {
             healthFailures = 0;
+            // Refusals are often temporary (busy server, shared office IP): try again later.
+            if (refused && Date.now() - refusedAt > REFUSAL_COOLDOWN_MS) {
+              refused = false;
+              connectFailures = 0;
+            }
             setAvailable(true);
           } else if (++healthFailures >= 2) {
             // A live socket is better evidence than one failed check; it will report problems.
@@ -569,7 +580,7 @@
       }
     });
     document.addEventListener('visibilitychange', function () {
-      if (document.visibilityState === 'visible' && !outage) watchHealth(true);
+      if (document.visibilityState === 'visible' && !outage && Date.now() - lastCheckAt > 15000) watchHealth(true);
     });
 
     checkHealth().then(function (ok) {

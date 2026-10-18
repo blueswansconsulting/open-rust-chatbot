@@ -74,7 +74,8 @@ never appears and the browser console says why.
 
 The chat button only appears while the chat can answer: the widget checks `/availability`, which
 reports down after repeated model outages seen by more than one visitor. `/health` is a plain liveness
-check for your container or load balancer.
+check for your container or load balancer. Behind a reverse proxy, set `TRUST_PROXY_HEADERS=true` so the outage detector
+can tell visitors apart; otherwise every visitor shares the proxy's IP and the button simply stays visible.
 
 ## Customising the widget
 
