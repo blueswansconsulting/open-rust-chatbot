@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/blueswansconsulting/open-rust-chatbot/security/advisories/new
+    about: Please report security issues privately.
+  - name: Questions and ideas
+    url: https://github.com/blueswansconsulting/open-rust-chatbot/discussions
+    about: Ask and discuss in GitHub Discussions.

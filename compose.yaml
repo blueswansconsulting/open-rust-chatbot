@@ -1,0 +1,15 @@
+# docker compose up -d   (copy .env.example to .env first)
+services:
+  chatbot:
+    image: ghcr.io/blueswansconsulting/open-rust-chatbot:latest
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:8787:8787" # put a TLS reverse proxy (Caddy, nginx, Traefik) in front
+    volumes:
+      - ./examples/knowledge-base.md:/data/knowledge-base.md:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    restart: unless-stopped

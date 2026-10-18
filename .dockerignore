@@ -1,0 +1,5 @@
+target
+.git
+.env
+*.md
+!examples/knowledge-base.md

@@ -1,0 +1,21 @@
+name: Bug report
+description: Something isn't working as documented
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Include steps to reproduce. Please remove API keys, secrets and visitor details.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Version / commit
+  - type: input
+    attributes:
+      label: Model provider (OpenAI, Ollama, OpenRouter, ...)
