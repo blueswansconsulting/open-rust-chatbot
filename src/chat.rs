@@ -29,6 +29,13 @@ fn retrieval_query(history: &[Message], current: &str) -> String {
     format!("{previous} {current}")
 }
 
+/// Errors that mean the model is unreachable (5xx, 429, timeouts, network, auth), as opposed to
+/// a request the provider refused because of its content.
+pub fn is_availability_failure(detail: &str) -> bool {
+    const REQUEST_ERRORS: [&str; 5] = ["HTTP 400", "HTTP 403", "HTTP 404", "HTTP 413", "HTTP 422"];
+    !REQUEST_ERRORS.iter().any(|code| detail.contains(code))
+}
+
 pub fn trim_history(history: &[Message], max_messages: usize) -> Vec<Message> {
     let Some((system, rest)) = history.split_first() else {
         return Vec::new();
@@ -116,7 +123,16 @@ impl ChatSession {
             return;
         }
         self.turns += 1;
-        if let Err(detail) = self.run_turn(text, tx).await {
+        let result = self.run_turn(text, tx).await;
+        match &result {
+            Ok(()) => self.shared.record_model_result(true),
+            // Only outages count, so a visitor can't hide the bot by sending rejected input.
+            Err(detail) if is_availability_failure(detail) => {
+                self.shared.record_model_result(false)
+            }
+            Err(_) => {}
+        }
+        if let Err(detail) = result {
             log_event(
                 "turn_failed",
                 json!({ "session": self.session_id, "detail": detail }),
@@ -368,6 +384,15 @@ mod tests {
             retrieval_query(&h, "How often do I need one?"),
             "I need an EICR in Croydon How often do I need one?"
         );
+    }
+
+    #[test]
+    fn only_outages_count_towards_the_breaker() {
+        assert!(is_availability_failure("bridge HTTP 503"));
+        assert!(is_availability_failure("timed out waiting for the model"));
+        assert!(is_availability_failure("HTTP 401: invalid key"));
+        assert!(!is_availability_failure("bridge HTTP 403"));
+        assert!(!is_availability_failure("HTTP 400: bad request"));
     }
 
     #[test]

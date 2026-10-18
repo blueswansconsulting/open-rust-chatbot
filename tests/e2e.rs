@@ -449,3 +449,119 @@ async fn openclaw_bridge_blip_is_retried_once_and_policy_errors_are_not() {
     assert_eq!(frames[0]["type"], "error");
     assert_eq!(calls.load(Ordering::SeqCst), 3, "403 is not retried");
 }
+
+#[tokio::test]
+async fn health_is_readable_cross_origin_and_never_cached() {
+    let addr = serve(&[]).await;
+    let res = reqwest::Client::new()
+        .get(format!("http://{addr}/health"))
+        .header("origin", "https://shop.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["access-control-allow-origin"], "*");
+    assert_eq!(res.headers()["cache-control"], "no-store");
+}
+
+#[tokio::test]
+async fn health_reports_down_after_repeated_model_failures_and_recovers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let failing = Arc::new(AtomicBool::new(true));
+    let flag = failing.clone();
+    let bridge = axum::Router::new().route(
+        "/bridge",
+        post(move || {
+            let flag = flag.clone();
+            async move {
+                if flag.load(Ordering::SeqCst) {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(json!({"error": "down"})),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"text": "Back."})),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_url = format!("http://{}/bridge", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "openclaw"),
+        ("OPENCLAW_BRIDGE_URL", &bridge_url),
+        ("OPENCLAW_BRIDGE_TOKEN", "t"),
+        ("MODEL_FAILURE_COOLDOWN_SECONDS", "1"),
+    ])
+    .await;
+    let health = || async {
+        reqwest::get(format!("http://{addr}/health"))
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    };
+    let mut ws = connect(&addr, ORIGIN).await.unwrap();
+    for i in 0..3 {
+        assert_eq!(health().await, 200, "healthy before failure {i}");
+        ws.send(Message::Text(format!("question {i}").into()))
+            .await
+            .unwrap();
+        until_done(&mut ws).await;
+    }
+    assert_eq!(
+        health().await,
+        503,
+        "three model failures in a row mark the chat as down"
+    );
+
+    // After the cooldown one request is let through; a success makes it healthy again.
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(health().await, 200);
+    ws.send(Message::Text("again".into())).await.unwrap();
+    assert_eq!(text_of(&until_done(&mut ws).await), "Back.");
+    assert_eq!(health().await, 200);
+}
+
+#[tokio::test]
+async fn rejected_visitor_input_does_not_hide_the_bot() {
+    let bridge = axum::Router::new().route(
+        "/bridge",
+        post(|| async {
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(json!({"error": "not allowed"})),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_url = format!("http://{}/bridge", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "openclaw"),
+        ("OPENCLAW_BRIDGE_URL", &bridge_url),
+        ("OPENCLAW_BRIDGE_TOKEN", "t"),
+    ])
+    .await;
+    let mut ws = connect(&addr, ORIGIN).await.unwrap();
+    for i in 0..5 {
+        ws.send(Message::Text(format!("bad {i}").into()))
+            .await
+            .unwrap();
+        until_done(&mut ws).await;
+    }
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/health"))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+}

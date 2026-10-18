@@ -159,6 +159,8 @@
     root.appendChild(panel);
     root.appendChild(bubble);
     // First in the page so keyboard users reach the chat without tabbing through every link.
+    // Hidden until the server confirms the chat can answer (see checkHealth below).
+    root.hidden = true;
     document.body.insertBefore(root, document.body.firstChild);
 
     var ws = null;
@@ -212,7 +214,10 @@
           current = null;
           append('error', "Sorry, no reply came back. Please try again.");
           announce("Sorry, no reply came back. Please try again.");
-          if (ws) ws.close();
+          if (ws) {
+            closingOnPurpose = ws;
+            ws.close();
+          }
         }, REPLY_TIMEOUT_MS);
       }
       if (value && !typing) {
@@ -286,6 +291,116 @@
       }
     }
 
+    // ---- Availability -------------------------------------------------------------------
+    // The button only shows while the chat works. If the connection drops mid-chat the visitor
+    // gets an apology, the input pauses, and the widget reconnects by itself.
+    var available = false;
+    var outage = false;
+    var recoveryTimer = null;
+    var recoveryDelay = 0;
+    var healthTimer = null;
+    var HEALTH_RECHECK_MS = 120000;
+    var MSG_LOST_REPLY = "Sorry, we lost the connection before your reply arrived. We're reconnecting now.";
+    var MSG_DROPPED = "Sorry, the chat connection has dropped. We're trying to reconnect.";
+    var MSG_BACK = "You're reconnected. Please send your message again.";
+    var MSG_BACK_IDLE = "You're reconnected. Carry on whenever you're ready.";
+
+    function checkHealth() {
+      var controller = typeof AbortController === 'function' ? new AbortController() : null;
+      var timer = setTimeout(function () {
+        if (controller) controller.abort();
+      }, 5000);
+      return fetch(serverBase + '/health', { cache: 'no-store', credentials: 'omit', signal: controller && controller.signal })
+        .then(function (r) {
+          return r.ok;
+        })
+        .catch(function () {
+          return false;
+        })
+        .then(function (ok) {
+          clearTimeout(timer);
+          return ok;
+        });
+    }
+
+    function setAvailable(ok) {
+      available = ok;
+      // Never yank the panel away from someone mid-conversation; just hide the button when idle.
+      root.hidden = !ok && panel.dataset.open !== 'true';
+    }
+
+    function setInputPaused(paused) {
+      input.disabled = paused;
+      sendBtn.disabled = paused || waiting;
+      input.placeholder = paused ? 'Reconnecting…' : TEXT.placeholder;
+    }
+
+    function startOutage(message) {
+      if (!outage) {
+        outage = true;
+        recoveryDelay = 0;
+        append('error', message);
+        announce(message);
+      }
+      setInputPaused(true);
+      scheduleRecovery();
+    }
+
+    function scheduleRecovery() {
+      clearTimeout(recoveryTimer);
+      recoveryDelay = Math.min(recoveryDelay ? recoveryDelay * 2 : 2000, 30000);
+      recoveryTimer = setTimeout(function () {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) return scheduleRecovery();
+        checkHealth().then(function (ok) {
+          if (!ok) return scheduleRecovery();
+          endOutage();
+        });
+      }, recoveryDelay);
+    }
+
+    function endOutage() {
+      clearTimeout(recoveryTimer);
+      setAvailable(true);
+      if (!outage) return;
+      outage = false;
+      setInputPaused(false);
+      var msg = lostReply ? MSG_BACK : MSG_BACK_IDLE;
+      lostReply = false;
+      append('assistant', msg);
+      announce(msg);
+    }
+
+    var lostReply = false;
+
+    // An unexpected close: if a reply was in flight it is lost; otherwise only treat it as an
+    // outage if the server is really unreachable (idle timeouts close sockets harmlessly).
+    function onUnexpectedClose(wasWaiting) {
+      if (wasWaiting) {
+        lostReply = true;
+        startOutage(MSG_LOST_REPLY);
+        return;
+      }
+      checkHealth().then(function (ok) {
+        if (!ok && panel.dataset.open === 'true') startOutage(MSG_DROPPED);
+        else if (!ok) setAvailable(false);
+      });
+    }
+
+    function watchHealth() {
+      clearTimeout(healthTimer);
+      healthTimer = setTimeout(function () {
+        if (document.visibilityState === 'hidden' || outage) return watchHealth();
+        checkHealth().then(function (ok) {
+          if (ok) setAvailable(true);
+          else if (panel.dataset.open === 'true') startOutage(MSG_DROPPED);
+          else setAvailable(false);
+          watchHealth();
+        });
+      }, available ? HEALTH_RECHECK_MS : 30000);
+    }
+
+    var closingOnPurpose = null;
+
     function connect() {
       if (connecting || (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) return;
       connecting = true;
@@ -307,19 +422,23 @@
             messages.querySelectorAll('.orc-card-action').forEach(function (b) {
               b.disabled = true;
             });
-            if (waiting || !opened) {
-              setWaiting(false);
-              append('error', opened ? 'Connection lost. Please try again.' : 'Could not connect. Please try again.');
-            }
+            var wasWaiting = waiting;
+            if (waiting) setWaiting(false);
             current = null;
             if (ws === socket) ws = null;
+            if (closingOnPurpose === socket) {
+              closingOnPurpose = null;
+              return;
+            }
+            onUnexpectedClose(wasWaiting);
           });
         },
         function () {
           connecting = false;
           queue = [];
+          var wasWaiting = waiting;
           setWaiting(false);
-          append('error', 'Could not connect. Please try again.');
+          onUnexpectedClose(wasWaiting);
         }
       );
     }
@@ -347,6 +466,10 @@
 
     function close() {
       panel.dataset.open = 'false';
+      if (!available) {
+        root.hidden = true;
+        return;
+      }
       bubble.setAttribute('aria-expanded', 'false');
       bubble.setAttribute('aria-label', 'Open chat');
       bubble.focus();
@@ -362,19 +485,36 @@
       if (e.key === 'Escape' && panel.dataset.open === 'true') close();
     });
     window.addEventListener('offline', function () {
-      if (panel.dataset.open !== 'true' && !waiting) return;
+      if (panel.dataset.open !== 'true' && !waiting) return setAvailable(false);
+      var wasWaiting = waiting;
       if (waiting) {
         setWaiting(false);
         current = null;
       }
-      append('error', "You're offline. Check your connection and try again.");
-      announce("You're offline.");
-      if (ws) ws.close();
+      lostReply = lostReply || wasWaiting;
+      if (ws) {
+        closingOnPurpose = ws;
+        ws.close();
+      }
+      startOutage(wasWaiting ? MSG_LOST_REPLY : "Sorry, you seem to be offline. We'll reconnect when your connection is back.");
+    });
+    window.addEventListener('online', function () {
+      if (outage) {
+        recoveryDelay = 0;
+        scheduleRecovery();
+      } else {
+        checkHealth().then(setAvailable);
+      }
+    });
+
+    checkHealth().then(function (ok) {
+      setAvailable(ok);
+      watchHealth();
     });
     inputRow.addEventListener('submit', function (e) {
       e.preventDefault();
       var text = input.value.trim();
-      if (!text || waiting) return;
+      if (!text || waiting || outage) return;
       append('user', text);
       input.value = '';
       setWaiting(true);
