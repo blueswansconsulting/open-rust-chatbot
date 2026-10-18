@@ -37,6 +37,17 @@ async fn serve(extra: &[(&str, &str)]) -> String {
     addr.to_string()
 }
 
+async fn connect_from(addr: &str, origin: &str, client_ip: &str) -> Result<Ws, String> {
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("origin", origin.parse().unwrap());
+    req.headers_mut()
+        .insert("x-forwarded-for", client_ip.parse().unwrap());
+    tokio_tungstenite::connect_async(req)
+        .await
+        .map(|(ws, _)| ws)
+        .map_err(|e| e.to_string())
+}
+
 async fn connect(addr: &str, origin: &str) -> Result<Ws, String> {
     let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
     req.headers_mut().insert("origin", origin.parse().unwrap());
@@ -448,4 +459,139 @@ async fn openclaw_bridge_blip_is_retried_once_and_policy_errors_are_not() {
     let frames = until_done(&mut ws).await;
     assert_eq!(frames[0]["type"], "error");
     assert_eq!(calls.load(Ordering::SeqCst), 3, "403 is not retried");
+}
+
+#[tokio::test]
+async fn availability_is_readable_cross_origin_and_never_cached() {
+    let addr = serve(&[]).await;
+    let res = reqwest::Client::new()
+        .get(format!("http://{addr}/availability"))
+        .header("origin", "https://shop.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["access-control-allow-origin"], "*");
+    assert_eq!(res.headers()["cache-control"], "no-store");
+}
+
+#[tokio::test]
+async fn health_reports_down_after_repeated_model_failures_and_recovers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let failing = Arc::new(AtomicBool::new(true));
+    let flag = failing.clone();
+    let bridge = axum::Router::new().route(
+        "/bridge",
+        post(move || {
+            let flag = flag.clone();
+            async move {
+                if flag.load(Ordering::SeqCst) {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(json!({"error": "down"})),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(json!({"text": "Back."})),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_url = format!("http://{}/bridge", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "openclaw"),
+        ("OPENCLAW_BRIDGE_URL", &bridge_url),
+        ("OPENCLAW_BRIDGE_TOKEN", "t"),
+        ("MODEL_FAILURE_COOLDOWN_SECONDS", "1"),
+        ("TRUST_PROXY_HEADERS", "true"),
+    ])
+    .await;
+    let health = || async {
+        reqwest::get(format!("http://{addr}/availability"))
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    };
+    // One visitor alone can't hide the bot, however many failures they cause.
+    let mut ws = connect_from(&addr, ORIGIN, "198.51.100.1").await.unwrap();
+    for i in 0..4 {
+        ws.send(Message::Text(format!("question {i}").into()))
+            .await
+            .unwrap();
+        until_done(&mut ws).await;
+    }
+    assert_eq!(
+        health().await,
+        200,
+        "a single visitor's failures don't trip the breaker"
+    );
+
+    // Outages seen by a second visitor do.
+    let mut other = connect_from(&addr, ORIGIN, "198.51.100.2").await.unwrap();
+    other.send(Message::Text("hello".into())).await.unwrap();
+    until_done(&mut other).await;
+    assert_eq!(
+        health().await,
+        503,
+        "repeated outages across visitors mark the chat as down"
+    );
+    let liveness = reqwest::get(format!("http://{addr}/health"))
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(
+        liveness, 200,
+        "liveness stays up so the container isn't restarted"
+    );
+
+    // After the cooldown one request is let through; a success makes it healthy again.
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(health().await, 200);
+    ws.send(Message::Text("again".into())).await.unwrap();
+    assert_eq!(text_of(&until_done(&mut ws).await), "Back.");
+    assert_eq!(health().await, 200);
+}
+
+#[tokio::test]
+async fn rejected_visitor_input_does_not_hide_the_bot() {
+    let bridge = axum::Router::new().route(
+        "/bridge",
+        post(|| async {
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(json!({"error": "not allowed"})),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_url = format!("http://{}/bridge", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "openclaw"),
+        ("OPENCLAW_BRIDGE_URL", &bridge_url),
+        ("OPENCLAW_BRIDGE_TOKEN", "t"),
+    ])
+    .await;
+    let mut ws = connect(&addr, ORIGIN).await.unwrap();
+    for i in 0..5 {
+        ws.send(Message::Text(format!("bad {i}").into()))
+            .await
+            .unwrap();
+        until_done(&mut ws).await;
+    }
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/availability"))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 }

@@ -9,6 +9,7 @@ DEV_MODE=true MOCK_LLM=true KNOWLEDGE_BASE_PATH=examples/knowledge-base.md cargo
 cargo test          # unit + end-to-end WebSocket tests, a few seconds
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+cargo build && (cd tests/browser && npm ci && npx playwright install chromium && npm test)   # widget browser tests
 ```
 
 The widget (`static/widget.js`) is plain JavaScript with no build step and is embedded in the binary.
