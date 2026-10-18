@@ -58,6 +58,7 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<LlmEvent, String>> + Sen
 const HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ATTEMPTS: u32 = 3;
+const BRIDGE_RETRY_DELAY_MS: u64 = 750;
 
 pub struct Llm {
     config: LlmConfig,
@@ -253,19 +254,35 @@ impl Llm {
             "timeoutSeconds": timeout_seconds,
             "message": openclaw_prompt(messages),
         });
-        let response = self
-            .http
-            .post(bridge_url)
-            .timeout(Duration::from_secs(timeout_seconds.saturating_add(15)))
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("bridge request failed: {}", e.without_url()))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(format!("bridge HTTP {}", status.as_u16()));
-        }
+        // One retry for transient bridge failures (agent crash, busy slot, gateway restart),
+        // so a single blip doesn't reach the visitor. Auth and policy errors are not retried.
+        let mut attempt = 0;
+        let response = loop {
+            attempt += 1;
+            let result = self
+                .http
+                .post(bridge_url)
+                .timeout(Duration::from_secs(timeout_seconds.saturating_add(15)))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await;
+            let retry = match &result {
+                Err(e) => !e.is_timeout(),
+                Ok(r) => matches!(r.status().as_u16(), 429 | 500 | 502 | 503 | 504),
+            };
+            if retry && attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(BRIDGE_RETRY_DELAY_MS)).await;
+                continue;
+            }
+            let response =
+                result.map_err(|e| format!("bridge request failed: {}", e.without_url()))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!("bridge HTTP {}", status.as_u16()));
+            }
+            break response;
+        };
         let payload: Value = response
             .json()
             .await
