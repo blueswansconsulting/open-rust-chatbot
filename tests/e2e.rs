@@ -337,11 +337,7 @@ async fn flooding_without_reading_gets_the_socket_closed_with_few_replies() {
     let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match ws.next().await {
-                Some(Ok(Message::Text(t))) => {
-                    if t.contains("\"error\"") {
-                        errors += 1;
-                    }
-                }
+                Some(Ok(Message::Text(t))) if t.contains("\"error\"") => errors += 1,
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return true,
                 _ => {}
             }
