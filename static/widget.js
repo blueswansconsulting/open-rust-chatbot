@@ -169,7 +169,9 @@
     var waiting = false;
     var greeted = false;
     var replyTimer = null;
-    var REPLY_TIMEOUT_MS = 45000;
+    var REPLY_TIMEOUT_MS = 60000;
+    var SLOW_REPLY_MS = 15000;
+    var slowTimer = null;
 
     function announce(text) {
       announcer.textContent = '';
@@ -194,7 +196,15 @@
       waiting = value;
       sendBtn.disabled = value;
       clearTimeout(replyTimer);
+      clearTimeout(slowTimer);
       if (value) {
+        // Busy times queue replies; tell the visitor we're still on it.
+        slowTimer = setTimeout(function () {
+          if (waiting && typing && !typing.querySelector('.orc-typing-note')) {
+            typing.appendChild(el('em', 'orc-typing-note', 'Still working on it…'));
+            scroll();
+          }
+        }, SLOW_REPLY_MS);
         // Never leave the visitor watching typing dots forever.
         replyTimer = setTimeout(function () {
           if (!waiting) return;

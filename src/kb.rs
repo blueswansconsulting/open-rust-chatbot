@@ -33,9 +33,24 @@ fn tokens(text: &str) -> Vec<String> {
         .collect();
     cleaned
         .split_whitespace()
-        .filter(|t| t.len() > 2)
-        .map(str::to_owned)
+        .filter(|t| t.len() > 2 && !is_stopword(t))
+        .map(stem)
         .collect()
+}
+
+/// Very light English stemming so "rank", "ranks", "ranked" and "ranking" match each other.
+fn stem(word: &str) -> String {
+    let w = word;
+    let stripped = if w.len() > 5 && w.ends_with("ing") {
+        &w[..w.len() - 3]
+    } else if w.len() > 4 && w.ends_with("ed") {
+        &w[..w.len() - 2]
+    } else if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") {
+        &w[..w.len() - 1]
+    } else {
+        w
+    };
+    stripped.to_owned()
 }
 
 fn chunk(id: String, header_path: Vec<String>, text: String) -> KnowledgeChunk {
@@ -193,6 +208,23 @@ impl KnowledgeBase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stemming_matches_word_forms() {
+        let kb = KnowledgeBase::from_markdown(
+            "# How listings are ranked\nListings are ordered editorially.\n# Other\nNothing here.",
+        );
+        assert_eq!(
+            kb.search("how do you rank electricians", 1)[0].header_path,
+            vec!["How listings are ranked"]
+        );
+        assert_eq!(
+            kb.search("ranking", 1)[0].header_path,
+            vec!["How listings are ranked"]
+        );
+        assert_eq!(stem("boxes"), "boxe");
+        assert_eq!(stem("address"), "address");
+    }
 
     #[test]
     fn rare_words_and_headings_beat_common_words() {
