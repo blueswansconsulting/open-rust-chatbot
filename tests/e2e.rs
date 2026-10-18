@@ -384,3 +384,47 @@ fn client_ip_trusts_only_the_configured_header_and_groups_ipv6() {
         "2001:db8:1:2::/64"
     );
 }
+
+#[tokio::test]
+async fn chatgpt_mode_asks_visitor_to_sign_in_and_redirects_to_openai() {
+    let data_dir = std::env::temp_dir().join(format!("orc-e2e-{}", uuid::Uuid::new_v4()));
+    let data_dir_str = data_dir.to_string_lossy().to_string();
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "chatgpt"),
+        ("CHATGPT_DATA_DIR", &data_dir_str),
+    ])
+    .await;
+    let mut ws = connect(&addr, ORIGIN).await.unwrap();
+    ws.send(Message::Text("hello".into())).await.unwrap();
+    let frames = until_done(&mut ws).await;
+    assert_eq!(
+        frames[0],
+        json!({"type": "auth_required", "url": "/auth/chatgpt/start"})
+    );
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let res = client
+        .get(format!("http://{addr}/auth/chatgpt/start"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 303);
+    let location = res.headers()["location"].to_str().unwrap();
+    assert!(location.starts_with(
+        "https://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client"
+    ));
+
+    // A forged callback is refused and sets no cookie.
+    let bad = client
+        .get(format!("http://{addr}/auth/callback?state=forged&code=x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    assert!(bad.headers().get("set-cookie").is_none());
+    std::fs::remove_dir_all(data_dir).ok();
+}

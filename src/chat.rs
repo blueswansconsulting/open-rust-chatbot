@@ -65,10 +65,20 @@ pub struct ChatSession {
     history: Vec<Message>,
     pending_leads: HashMap<String, Lead>,
     turns: usize,
+    visitor_token: Option<String>,
 }
 
 impl ChatSession {
     pub fn new(shared: Arc<Shared>, session_id: String) -> Self {
+        Self::with_visitor_token(shared, session_id, None)
+    }
+
+    /// `visitor_token` is the signed-in visitor's ChatGPT access token (Sign in with ChatGPT mode).
+    pub fn with_visitor_token(
+        shared: Arc<Shared>,
+        session_id: String,
+        visitor_token: Option<String>,
+    ) -> Self {
         let system = Message::new(Role::System, shared.config.system_prompt.clone());
         Self {
             shared,
@@ -76,12 +86,28 @@ impl ChatSession {
             history: vec![system],
             pending_leads: HashMap::new(),
             turns: 0,
+            visitor_token,
         }
+    }
+
+    fn needs_sign_in(&self) -> bool {
+        matches!(
+            self.shared.config.llm,
+            crate::config::LlmConfig::ChatGpt { .. }
+        ) && self.visitor_token.is_none()
     }
 
     pub async fn handle_message(&mut self, text: &str, tx: &Sender) {
         if let Some(lead_id) = parse_confirmation(text) {
             self.confirm_lead(&lead_id, tx).await;
+            return;
+        }
+        if self.needs_sign_in() {
+            send(
+                tx,
+                json!({ "type": "auth_required", "url": "/auth/chatgpt/start" }),
+            );
+            send(tx, json!({ "type": "done" }));
             return;
         }
         let limits = &self.shared.config.limits;
@@ -108,7 +134,14 @@ impl ChatSession {
                 "turn_failed",
                 json!({ "session": self.session_id, "detail": detail }),
             );
-            send(tx, json!({ "type": "error", "message": GENERIC_ERROR }));
+            let message = if detail.contains("subscription_sharing_usage") {
+                "Your ChatGPT plan's usage limit has been reached, or plan usage isn't available for your account."
+            } else if detail.starts_with("HTTP 401") {
+                "Your ChatGPT sign-in has expired. Please sign in again."
+            } else {
+                GENERIC_ERROR
+            };
+            send(tx, json!({ "type": "error", "message": message }));
         }
     }
 
@@ -127,6 +160,7 @@ impl ChatSession {
                 .stream(
                     &trim_history(&self.history, max_history),
                     &self.shared.tool_definitions,
+                    self.visitor_token.as_deref(),
                 )
                 .await?;
             while let Some(event) = stream.next().await {
@@ -184,7 +218,7 @@ impl ChatSession {
             system.content.push_str(&excerpts.join("\n"));
         }
         let mut reply = String::new();
-        let mut stream = self.shared.llm.stream(&messages, &[]).await?;
+        let mut stream = self.shared.llm.stream(&messages, &[], None).await?;
         while let Some(event) = stream.next().await {
             if let LlmEvent::Token(value) = event? {
                 reply.push_str(&value);

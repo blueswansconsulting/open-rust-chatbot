@@ -67,6 +67,17 @@ enforces header timeouts. Set `TRUST_PROXY_HEADERS=true` so rate limits use the 
 If your site sends a Content-Security-Policy, allow the chatbot's origin in `script-src`, `style-src`
 and `connect-src` (as `wss://chat.your-domain.com`).
 
+### Experimental: Sign in with ChatGPT (local only)
+
+Set `LLM_PROVIDER=chatgpt` and visitors are asked to **sign in with their own ChatGPT account**; their
+replies are billed to their own ChatGPT plan (OpenAI's [Sign in with ChatGPT](https://developers.openai.com/siwc)
+plan usage, currently a preview for open-source and locally hosted apps).
+
+OpenAI requires the sign-in redirect to be `http://127.0.0.1:<port>/auth/callback`, so this mode only
+works when the chatbot runs on the visitor's own machine (`HOST=127.0.0.1`, enforced). It cannot serve a
+public website. Options: `CHATGPT_MODEL` (default `gpt-5.6-luna`), `CHATGPT_DATA_DIR` (default `.orc-data`,
+holds only the issued client id). Tokens are kept in memory, never logged, and expire with the session.
+
 ## Customising the widget
 
 ```html

@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod chat;
+pub mod chatgpt;
 pub mod config;
 pub mod kb;
 pub mod llm;
@@ -43,6 +44,8 @@ fn now_ms() -> u64 {
 const WIDGET_JS: &str = include_str!("../static/widget.js");
 const WIDGET_CSS: &str = include_str!("../static/widget.css");
 const DEMO_HTML: &str = include_str!("../static/demo.html");
+// Tells the widget (in the opener window) that sign-in finished, then closes the popup.
+const AUTH_DONE_JS: &str = "if (window.opener) { window.opener.postMessage({ type: 'orc-signed-in' }, '*'); } setTimeout(function () { window.close(); }, 800);";
 const MAX_WS_FRAME_BYTES: usize = 16 * 1024;
 const MAX_REJECTION_REPLIES: usize = 3;
 const MAX_REJECTED_FRAMES: usize = 20;
@@ -56,6 +59,7 @@ pub struct Shared {
     pub llm: llm::Llm,
     pub http: reqwest::Client,
     pub tool_definitions: Vec<tools::ToolDefinition>,
+    pub chatgpt: Option<chatgpt::ChatGpt>,
     rate_limiter: RateLimiter,
     open_connections: AtomicUsize,
 }
@@ -70,8 +74,15 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
         .user_agent(concat!("open-rust-chatbot/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(std::io::Error::other)?;
+    let chatgpt = match &config.llm {
+        config::LlmConfig::ChatGpt { data_dir, .. } => {
+            Some(chatgpt::ChatGpt::new(config.port, data_dir.into())?)
+        }
+        _ => None,
+    };
     let limits = &config.limits;
     Ok(Arc::new(Shared {
+        chatgpt,
         rate_limiter: RateLimiter::new(
             limits.max_messages_per_window,
             limits.rate_window.as_millis() as u64,
@@ -106,6 +117,15 @@ pub fn app(state: Arc<Shared>) -> Router {
         .merge(assets);
     if !state.config.production {
         router = router.route("/", get(|| async { Html(DEMO_HTML) }));
+    }
+    if state.chatgpt.is_some() {
+        router = router
+            .route("/auth/chatgpt/start", get(chatgpt_start))
+            .route("/auth/callback", get(chatgpt_callback))
+            .route(
+                "/auth/done.js",
+                get(|| async { asset("text/javascript; charset=utf-8", AUTH_DONE_JS) }),
+            );
     }
     router
         .layer(middleware::from_fn(security_headers))
@@ -255,15 +275,24 @@ async fn ws_upgrade(
         }
     }
     let session_id = uuid::Uuid::new_v4().to_string();
+    let visitor_token = shared
+        .chatgpt
+        .as_ref()
+        .and_then(|g| cookie(&headers, chatgpt::COOKIE).and_then(|sid| g.access_token(&sid)));
     ws.max_message_size(MAX_WS_FRAME_BYTES)
         .max_frame_size(MAX_WS_FRAME_BYTES)
         .read_buffer_size(WS_BUFFER_BYTES)
         .write_buffer_size(WS_BUFFER_BYTES)
         // If the upgrade fails the closure (and the slot inside it) is dropped, releasing it.
-        .on_upgrade(move |socket| run_socket(socket, slot, session_id))
+        .on_upgrade(move |socket| run_socket(socket, slot, session_id, visitor_token))
 }
 
-async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String) {
+async fn run_socket(
+    socket: WebSocket,
+    slot: ConnectionSlot,
+    session_id: String,
+    visitor_token: Option<String>,
+) {
     let shared = slot.shared.clone();
     let (mut sink, mut inbound) = socket.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -280,7 +309,7 @@ async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String)
 
     // One worker per socket keeps a visitor's messages strictly in order.
     let worker_tx = out_tx.clone();
-    let mut session = ChatSession::new(shared.clone(), session_id);
+    let mut session = ChatSession::with_visitor_token(shared.clone(), session_id, visitor_token);
     let worker = tokio::spawn(async move {
         while let Some(text) = msg_rx.recv().await {
             session.handle_message(&text, &worker_tx).await;
@@ -332,4 +361,72 @@ async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String)
     drop(out_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
     drop(slot);
+}
+
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.to_owned())
+}
+
+async fn chatgpt_start(State(shared): State<Arc<Shared>>) -> Response {
+    match &shared.chatgpt {
+        Some(g) => axum::response::Redirect::to(&g.start()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn auth_page(title: &str, body: &str, signed_in: bool) -> Html<String> {
+    let script = if signed_in {
+        r#"<script src="/auth/done.js"></script>"#
+    } else {
+        ""
+    };
+    Html(format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{title}</title></head><body><h1>{title}</h1><p>{body}</p>{script}</body></html>"
+    ))
+}
+
+async fn chatgpt_callback(
+    State(shared): State<Arc<Shared>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(g) = &shared.chatgpt else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match g.finish(&shared.http, &query).await {
+        Ok(sid) => {
+            log::log_event("chatgpt_signed_in", json!({}));
+            let cookie = format!(
+                "{}={sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age=3600",
+                chatgpt::COOKIE
+            );
+            (
+                [(header::SET_COOKIE, cookie)],
+                auth_page("Signed in", "You're signed in with ChatGPT. You can close this window and go back to the chat.", true),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            log::log_event(
+                "chatgpt_sign_in_failed",
+                json!({ "reason": format!("{err:?}") }),
+            );
+            let message = match err {
+                chatgpt::CallbackError::Denied => "Sign-in was cancelled.",
+                chatgpt::CallbackError::PlanUsageNotGranted => "ChatGPT plan usage wasn't granted, so this chat can't use your plan. It needs an eligible ChatGPT plan and your consent.",
+                _ => "Sign-in didn't complete. Please close this window and try again.",
+            };
+            (
+                StatusCode::BAD_REQUEST,
+                auth_page("Sign-in failed", message, false),
+            )
+                .into_response()
+        }
+    }
 }
