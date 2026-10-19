@@ -25,7 +25,8 @@ pub fn sign(secret: &str, timestamp: u64, body: &[u8]) -> String {
 /// The signed lead body. In multi-site mode it carries `siteId`, so the receiver can check it
 /// matches the `site` query parameter (the query string is not covered by the signature).
 pub fn payload(lead: &Lead, bot_name: &str, site_id: &str) -> Vec<u8> {
-    let mut body = json!({ "type": "lead", "bot": bot_name, "lead": lead, "submittedAt": crate::now_iso() });
+    let mut body =
+        json!({ "type": "lead", "bot": bot_name, "lead": lead, "submittedAt": crate::now_iso() });
     if !site_id.is_empty() {
         body["siteId"] = json!(site_id);
     }

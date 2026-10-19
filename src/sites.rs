@@ -92,6 +92,25 @@ impl Site {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests(id: &str) -> Self {
+        Site {
+            id: id.into(),
+            bot_name: "b".into(),
+            system_prompt: String::new(),
+            kb: Arc::new(KnowledgeBase::from_markdown("")),
+            lead_capture: false,
+            tool_definitions: Vec::new(),
+            lead_webhook_url: None,
+            allowed_origins: Vec::new(),
+            public_config: Value::Null,
+            partner_id: None,
+            caps: SpendCaps::default(),
+            version_key: "v1".into(),
+            size: 0,
+        }
+    }
+
     pub fn allows_origin(&self, origin: &str) -> bool {
         self.allowed_origins.iter().any(|a| a == origin)
     }
@@ -640,21 +659,9 @@ mod tests {
     }
 
     fn site(size: usize) -> Arc<Site> {
-        Arc::new(Site {
-            id: "x".into(),
-            bot_name: "b".into(),
-            system_prompt: String::new(),
-            kb: Arc::new(KnowledgeBase::from_markdown("")),
-            lead_capture: false,
-            tool_definitions: Vec::new(),
-            lead_webhook_url: None,
-            allowed_origins: Vec::new(),
-            public_config: Value::Null,
-            partner_id: None,
-            caps: SpendCaps::default(),
-            version_key: "v1".into(),
-            size,
-        })
+        let mut s = Site::for_tests("x");
+        s.size = size;
+        Arc::new(s)
     }
 
     fn found(size: usize, used: Instant) -> Entry {

@@ -41,6 +41,7 @@ async fn main() {
             std::process::exit(2);
         });
     eprintln!("open-rust-chatbot listening on http://{addr}");
+    let on_exit = state.clone();
     axum::serve(
         listener,
         app(state).into_make_service_with_connect_info::<SocketAddr>(),
@@ -48,6 +49,8 @@ async fn main() {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .expect("server error");
+    // Send any usage counted since the last report, so a deploy doesn't lose it.
+    open_rust_chatbot::flush_usage_now(&on_exit).await;
 }
 
 async fn shutdown_signal() {

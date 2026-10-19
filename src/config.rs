@@ -46,6 +46,11 @@ pub struct SitesConfig {
     pub partner_stale_ttl: Duration,
     /// Approximate memory budget for cached bots; least recently used bots are dropped first.
     pub max_cache_bytes: usize,
+    /// Where reply counts are sent (`USAGE_API_URL`, default: `SITES_API_URL` with `/bots`
+    /// replaced by `/usage`). Reporting is off without `USAGE_TOKEN`.
+    pub usage_url: Option<String>,
+    pub usage_token: Option<String>,
+    pub usage_flush: Duration,
 }
 
 impl std::fmt::Debug for SitesConfig {
@@ -57,6 +62,12 @@ impl std::fmt::Debug for SitesConfig {
             .field("stale_ttl", &self.stale_ttl)
             .field("partner_stale_ttl", &self.partner_stale_ttl)
             .field("max_cache_bytes", &self.max_cache_bytes)
+            .field("usage_url", &self.usage_url)
+            .field(
+                "usage_token",
+                &self.usage_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("usage_flush", &self.usage_flush)
             .finish()
     }
 }
@@ -178,8 +189,35 @@ impl Config {
                         .into(),
                 );
             }
+            let api_url = url.trim_end_matches('/').to_owned();
+            let usage_url = env.get("USAGE_API_URL").or_else(|| {
+                api_url
+                    .strip_suffix("/bots")
+                    .map(|base| format!("{base}/usage"))
+            });
+            if let Some(u) = &usage_url {
+                if !(u.starts_with("https://") || u.starts_with("http://")) {
+                    errors.push(format!("USAGE_API_URL {u:?} must be an http(s) URL"));
+                }
+            }
+            let usage_token = env.get("USAGE_TOKEN").filter(|t| !t.is_empty());
+            if let Some(t) = &usage_token {
+                if t.len() < 32 {
+                    errors.push("USAGE_TOKEN must be at least 32 characters".into());
+                } else if *t == token {
+                    errors.push("USAGE_TOKEN must differ from INTERNAL_API_TOKEN".into());
+                }
+                if usage_url.is_none() {
+                    errors.push("USAGE_API_URL is required when SITES_API_URL doesn't end in /bots".into());
+                }
+            }
             SitesConfig {
-                api_url: url.trim_end_matches('/').to_owned(),
+                api_url,
+                usage_url,
+                usage_token,
+                usage_flush: Duration::from_secs(
+                    env.num::<u64>("USAGE_FLUSH_SECONDS", 60, &mut errors).max(1),
+                ),
                 token,
                 cache_ttl: Duration::from_secs(env.num("SITES_CACHE_SECONDS", 30, &mut errors)),
                 stale_ttl: Duration::from_secs(env.num("SITES_STALE_SECONDS", 600, &mut errors)),

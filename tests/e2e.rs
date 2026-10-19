@@ -184,7 +184,10 @@ async fn lead_is_only_sent_after_visitor_confirms_and_is_signed() {
     );
     let payload: Value = serde_json::from_str(body).unwrap();
     assert_eq!(payload["lead"]["email"], "sam@example.com");
-    assert!(payload.get("siteId").is_none(), "single-site leads carry no site id");
+    assert!(
+        payload.get("siteId").is_none(),
+        "single-site leads carry no site id"
+    );
 
     // Confirming twice does not resend.
     ws.send(Message::Text(
