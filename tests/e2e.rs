@@ -794,3 +794,18 @@ fn parked_store_sweeps_expired_entries_on_save() {
     );
     assert!(shared.take_session("active").is_some());
 }
+
+#[test]
+fn idle_sweep_removes_expired_chats_without_any_new_traffic() {
+    let config = Config::from_pairs(&[
+        ("DEV_MODE", "true"),
+        ("MOCK_LLM", "true"),
+        ("RESUME_TTL_SECONDS", "1"),
+    ])
+    .unwrap();
+    let shared = build_state(config).unwrap();
+    shared.save_session("abandoned", Default::default());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    shared.sweep_expired_sessions();
+    assert_eq!(shared.parked_sessions(), 0);
+}

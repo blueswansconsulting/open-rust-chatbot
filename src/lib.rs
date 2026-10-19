@@ -133,6 +133,15 @@ impl Shared {
         (stored.saved.elapsed() < self.config.limits.resume_ttl).then_some(stored.chat)
     }
 
+    /// Drops expired parked chats. Runs on a timer (see main.rs) so contact details don't
+    /// linger on a quiet site, as well as opportunistically on save.
+    pub fn sweep_expired_sessions(&self) {
+        let ttl = self.config.limits.resume_ttl;
+        let mut store = self.resume_store.lock().unwrap();
+        store.last_sweep = Some(std::time::Instant::now());
+        store.sessions.retain(|_, s| s.saved.elapsed() < ttl);
+    }
+
     /// Number of parked conversations (for tests and monitoring).
     pub fn parked_sessions(&self) -> usize {
         self.resume_store.lock().unwrap().sessions.len()

@@ -26,6 +26,14 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let sweeper = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            sweeper.sweep_expired_sessions();
+        }
+    });
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| {

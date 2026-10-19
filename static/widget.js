@@ -254,6 +254,7 @@
       saved.slice(-MAX_SAVED_MESSAGES).forEach(function (m) {
         if (!m || (m.r !== 'user' && m.r !== 'assistant')) return;
         var div = append(m.r, String(m.t || ''));
+        div.setAttribute('data-restored', '');
         if (m.r === 'assistant') linkify(div);
       });
       return true;
@@ -344,10 +345,14 @@
         // a conversation the assistant no longer remembers.
         if (frame.resumed === false && restoredFromStorage) {
           restoredFromStorage = false;
-          messages.textContent = '';
-          store.set('transcript', null);
-          append('notice', 'Your earlier chat has ended, so this is a new conversation.');
-          append('assistant', TEXT.greeting);
+          // Remove only the restored messages, so anything typed meanwhile stays.
+          messages.querySelectorAll('[data-restored]').forEach(function (m) {
+            m.remove();
+          });
+          var notice = append('notice', 'Your earlier chat has ended, so this is a new conversation.');
+          var greeting = append('assistant', TEXT.greeting);
+          messages.insertBefore(greeting, messages.firstChild);
+          messages.insertBefore(notice, greeting);
           saveTranscript();
         }
         restoredFromStorage = false;
