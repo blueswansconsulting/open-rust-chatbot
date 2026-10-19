@@ -494,7 +494,7 @@ impl ChatSession {
             &self.shared.config.lead_webhook_secret,
         ) {
             (Some(url), Some(secret)) => {
-                let body = crate::webhook::payload(&lead, &self.site.bot_name);
+                let body = crate::webhook::payload(&lead, &self.site.bot_name, &self.site.id);
                 crate::webhook::deliver(&self.shared.http, url, secret, body).await
             }
             // No webhook configured: record that a lead arrived (PII redacted) so local demos work.

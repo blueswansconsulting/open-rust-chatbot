@@ -560,6 +560,9 @@ async fn lead_webhook_url_carries_the_bot_id_as_site() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "x=1&site=beta-02");
     assert_eq!(calls[0].1["bot"], "Beta Bot");
+    // The bot id is inside the signed body too, so a captured request can't be replayed
+    // against another site by changing the query string.
+    assert_eq!(calls[0].1["siteId"], "beta-02");
 }
 
 #[tokio::test]
