@@ -277,7 +277,7 @@ async fn unknown_and_paused_bots_are_404_on_every_route() {
 #[tokio::test]
 async fn bad_ids_are_rejected_without_fetching() {
     let h = start(&[]).await;
-    for id in ["ab", "UPPER", "has_underscore", &"x".repeat(41), "dot.dot"] {
+    for id in ["a", "UPPER", "has_underscore", &"x".repeat(41), "dot.dot"] {
         assert_eq!(
             status(format!("http://{}/b/{id}/config", h.addr)).await,
             404,

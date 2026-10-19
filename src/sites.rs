@@ -75,9 +75,9 @@ impl Site {
     }
 }
 
-/// Bot ids are `[a-z0-9-]{3,40}`; anything else is rejected before any fetch.
+/// Bot ids are `[a-z0-9-]{2,40}`; anything else is rejected before any fetch.
 pub fn valid_id(id: &str) -> bool {
-    (3..=40).contains(&id.len())
+    (2..=40).contains(&id.len())
         && id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -464,8 +464,13 @@ mod tests {
 
     #[test]
     fn ids_are_short_lowercase_slugs() {
-        assert!(valid_id("abc") && valid_id("plumbing-co-7f3a") && valid_id(&"a".repeat(40)));
-        assert!(!valid_id("ab") && !valid_id(&"a".repeat(41)));
+        assert!(
+            valid_id("er")
+                && valid_id("abc")
+                && valid_id("plumbing-co-7f3a")
+                && valid_id(&"a".repeat(40))
+        );
+        assert!(!valid_id("a") && !valid_id(&"a".repeat(41)));
         assert!(!valid_id("Abc") && !valid_id("a_b") && !valid_id("a.b") && !valid_id("a/b"));
         assert!(!valid_id("../x") && !valid_id("abc%2f"));
     }
