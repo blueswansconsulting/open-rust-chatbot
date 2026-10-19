@@ -60,6 +60,92 @@ pub struct Shared {
     rate_limiter: RateLimiter,
     open_connections: AtomicUsize,
     model_health: std::sync::Mutex<ModelHealth>,
+    resume_store: std::sync::Mutex<ResumeStore>,
+}
+
+/// A conversation parked between page loads so the next page can resume it. The system
+/// prompt is not stored (the current one is used on resume).
+#[derive(Clone, Default)]
+pub struct ParkedChat {
+    pub history: Vec<llm::Message>,
+    pub turns: usize,
+    pub leads: Vec<tools::Lead>,
+}
+
+struct StoredSession {
+    chat: ParkedChat,
+    saved: std::time::Instant,
+}
+
+#[derive(Default)]
+struct ResumeStore {
+    sessions: HashMap<String, StoredSession>,
+    last_sweep: Option<std::time::Instant>,
+}
+
+const MAX_STORED_SESSIONS: usize = 10_000;
+const RESUME_SWEEP_EVERY: Duration = Duration::from_secs(30);
+
+/// Random token from the OS RNG: two v4 UUIDs, 244 random bits, as 64 hex characters.
+pub fn random_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+impl Shared {
+    pub fn save_session(&self, token: &str, chat: ParkedChat) {
+        let ttl = self.config.limits.resume_ttl;
+        let mut store = self.resume_store.lock().unwrap();
+        // Expired chats (which can contain contact details) are dropped promptly, not only
+        // when the store fills up.
+        if store
+            .last_sweep
+            .is_none_or(|t| t.elapsed() >= RESUME_SWEEP_EVERY.min(ttl))
+        {
+            store.last_sweep = Some(std::time::Instant::now());
+            store.sessions.retain(|_, s| s.saved.elapsed() < ttl);
+        }
+        if store.sessions.len() >= MAX_STORED_SESSIONS && !store.sessions.contains_key(token) {
+            if let Some(oldest) = store
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| s.saved)
+                .map(|(k, _)| k.clone())
+            {
+                store.sessions.remove(&oldest);
+            }
+        }
+        store.sessions.insert(
+            token.to_owned(),
+            StoredSession {
+                chat,
+                saved: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Single use: a token can resume one conversation once.
+    pub fn take_session(&self, token: &str) -> Option<ParkedChat> {
+        let stored = self.resume_store.lock().unwrap().sessions.remove(token)?;
+        (stored.saved.elapsed() < self.config.limits.resume_ttl).then_some(stored.chat)
+    }
+
+    /// Drops expired parked chats. Runs on a timer (see main.rs) so contact details don't
+    /// linger on a quiet site, as well as opportunistically on save.
+    pub fn sweep_expired_sessions(&self) {
+        let ttl = self.config.limits.resume_ttl;
+        let mut store = self.resume_store.lock().unwrap();
+        store.last_sweep = Some(std::time::Instant::now());
+        store.sessions.retain(|_, s| s.saved.elapsed() < ttl);
+    }
+
+    /// Number of parked conversations (for tests and monitoring).
+    pub fn parked_sessions(&self) -> usize {
+        self.resume_store.lock().unwrap().sessions.len()
+    }
 }
 
 /// Circuit breaker for the model: the widget hides its button while the chat can't answer.
@@ -125,6 +211,7 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
             .collect(),
         open_connections: AtomicUsize::new(0),
         model_health: Default::default(),
+        resume_store: Default::default(),
         kb,
         http,
         config,

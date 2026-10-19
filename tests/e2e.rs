@@ -595,3 +595,217 @@ async fn rejected_visitor_input_does_not_hide_the_bot() {
         200
     );
 }
+
+async fn next_frame(ws: &mut Ws) -> Value {
+    let read = async {
+        loop {
+            if let Some(Ok(Message::Text(t))) = ws.next().await {
+                return serde_json::from_str::<Value>(&t).unwrap();
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), read)
+        .await
+        .expect("frame within 5s")
+}
+
+fn resume_frame(token: Option<&str>) -> Message {
+    Message::Text(json!({"type": "resume", "token": token}).to_string().into())
+}
+
+#[tokio::test]
+async fn conversation_resumes_on_the_next_page_with_a_single_use_token() {
+    let prompts: Arc<Mutex<Vec<String>>> = Arc::default();
+    let sink = prompts.clone();
+    let bridge = axum::Router::new().route(
+        "/bridge",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock()
+                    .unwrap()
+                    .push(body["message"].as_str().unwrap_or_default().to_owned());
+                axum::Json(json!({ "text": "Noted." }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_url = format!("http://{}/bridge", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "openclaw"),
+        ("OPENCLAW_BRIDGE_URL", &bridge_url),
+        ("OPENCLAW_BRIDGE_TOKEN", "t"),
+    ])
+    .await;
+
+    // Page 1: the widget asks for a session and gets a resume token.
+    let mut page1 = connect(&addr, ORIGIN).await.unwrap();
+    page1.send(resume_frame(None)).await.unwrap();
+    let session = next_frame(&mut page1).await;
+    assert_eq!(
+        (session["type"].as_str(), session["resumed"].as_bool()),
+        (Some("session"), Some(false))
+    );
+    let token = session["token"].as_str().unwrap().to_owned();
+    assert_eq!(token.len(), 64);
+    page1
+        .send(Message::Text(
+            "I need an EICR for my flat in Croydon".into(),
+        ))
+        .await
+        .unwrap();
+    until_done(&mut page1).await;
+    page1.close(None).await.unwrap();
+
+    // Page 2: resuming restores the conversation for the model, under a fresh token.
+    let mut page2 = connect(&addr, ORIGIN).await.unwrap();
+    page2.send(resume_frame(Some(&token))).await.unwrap();
+    let resumed = next_frame(&mut page2).await;
+    assert_eq!(
+        (resumed["resumed"].as_bool(), resumed["turns"].as_u64()),
+        (Some(true), Some(1))
+    );
+    assert_ne!(resumed["token"], json!(token));
+    page2
+        .send(Message::Text("How often do I need one?".into()))
+        .await
+        .unwrap();
+    until_done(&mut page2).await;
+    let last = prompts.lock().unwrap().last().unwrap().clone();
+    assert!(
+        last.contains("EICR for my flat in Croydon"),
+        "earlier turn restored: {last}"
+    );
+
+    // The old token is single-use, so a copied token or second tab can't take over the chat.
+    let mut page3 = connect(&addr, ORIGIN).await.unwrap();
+    page3.send(resume_frame(Some(&token))).await.unwrap();
+    assert_eq!(next_frame(&mut page3).await["resumed"], json!(false));
+}
+
+#[tokio::test]
+async fn resume_is_only_accepted_as_the_first_message() {
+    let addr = serve(&[]).await;
+    let mut page1 = connect(&addr, ORIGIN).await.unwrap();
+    page1.send(resume_frame(None)).await.unwrap();
+    let token = next_frame(&mut page1).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    page1.send(Message::Text("hello".into())).await.unwrap();
+    until_done(&mut page1).await;
+    page1.close(None).await.unwrap();
+
+    let mut page2 = connect(&addr, ORIGIN).await.unwrap();
+    page2.send(Message::Text("hi".into())).await.unwrap();
+    until_done(&mut page2).await;
+    page2.send(resume_frame(Some(&token))).await.unwrap();
+    page2
+        .send(Message::Text("still here".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut page2).await;
+    assert!(
+        frames.iter().all(|f| f["type"] != "session"),
+        "ignored mid-conversation: {frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pending_lead_survives_a_page_change_and_can_still_be_confirmed() {
+    let addr = serve(&[]).await; // mock model, DEV_MODE: lead capture on
+    let mut page1 = connect(&addr, ORIGIN).await.unwrap();
+    page1.send(resume_frame(None)).await.unwrap();
+    let token = next_frame(&mut page1).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    page1
+        .send(Message::Text("Call me on sam@example.com".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut page1).await;
+    let lead_id = frames.iter().find(|f| f["type"] == "card").unwrap()["card"]["lead"]["leadId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    page1.close(None).await.unwrap();
+
+    let mut page2 = connect(&addr, ORIGIN).await.unwrap();
+    page2.send(resume_frame(Some(&token))).await.unwrap();
+    assert_eq!(next_frame(&mut page2).await["resumed"], json!(true));
+    let card = next_frame(&mut page2).await;
+    assert_eq!(
+        card["card"]["lead"]["leadId"],
+        json!(lead_id),
+        "pending card shown again"
+    );
+    page2
+        .send(Message::Text(
+            json!({"type": "confirm_lead", "leadId": lead_id})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let confirmed = until_done(&mut page2).await;
+    assert_eq!(confirmed[0]["card"]["type"], "lead_submitted");
+}
+
+#[tokio::test]
+async fn expired_conversations_are_swept_from_memory() {
+    let addr = serve(&[("RESUME_TTL_SECONDS", "1")]).await;
+    let mut page1 = connect(&addr, ORIGIN).await.unwrap();
+    page1.send(resume_frame(None)).await.unwrap();
+    let token = next_frame(&mut page1).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    page1.close(None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let mut page2 = connect(&addr, ORIGIN).await.unwrap();
+    page2.send(resume_frame(Some(&token))).await.unwrap();
+    assert_eq!(
+        next_frame(&mut page2).await["resumed"],
+        json!(false),
+        "expired after the TTL"
+    );
+}
+
+#[test]
+fn parked_store_sweeps_expired_entries_on_save() {
+    let config = Config::from_pairs(&[
+        ("DEV_MODE", "true"),
+        ("MOCK_LLM", "true"),
+        ("RESUME_TTL_SECONDS", "1"),
+    ])
+    .unwrap();
+    let shared = build_state(config).unwrap();
+    shared.save_session("abandoned", Default::default());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // Any later save sweeps expired chats, even ones nobody ever comes back for.
+    shared.save_session("active", Default::default());
+    assert_eq!(
+        shared.parked_sessions(),
+        1,
+        "the abandoned chat was removed from memory"
+    );
+    assert!(shared.take_session("active").is_some());
+}
+
+#[test]
+fn idle_sweep_removes_expired_chats_without_any_new_traffic() {
+    let config = Config::from_pairs(&[
+        ("DEV_MODE", "true"),
+        ("MOCK_LLM", "true"),
+        ("RESUME_TTL_SECONDS", "1"),
+    ])
+    .unwrap();
+    let shared = build_state(config).unwrap();
+    shared.save_session("abandoned", Default::default());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    shared.sweep_expired_sessions();
+    assert_eq!(shared.parked_sessions(), 0);
+}

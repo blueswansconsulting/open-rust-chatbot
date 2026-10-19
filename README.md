@@ -44,6 +44,8 @@ Then add this to your website, just before `</body>`:
 - **Lead capture with visitor consent.** The bot proposes a card with the visitor's details; nothing is sent until they press *Confirm and send*. Confirmed leads go to your webhook, signed with HMAC-SHA256. Without a webhook, lead capture is switched off so leads are never silently lost.
 - **Any OpenAI-compatible model,** plus an [OpenClaw](https://github.com/openclaw/openclaw) gateway bridge.
 - **Abuse protection:** exact-origin allowlist, per-IP and global connection caps, message rate limits, message size limits, idle timeouts, optional Cloudflare Turnstile.
+- **AI disclosure built in.** The panel always tells visitors they're talking to an AI (EU AI Act Art. 50), with an optional privacy link.
+- **Chats survive page changes.** Moving to another page keeps the conversation: the transcript is kept per tab in `sessionStorage`, and the server resumes the model's context with a single-use token (30-minute expiry, memory only).
 - **Themeable:** override the `.orc-*` CSS classes, or set title, subtitle, greeting and placeholder text.
 
 ## Model providers
@@ -86,6 +88,8 @@ can tell visitors apart; otherwise every visitor shares the proxy's IP and the b
     subtitle: 'Usually replies instantly',
     greeting: 'Hi! Need an electrician? Ask me anything.',
     placeholder: 'Type your question...',
+    privacyUrl: 'https://your-site.example/privacy',  // optional link in the AI disclosure line
+    // disclosure: 'You are chatting with an AI assistant…', // optional wording; a notice is always shown
     // serverUrl: 'https://your-domain.com/chat',  // only if the script is served from elsewhere (may include a path)
     // turnstileToken: () => getFreshTurnstileToken(), // if TURNSTILE_SECRET_KEY is set (tokens are single-use)
   };

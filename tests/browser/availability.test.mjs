@@ -173,3 +173,114 @@ await run('one failed health check while connected shows nothing', async (page) 
   await page.waitForTimeout(1500);
   assert.equal(count(await text(page), 'Sorry'), 0, 'a single blip must not interrupt the chat');
 });
+
+await run('AI disclosure is always shown in the chat panel', async (page) => {
+  await startServer();
+  await page.goto(BASE + '/');
+  await page.click('[data-testid=orc-bubble]');
+  const disclosure = await page.textContent('.orc-disclosure');
+  assert.match(disclosure, /AI assistant/);
+});
+
+await run('chat continues on the next page: transcript, open panel and server context restored', async (page) => {
+  await startServer();
+  const sessions = [];
+  page.on('websocket', (ws) => ws.on('framereceived', (f) => {
+    try {
+      const v = JSON.parse(f.payload);
+      if (v.type === 'session') sessions.push(v);
+    } catch {}
+  }));
+  await page.goto(BASE + '/');
+  await page.click('[data-testid=orc-bubble]');
+  await page.fill('.orc-input', 'What are your opening hours?');
+  await page.press('.orc-input', 'Enter');
+  await page.waitForFunction(() => document.body.textContent.includes('8am'), null, { timeout: 5000 });
+  await page.reload(); // same tab, next page
+  await page.waitForSelector('.orc-panel[data-open="true"]', { timeout: 10000 });
+  const text = await page.textContent('.orc-messages');
+  assert.match(text, /What are your opening hours\?/, 'visitor message restored');
+  assert.match(text, /8am/, 'assistant reply restored');
+  await new Promise((r) => setTimeout(r, 500));
+  assert.equal(sessions.length >= 2, true, 'a session frame on each page');
+  assert.equal(sessions[sessions.length - 1].resumed, true, 'server restored the conversation');
+  assert.equal(sessions[sessions.length - 1].turns, 1);
+  assert.equal(await page.locator('.orc-msg-assistant', { hasText: 'Hi! How can I help' }).count(), 1, 'greeting restored once, not repeated');
+});
+
+async function chatOnce(page, question = 'What are your opening hours?') {
+  await page.click('[data-testid=orc-bubble]');
+  await page.fill('.orc-input', question);
+  await page.press('.orc-input', 'Enter');
+  await page.waitForSelector('.orc-send:not([disabled])', { timeout: 5000 });
+}
+
+await run('after a server restart the old transcript is replaced, not silently forgotten', async (page) => {
+  await startServer();
+  await page.goto(BASE + '/');
+  await chatOnce(page);
+  stopServer();
+  await startServer(); // parked chats live in memory, so a restart loses them
+  await page.reload();
+  await page.waitForFunction(() => document.body.textContent.includes('Your earlier chat has ended'), null, { timeout: 10000 });
+  const text = await page.textContent('.orc-messages');
+  assert.doesNotMatch(text, /opening hours/, 'old messages cleared');
+});
+
+await run('a closed panel stays closed on the next page, and phones get the button not the panel', async (page) => {
+  await startServer();
+  await page.goto(BASE + '/');
+  await chatOnce(page);
+  await page.keyboard.press('Escape');
+  await page.reload();
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible' });
+  await page.waitForTimeout(800);
+  assert.equal(await page.getAttribute('.orc-panel', 'data-open'), 'false', 'closed stays closed');
+
+  await page.click('[data-testid=orc-bubble]'); // open, then move page on a phone
+  await page.setViewportSize({ width: 390, height: 800 });
+  await page.reload();
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible' });
+  await page.waitForTimeout(800);
+  assert.equal(await page.getAttribute('.orc-panel', 'data-open'), 'false', 'no auto-reopen on phones');
+});
+
+await run('a tampered saved transcript renders as text, never as HTML', async (page) => {
+  await startServer();
+  // Planted before the page's own scripts run, as an attacker with storage access could.
+  await page.addInitScript(() => {
+    sessionStorage.setItem('orc-transcript', JSON.stringify([
+      { r: 'assistant', t: '<img src=x onerror="window.__pwned=1">' },
+      { r: 'user', t: '<script>window.__pwned=2</script>' },
+      { r: 'evil', t: 'ignored role' },
+    ]));
+  });
+  await page.goto(BASE + '/');
+  // Restored at page load, before any connection (which would then replace it).
+  await page.waitForSelector('.orc-root', { state: 'attached' });
+  await page.waitForTimeout(300);
+  assert.equal(await page.evaluate(() => window.__pwned), undefined);
+  assert.equal(await page.locator('.orc-messages img').count(), 0);
+  assert.match(await page.textContent('.orc-messages'), /<img src=x/);
+  assert.doesNotMatch(await page.textContent('.orc-messages'), /ignored role/);
+});
+
+await run('a reconnect on the same page keeps the server-side conversation', async (page) => {
+  await startServer(5, { IDLE_TIMEOUT_SECONDS: '1' });
+  const sessions = [];
+  page.on('websocket', (ws) => ws.on('framereceived', (f) => {
+    try {
+      const v = JSON.parse(f.payload);
+      if (v.type === 'session') sessions.push(v);
+    } catch {}
+  }));
+  await page.goto(BASE + '/');
+  await chatOnce(page);
+  await page.waitForTimeout(2500); // server closes the idle socket
+  await page.fill('.orc-input', 'And on Saturday?');
+  await page.press('.orc-input', 'Enter');
+  await page.waitForSelector('.orc-send:not([disabled])', { timeout: 5000 });
+  const last = sessions[sessions.length - 1];
+  assert.equal(last.resumed, true, 'the new socket resumed the conversation');
+  assert.equal(last.turns, 1);
+});

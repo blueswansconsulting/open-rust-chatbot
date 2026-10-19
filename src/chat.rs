@@ -72,6 +72,15 @@ fn send(tx: &Sender, frame: Value) {
     let _ = tx.send(frame.to_string());
 }
 
+/// `{"type":"resume","token":"…"|null}`: the widget asking to continue (or start) a session.
+fn parse_resume(text: &str) -> Option<Option<String>> {
+    if !text.starts_with('{') {
+        return None;
+    }
+    let v: Value = serde_json::from_str(text).ok()?;
+    (v["type"] == "resume").then(|| v["token"].as_str().map(str::to_owned))
+}
+
 /// Inbound frames are either plain chat text or a JSON lead confirmation from the widget's button.
 fn parse_confirmation(text: &str) -> Option<String> {
     if !text.starts_with('{') {
@@ -96,6 +105,9 @@ pub struct ChatSession {
     turns: usize,
     /// Rate-limit key of the visitor (IP or /64), used by the availability breaker.
     client: String,
+    /// Token under which this conversation is parked so the next page can resume it.
+    resume_token: Option<String>,
+    seen_first_message: bool,
 }
 
 impl ChatSession {
@@ -108,6 +120,8 @@ impl ChatSession {
             pending_leads: HashMap::new(),
             turns: 0,
             client: String::new(),
+            resume_token: None,
+            seen_first_message: false,
         }
     }
 
@@ -117,6 +131,66 @@ impl ChatSession {
     }
 
     pub async fn handle_message(&mut self, text: &str, tx: &Sender) {
+        let first = !self.seen_first_message;
+        self.seen_first_message = true;
+        if let Some(token) = parse_resume(text) {
+            // Only honoured as a connection's first message, so a live chat can't be swapped.
+            if first {
+                self.resume(token.as_deref(), tx);
+            }
+            return;
+        }
+        self.handle_chat_message(text, tx).await;
+        self.save();
+    }
+
+    fn park(&self) -> crate::ParkedChat {
+        crate::ParkedChat {
+            history: self.history.iter().skip(1).cloned().collect(),
+            turns: self.turns,
+            leads: self.pending_leads.values().cloned().collect(),
+        }
+    }
+
+    fn save(&self) {
+        if let Some(token) = &self.resume_token {
+            self.shared.save_session(token, self.park());
+        }
+    }
+
+    fn resume(&mut self, token: Option<&str>, tx: &Sender) {
+        let restored = token
+            .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|t| self.shared.take_session(t));
+        let resumed = restored.is_some();
+        let mut leads = Vec::new();
+        if let Some(chat) = restored {
+            // Keep today's system prompt; restore only the conversation.
+            self.history.truncate(1);
+            self.history.extend(chat.history);
+            self.turns = chat.turns;
+            leads = chat.leads;
+        }
+        let token = crate::random_token();
+        self.resume_token = Some(token.clone());
+        for lead in leads {
+            self.pending_leads.insert(lead.lead_id.clone(), lead);
+        }
+        self.save();
+        send(
+            tx,
+            json!({ "type": "session", "token": token, "resumed": resumed, "turns": self.turns }),
+        );
+        // Leads awaiting confirmation are shown again so the visitor can still confirm them.
+        for lead in self.pending_leads.values() {
+            send(
+                tx,
+                json!({ "type": "card", "card": { "type": "lead_confirmation", "lead": lead } }),
+            );
+        }
+    }
+
+    async fn handle_chat_message(&mut self, text: &str, tx: &Sender) {
         if let Some(lead_id) = parse_confirmation(text) {
             self.confirm_lead(&lead_id, tx).await;
             return;
@@ -135,7 +209,7 @@ impl ChatSession {
         if self.turns >= limits.max_turns_per_connection {
             send(
                 tx,
-                json!({ "type": "error", "message": "This conversation has reached its limit. Please refresh to start a new one." }),
+                json!({ "type": "error", "message": "This conversation has reached its limit. Please contact the business directly for anything else." }),
             );
             return;
         }
@@ -160,6 +234,8 @@ impl ChatSession {
 
     async fn run_turn(&mut self, text: &str, tx: &Sender) -> Result<(), String> {
         self.history.push(Message::new(Role::User, text));
+        // Park the question straight away: a visitor who moves page mid-reply cancels this turn.
+        self.save();
         if !self.shared.llm.supports_tools() {
             return self.run_text_only_turn(text, tx).await;
         }

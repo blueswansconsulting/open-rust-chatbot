@@ -43,6 +43,34 @@
     subtitle: options.subtitle || 'Usually replies instantly',
     greeting: options.greeting || 'Hi! How can I help you today?',
     placeholder: options.placeholder || 'Type your message...',
+    // Required transparency (EU AI Act Art. 50): visitors must know they're talking to an AI.
+    disclosure: options.disclosure || "You're chatting with an AI assistant. It can make mistakes, so please check anything important.",
+  };
+
+  function safeUrl(value) {
+    try {
+      var u = new URL(String(value), location.href);
+      return u.protocol === 'https:' || u.protocol === 'http:' ? u.href : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Per-tab storage for continuing a chat on the next page; never required to work.
+  var store = {
+    get: function (key) {
+      try {
+        return sessionStorage.getItem('orc-' + key);
+      } catch (e) {
+        return null;
+      }
+    },
+    set: function (key, value) {
+      try {
+        if (value === null) sessionStorage.removeItem('orc-' + key);
+        else sessionStorage.setItem('orc-' + key, value);
+      } catch (e) {}
+    },
   };
 
   function el(tag, className, text) {
@@ -153,6 +181,16 @@
     inputRow.appendChild(sendBtn);
 
     panel.appendChild(header);
+    var disclosure = el('div', 'orc-disclosure', TEXT.disclosure);
+    var privacyUrl = options.privacyUrl && safeUrl(options.privacyUrl);
+    if (privacyUrl) {
+      disclosure.appendChild(document.createTextNode(' '));
+      var privacy = el('a', 'orc-disclosure-link', 'Privacy');
+      privacy.href = privacyUrl;
+      privacy.rel = 'noopener noreferrer';
+      disclosure.appendChild(privacy);
+    }
+    panel.appendChild(disclosure);
     panel.appendChild(messages);
     panel.appendChild(inputRow);
     panel.appendChild(announcer);
@@ -192,6 +230,34 @@
       messages.appendChild(div);
       scroll();
       return div;
+    }
+
+    // The visible conversation (not errors or cards), kept per tab so the next page continues it.
+    var MAX_SAVED_MESSAGES = 40;
+    function saveTranscript() {
+      var saved = [];
+      messages.querySelectorAll('.orc-msg-user, .orc-msg-assistant').forEach(function (m) {
+        if (!m.textContent) return;
+        saved.push({ r: m.getAttribute('data-role'), t: m.textContent });
+      });
+      store.set('transcript', JSON.stringify(saved.slice(-MAX_SAVED_MESSAGES)));
+    }
+
+    function restoreTranscript() {
+      var saved;
+      try {
+        saved = JSON.parse(store.get('transcript') || '[]');
+      } catch (e) {
+        saved = [];
+      }
+      if (!Array.isArray(saved) || !saved.length) return false;
+      saved.slice(-MAX_SAVED_MESSAGES).forEach(function (m) {
+        if (!m || (m.r !== 'user' && m.r !== 'assistant')) return;
+        var div = append(m.r, String(m.t || ''));
+        div.setAttribute('data-restored', '');
+        if (m.r === 'assistant') linkify(div);
+      });
+      return true;
     }
 
     function setWaiting(value) {
@@ -273,6 +339,23 @@
         if (!current) current = append('assistant', '');
         current.textContent += String(frame.value);
         scroll();
+      } else if (frame.type === 'session') {
+        if (typeof frame.token === 'string') store.set('token', frame.token);
+        // The server couldn't continue the earlier chat (expired or restarted), so don't show
+        // a conversation the assistant no longer remembers.
+        if (frame.resumed === false && restoredFromStorage) {
+          restoredFromStorage = false;
+          // Remove only the restored messages, so anything typed meanwhile stays.
+          messages.querySelectorAll('[data-restored]').forEach(function (m) {
+            m.remove();
+          });
+          var notice = append('notice', 'Your earlier chat has ended, so this is a new conversation.');
+          var greeting = append('assistant', TEXT.greeting);
+          messages.insertBefore(greeting, messages.firstChild);
+          messages.insertBefore(notice, greeting);
+          saveTranscript();
+        }
+        restoredFromStorage = false;
       } else if (frame.type === 'done') {
         if (current) {
           linkify(current);
@@ -280,6 +363,7 @@
         }
         current = null;
         setWaiting(false);
+        saveTranscript();
       } else if (frame.type === 'error') {
         current = null;
         setWaiting(false);
@@ -321,8 +405,9 @@
     var MSG_BACK = "You're reconnected. Please send your message again.";
     var MSG_BACK_IDLE = "You're reconnected. Carry on whenever you're ready.";
 
+    // System notices (connection status) are styled apart and never saved in the transcript.
     function say(role, text) {
-      append(role, text);
+      append(role === 'assistant' ? 'notice' : role, text);
       announce(text);
     }
 
@@ -482,6 +567,9 @@
           socket.addEventListener('open', function () {
             opened = true;
             onConnected();
+            // First message: continue this tab's conversation (single-use token) or start one.
+            // The stored token is replaced when the server answers with a new one.
+            socket.send(JSON.stringify({ type: 'resume', token: store.get('token') }));
             while (queue.length) socket.send(queue.shift());
           });
           socket.addEventListener('message', onFrame);
@@ -525,8 +613,9 @@
       connect();
     }
 
-    function open() {
+    function open(opts) {
       panel.dataset.open = 'true';
+      store.set('open', '1');
       bubble.setAttribute('aria-expanded', 'true');
       bubble.setAttribute('aria-label', 'Close chat');
       if (!greeted) {
@@ -534,11 +623,12 @@
         append('assistant', TEXT.greeting);
       }
       connect();
-      input.focus();
+      if (!opts || opts.focus !== false) input.focus();
     }
 
     function close() {
       panel.dataset.open = 'false';
+      store.set('open', null);
       bubble.setAttribute('aria-expanded', 'false');
       bubble.setAttribute('aria-label', 'Open chat');
       if (!available) {
@@ -583,8 +673,18 @@
       if (document.visibilityState === 'visible' && !outage && Date.now() - lastCheckAt > 15000) watchHealth(true);
     });
 
+    // Continuing from a previous page: show the conversation and reopen if it was open.
+    var restoredFromStorage = restoreTranscript();
+    if (restoredFromStorage) greeted = true;
+    // Leaving mid-reply keeps what has arrived so far.
+    window.addEventListener('pagehide', saveTranscript);
+    var reopen = store.get('open') === '1';
+
     checkHealth().then(function (ok) {
       setAvailable(ok);
+      // Reopen quietly on larger screens only: on phones the panel would cover the page the
+      // visitor just went to, so they get the button back instead.
+      if (ok && reopen && !window.matchMedia('(max-width: 480px)').matches) open({ focus: false });
       watchHealth();
     });
     inputRow.addEventListener('submit', function (e) {
@@ -592,6 +692,7 @@
       var text = input.value.trim();
       if (!text || waiting || outage) return;
       append('user', text);
+      saveTranscript();
       input.value = '';
       setWaiting(true);
       send(text);
