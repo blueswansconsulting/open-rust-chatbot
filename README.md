@@ -41,7 +41,7 @@ Then add this to your website, just before `</body>`:
 
 - **Knowledge base from Markdown.** Write `# Headings` and paragraphs about your business; the bot searches it before answering and is told never to guess.
 - **Streaming replies** over WebSockets, rendered safely (`textContent` only, never `innerHTML`).
-- **Lead capture with visitor consent.** The bot proposes a card with the visitor's details; nothing is sent until they press *Confirm and send*. Confirmed leads go to your webhook, signed with HMAC-SHA256. Without a webhook, lead capture is switched off so leads are never silently lost.
+- **Lead capture and call-back requests with visitor consent.** The bot collects a name, phone or email and the best time to call, then proposes a card with the visitor's details; nothing is sent until they press *Confirm and send*. Confirmed leads go to your webhook, signed with HMAC-SHA256. Without a webhook, lead capture is switched off so leads are never silently lost.
 - **Any OpenAI-compatible model,** plus an [OpenClaw](https://github.com/openclaw/openclaw) gateway bridge.
 - **Abuse protection:** exact-origin allowlist, per-IP and global connection caps, message rate limits, message size limits, idle timeouts, optional Cloudflare Turnstile.
 - **AI disclosure built in.** The panel always tells visitors they're talking to an AI (EU AI Act Art. 50), with an optional privacy link.

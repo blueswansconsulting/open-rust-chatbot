@@ -72,6 +72,28 @@ fn send(tx: &Sender, frame: Value) {
     let _ = tx.send(frame.to_string());
 }
 
+/// Text-only models can't call tools, so they signal a call-back request with one hidden line.
+const TEXT_ONLY_LEAD_INSTRUCTIONS: &str = "\n\nCall-back requests: when, and only when, the visitor has asked to be called or contacted and has given their name and a phone number or email, end your reply with one extra final line in exactly this form: LEAD: {\"name\":\"...\",\"phone\":\"...\",\"email\":\"...\",\"best_time\":\"...\",\"message\":\"...\"} using null for anything they did not give and only details the visitor actually wrote. The visitor will be shown their details to confirm. Never mention or explain this line.";
+
+/// Splits a text-only reply into what the visitor sees and the optional `LEAD: {…}` arguments.
+pub(crate) fn split_lead_line(raw: &str) -> (String, Option<serde_json::Map<String, Value>>) {
+    let mut lead = None;
+    let mut visible = Vec::new();
+    for line in raw.lines() {
+        if let Some(rest) = line.trim().strip_prefix("LEAD:") {
+            if let Some(map) = serde_json::from_str::<Value>(rest.trim())
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+            {
+                lead = Some(map);
+            }
+            continue; // never show the line, even if it doesn't parse
+        }
+        visible.push(line);
+    }
+    (visible.join("\n").trim().to_owned(), lead)
+}
+
 /// `{"type":"resume","token":"…"|null}`: the widget asking to continue (or start) a session.
 fn parse_resume(text: &str) -> Option<Option<String>> {
     if !text.starts_with('{') {
@@ -304,18 +326,43 @@ impl ChatSession {
                 "\n\nKnowledge-base excerpts (the only facts you may state about the business):\n"
             });
             system.content.push_str(&excerpts.join("\n"));
+            if self.shared.config.lead_capture {
+                system.content.push_str(TEXT_ONLY_LEAD_INSTRUCTIONS);
+            }
         }
-        let mut reply = String::new();
+        // Text-only providers answer in one piece, so buffer it to take out the hidden lead line.
+        let mut raw = String::new();
         let mut stream = self.shared.llm.stream(&messages, &[]).await?;
         while let Some(event) = stream.next().await {
             if let LlmEvent::Token(value) = event? {
-                reply.push_str(&value);
-                send(tx, json!({ "type": "token", "value": value }));
+                raw.push_str(&value);
             }
+        }
+        let (reply, lead_args) = split_lead_line(&raw);
+        if !reply.is_empty() {
+            send(tx, json!({ "type": "token", "value": reply }));
         }
         self.history.push(Message::new(Role::Assistant, reply));
         self.history = trim_history(&self.history, max_history);
 
+        if let Some(arguments) = lead_args.filter(|_| self.shared.config.lead_capture) {
+            let call = ToolCall {
+                id: "text-lead".into(),
+                name: "propose_lead".into(),
+                arguments,
+            };
+            if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.shared.kb, &call) {
+                self.offer_lead(lead, tx);
+            }
+            send(tx, json!({ "type": "done" }));
+            log_event(
+                "turn_complete",
+                json!({ "session": self.session_id, "hops": 0 }),
+            );
+            return Ok(());
+        }
+
+        // Fallback when the model didn't add a lead line: offer a card for an email in the text.
         let email = EMAIL_IN_TEXT
             .find(text)
             .filter(|_| self.shared.config.lead_capture);
@@ -463,6 +510,22 @@ mod tests {
         let out = trim_history(&h, 12);
         assert_eq!(out[1].content, "q");
         assert_eq!(out.len(), 15);
+    }
+
+    #[test]
+    fn lead_line_is_split_from_the_visible_reply() {
+        let (visible, lead) =
+            split_lead_line("Thanks!\nLEAD: {\"name\":\"Jo\",\"phone\":\"07700 900123\"}");
+        assert_eq!(visible, "Thanks!");
+        assert_eq!(lead.unwrap()["phone"], "07700 900123");
+        let (visible, lead) = split_lead_line("Hi there\nLEAD: not json");
+        assert_eq!(
+            (visible.as_str(), lead.is_none()),
+            ("Hi there", true),
+            "a broken line is hidden, not shown"
+        );
+        let (visible, lead) = split_lead_line("No lead here.");
+        assert_eq!((visible.as_str(), lead.is_none()), ("No lead here.", true));
     }
 
     #[test]

@@ -303,7 +303,7 @@
       var wrap = el('div', 'orc-card');
       var submitted = card.type === 'lead_submitted';
       wrap.appendChild(el('div', 'orc-card-title', submitted ? 'Details sent' : 'Send these details to the team?'));
-      [lead.name, lead.email, lead.phone, lead.message].forEach(function (line) {
+      [lead.name, lead.phone, lead.email, lead.bestTime ? 'Best time: ' + lead.bestTime : null, lead.message].forEach(function (line) {
         if (line) wrap.appendChild(el('div', 'orc-card-line', String(line)));
       });
       // Only the newest card can be confirmed.

@@ -8,10 +8,11 @@ Content-Type: application/json
 X-ORC-Timestamp: 1760000000
 X-ORC-Signature: sha256=<64 hex characters>
 
-{"type":"lead","bot":"Sparky","lead":{"leadId":"…","name":"Sam","email":"sam@example.com","phone":"07700 900123","message":"Need a rewire quote"},"submittedAt":"2026-10-18T12:00:00.000Z"}
+{"type":"lead","bot":"Sparky","lead":{"leadId":"…","name":"Sam","email":"sam@example.com","phone":"07700 900123","bestTime":"after 5pm","message":"Need a rewire quote"},"submittedAt":"2026-10-18T12:00:00.000Z"}
 ```
 
-`phone` and `message` are omitted when empty. Any 2xx response counts as delivered. 429 and 5xx
+Every lead has a `name` and at least one of `phone` or `email`; `email`, `phone`, `bestTime` (when the
+visitor would like a call back, in their words) and `message` are omitted when empty. Any 2xx response counts as delivered. 429 and 5xx
 responses and network errors are retried twice; other 4xx responses are not retried.
 
 **Deduplicate on `leadId`.** If a delivery times out after your endpoint received it, the visitor may
