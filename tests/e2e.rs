@@ -859,3 +859,13 @@ async fn text_only_model_requests_a_call_back_via_a_hidden_lead_line() {
         "the model is told how to request a call back"
     );
 }
+
+#[tokio::test]
+async fn single_site_config_answers_with_no_server_texts() {
+    let addr = serve(&[]).await;
+    let res = reqwest::get(format!("http://{addr}/config")).await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["access-control-allow-origin"], "*");
+    let v: Value = res.json().await.unwrap();
+    assert!(v["title"].is_null() && v["greeting"].is_null(), "{v}");
+}

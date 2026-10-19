@@ -26,6 +26,33 @@ pub struct Config {
     pub lead_capture: bool,
 
     pub limits: Limits,
+
+    /// Multi-site mode: bots are loaded from a sites API instead of the single-site settings.
+    pub sites: Option<SitesConfig>,
+}
+
+/// Multi-site mode settings (`SITES_API_URL` and friends).
+#[derive(Clone)]
+pub struct SitesConfig {
+    /// Base URL; a bot is fetched from `{api_url}/{id}`.
+    pub api_url: String,
+    /// Bearer token for the sites API and for `/internal/...` calls to this server.
+    pub token: String,
+    /// How long a fetched bot is used before it is fetched again.
+    pub cache_ttl: Duration,
+    /// How long the last good copy is served while the sites API is unreachable.
+    pub stale_ttl: Duration,
+}
+
+impl std::fmt::Debug for SitesConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SitesConfig")
+            .field("api_url", &self.api_url)
+            .field("token", &"<redacted>")
+            .field("cache_ttl", &self.cache_ttl)
+            .field("stale_ttl", &self.stale_ttl)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +100,7 @@ pub struct Limits {
     pub resume_ttl: Duration,
 }
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are {bot_name}, a helpful assistant on this business's website. \
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are {bot_name}, a helpful assistant on this business's website. \
 Answer questions about the business using the search_knowledge_base tool; never invent prices, availability, or facts that are not in the knowledge base. \
 {lead_instructions} \
 Keep replies short (1 to 3 sentences) and friendly. \
@@ -134,6 +161,25 @@ impl Config {
         let mut errors = Vec::new();
         let production = !env.flag("DEV_MODE");
 
+        let sites = env.get("SITES_API_URL").map(|url| {
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                errors.push(format!("SITES_API_URL {url:?} must be an http(s) URL"));
+            }
+            let token = env.get("INTERNAL_API_TOKEN").unwrap_or_default();
+            if token.len() < 32 {
+                errors.push(
+                    "INTERNAL_API_TOKEN (at least 32 characters) is required when SITES_API_URL is set"
+                        .into(),
+                );
+            }
+            SitesConfig {
+                api_url: url.trim_end_matches('/').to_owned(),
+                token,
+                cache_ttl: Duration::from_secs(env.num("SITES_CACHE_SECONDS", 30, &mut errors)),
+                stale_ttl: Duration::from_secs(env.num("SITES_STALE_SECONDS", 600, &mut errors)),
+            }
+        });
+
         let allowed_origins: Vec<String> = env
             .get("ALLOWED_ORIGINS")
             .unwrap_or_default()
@@ -142,7 +188,8 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
         if allowed_origins.is_empty() {
-            if production {
+            // In multi-site mode each bot brings its own origins from the sites API.
+            if production && sites.is_none() {
                 errors.push(
                     "ALLOWED_ORIGINS is required (comma-separated, e.g. https://www.example.com)"
                         .into(),
@@ -161,7 +208,10 @@ impl Config {
                 }
             }
         }
-        let allowed_origins = if allowed_origins.is_empty() {
+        let allowed_origins = if allowed_origins.is_empty() && sites.is_some() {
+            // No single-site bot: the /ws, /availability routes are not served.
+            Vec::new()
+        } else if allowed_origins.is_empty() {
             vec![
                 "http://localhost:8787".into(),
                 "http://127.0.0.1:8787".into(),
@@ -234,18 +284,10 @@ impl Config {
             None => env
                 .get("SYSTEM_PROMPT")
                 .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.into()),
-        }
-        .replace("{bot_name}", &bot_name);
+        };
         // Without a webhook a confirmed lead would go nowhere, so lead capture is off in production.
         let lead_capture = lead_webhook_url.is_some() || !production;
-        let system_prompt = system_prompt.replace(
-            "{lead_instructions}",
-            if lead_capture {
-                "If you cannot answer, offer to take the visitor's contact details so the team can follow up. Only call propose_lead after the visitor has given their name and email and asked to be contacted."
-            } else {
-                "If you cannot answer, suggest the visitor contacts the business directly."
-            },
-        );
+        let system_prompt = render_system_prompt(&system_prompt, &bot_name, lead_capture);
 
         let limits = Limits {
             max_connections_per_ip: env.num("MAX_CONNECTIONS_PER_IP", 3, &mut errors),
@@ -299,6 +341,7 @@ impl Config {
             lead_webhook_secret,
             lead_capture,
             limits,
+            sites,
         };
         if errors.is_empty() {
             Ok(config)
@@ -308,7 +351,31 @@ impl Config {
     }
 }
 
-fn is_local(origin: &str) -> bool {
+/// Fills `{bot_name}` and `{lead_instructions}` in a system prompt template.
+pub fn render_system_prompt(template: &str, bot_name: &str, lead_capture: bool) -> String {
+    template.replace("{bot_name}", bot_name).replace(
+        "{lead_instructions}",
+        if lead_capture {
+            "If you cannot answer, offer to take the visitor's contact details so the team can follow up. Only call propose_lead after the visitor has given their name and email and asked to be contacted."
+        } else {
+            "If you cannot answer, suggest the visitor contacts the business directly."
+        },
+    )
+}
+
+/// An exact origin a bot may be embedded on: https, or plain http only for local hosts
+/// (and any host outside production).
+pub fn valid_origin(origin: &str, production: bool) -> bool {
+    let rest = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"));
+    let Some(host) = rest else { return false };
+    !host.is_empty()
+        && !host.contains(['/', '*', '?', '#', '@', ' '])
+        && (origin.starts_with("https://") || !production || is_local(origin))
+}
+
+pub(crate) fn is_local(origin: &str) -> bool {
     let host = origin.strip_prefix("http://").unwrap_or("");
     let host = host.rsplit_once(':').map_or(host, |(h, port)| {
         if port.chars().all(|c| c.is_ascii_digit()) {

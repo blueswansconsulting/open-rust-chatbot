@@ -4,6 +4,8 @@
  * Optional config, set before the script tag:
  *   window.openRustChatbot = { title, subtitle, greeting, placeholder, serverUrl, turnstileToken };
  * serverUrl may include a path when the server is behind a sub-path, e.g. https://example.com/chat
+ * Any of title, subtitle, greeting, placeholder and privacyUrl left out are read once from
+ * <base>/config when the server provides it (multi-site mode); options set here always win.
  * turnstileToken may be a string or a function returning a fresh token (or a Promise of one);
  * Turnstile tokens are single-use, so use a function if the visitor may reconnect.
  *
@@ -38,14 +40,48 @@
     });
   }
 
+  var DEFAULTS = {
+    title: 'Chat with us',
+    subtitle: 'Usually replies instantly',
+    greeting: 'Hi! How can I help you today?',
+    placeholder: 'Type your message...',
+  };
+  var CONFIG_KEYS = ['title', 'subtitle', 'greeting', 'placeholder', 'privacyUrl'];
   var TEXT = {
-    title: options.title || 'Chat with us',
-    subtitle: options.subtitle || 'Usually replies instantly',
-    greeting: options.greeting || 'Hi! How can I help you today?',
-    placeholder: options.placeholder || 'Type your message...',
     // Required transparency (EU AI Act Art. 50): visitors must know they're talking to an AI.
     disclosure: options.disclosure || "You're chatting with an AI assistant. It can make mistakes, so please check anything important.",
   };
+  var privacyOption = options.privacyUrl;
+
+  // Settings the host page left out may come from the server. The widget mounts straight away
+  // with the defaults and updates its texts when (and if) the reply arrives; any failure,
+  // including a 404 from an older server, keeps the defaults.
+  function applySettings(remote) {
+    remote = remote && typeof remote === 'object' ? remote : {};
+    function pick(key) {
+      if (options[key]) return options[key];
+      return typeof remote[key] === 'string' && remote[key] ? remote[key] : DEFAULTS[key];
+    }
+    TEXT.title = pick('title');
+    TEXT.subtitle = pick('subtitle');
+    TEXT.greeting = pick('greeting');
+    TEXT.placeholder = pick('placeholder');
+    if (!privacyOption && typeof remote.privacyUrl === 'string') privacyOption = remote.privacyUrl;
+  }
+
+  function loadSettings() {
+    var missing = CONFIG_KEYS.some(function (k) {
+      return !options[k];
+    });
+    if (!missing || typeof fetch !== 'function') return Promise.resolve(null);
+    return fetch(serverBase + '/config', { credentials: 'omit' })
+      .then(function (r) {
+        return r.ok ? r.json() : null;
+      })
+      .catch(function () {
+        return null;
+      });
+  }
 
   function safeUrl(value) {
     try {
@@ -154,8 +190,10 @@
 
     var header = el('div', 'orc-header');
     var headerText = el('div', 'orc-header-text');
-    headerText.appendChild(el('div', 'orc-header-title', TEXT.title));
-    headerText.appendChild(el('div', 'orc-header-subtitle', TEXT.subtitle));
+    var titleNode = el('div', 'orc-header-title', TEXT.title);
+    var subtitleNode = el('div', 'orc-header-subtitle', TEXT.subtitle);
+    headerText.appendChild(titleNode);
+    headerText.appendChild(subtitleNode);
     var closeBtn = el('button', 'orc-close', '×');
     closeBtn.type = 'button';
     closeBtn.setAttribute('aria-label', 'Close chat');
@@ -182,14 +220,17 @@
 
     panel.appendChild(header);
     var disclosure = el('div', 'orc-disclosure', TEXT.disclosure);
-    var privacyUrl = options.privacyUrl && safeUrl(options.privacyUrl);
-    if (privacyUrl) {
+    var privacyLink = null;
+    function showPrivacyLink() {
+      var privacyUrl = privacyOption && safeUrl(privacyOption);
+      if (!privacyUrl || privacyLink) return;
       disclosure.appendChild(document.createTextNode(' '));
-      var privacy = el('a', 'orc-disclosure-link', 'Privacy');
-      privacy.href = privacyUrl;
-      privacy.rel = 'noopener noreferrer';
-      disclosure.appendChild(privacy);
+      privacyLink = el('a', 'orc-disclosure-link', 'Privacy');
+      privacyLink.href = privacyUrl;
+      privacyLink.rel = 'noopener noreferrer';
+      disclosure.appendChild(privacyLink);
     }
+    showPrivacyLink();
     panel.appendChild(disclosure);
     panel.appendChild(messages);
     panel.appendChild(inputRow);
@@ -208,6 +249,7 @@
     var typing = null;
     var waiting = false;
     var greeted = false;
+    var greetingNode = null;
     var replyTimer = null;
     var REPLY_TIMEOUT_MS = 60000;
     var SLOW_REPLY_MS = 15000;
@@ -620,7 +662,7 @@
       bubble.setAttribute('aria-label', 'Close chat');
       if (!greeted) {
         greeted = true;
-        append('assistant', TEXT.greeting);
+        greetingNode = append('assistant', TEXT.greeting);
       }
       connect();
       if (!opts || opts.focus !== false) input.focus();
@@ -680,6 +722,22 @@
     window.addEventListener('pagehide', saveTranscript);
     var reopen = store.get('open') === '1';
 
+    // Server-provided texts arrived: update what is already on screen.
+    settings.then(function (remote) {
+      var oldGreeting = TEXT.greeting;
+      applySettings(remote);
+      titleNode.textContent = TEXT.title;
+      subtitleNode.textContent = TEXT.subtitle;
+      panel.setAttribute('aria-label', TEXT.title);
+      if (!input.disabled) input.placeholder = TEXT.placeholder;
+      input.setAttribute('aria-label', TEXT.placeholder);
+      showPrivacyLink();
+      if (greetingNode && greetingNode.textContent === oldGreeting && messages.lastChild === greetingNode) {
+        greetingNode.textContent = TEXT.greeting;
+        saveTranscript();
+      }
+    });
+
     checkHealth().then(function (ok) {
       setAvailable(ok);
       // Reopen quietly on larger screens only: on phones the panel would cover the page the
@@ -699,6 +757,8 @@
     });
   }
 
+  applySettings(null);
+  var settings = loadSettings();
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, { once: true });
   else mount();
 })();

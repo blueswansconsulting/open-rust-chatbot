@@ -11,3 +11,5 @@ All notable changes are documented here. This project follows [Semantic Versioni
 - Lead capture with visitor confirmation and HMAC-signed webhooks.
 - Origin allowlist, connection caps, rate limits, size limits, idle timeout, optional Turnstile.
 - Docker image (distroless, non-root) and compose file.
+- Multi-site mode: many bots from one server under `/b/<id>/...`, with settings, knowledge base and
+  allowed origins loaded from a sites API (`SITES_API_URL`), cached, and invalidated on demand.
