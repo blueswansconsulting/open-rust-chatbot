@@ -740,3 +740,83 @@ async fn parked_lead_cards_are_dropped_when_lead_capture_is_turned_off() {
     let extra = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
     assert!(extra.is_err(), "no lead card is shown again: {extra:?}");
 }
+
+fn partner_bot(id: &str) -> Value {
+    let mut b = bot(
+        id,
+        ALPHA_ORIGIN,
+        "# Hours\n\nPartner opens at 8am.",
+        "Partner",
+    );
+    b["partnerId"] = json!("tradesites");
+    b["version"] = json!(3);
+    b["caps"] = json!({"repliesPerHour": 60, "repliesPerDay": 300, "partnerRepliesPerDay": 20000});
+    b
+}
+
+#[tokio::test]
+async fn partner_details_never_reach_the_public_config() {
+    let h = start(&[]).await;
+    h.sites.set("ts-abc", partner_bot("ts-abc"));
+    let v: Value = reqwest::get(format!("http://{}/b/ts-abc/config", h.addr))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["greeting", "placeholder", "privacyUrl", "subtitle", "title"]
+    );
+    assert!(!v.to_string().contains("tradesites"));
+}
+
+#[tokio::test]
+async fn partner_bots_are_served_stale_for_less_time() {
+    let h = start(&[
+        ("SITES_CACHE_SECONDS", "1"),
+        ("SITES_STALE_SECONDS", "600"),
+        ("SITES_PARTNER_STALE_SECONDS", "2"),
+    ])
+    .await;
+    h.sites.set("ts-abc", partner_bot("ts-abc"));
+    for id in ["alpha", "ts-abc"] {
+        assert_eq!(
+            status(format!("http://{}/b/{id}/config", h.addr)).await,
+            200
+        );
+    }
+    h.sites.down.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    assert_eq!(
+        status(format!("http://{}/b/alpha/config", h.addr)).await,
+        200,
+        "a normal bot is still served stale"
+    );
+    assert_eq!(
+        status(format!("http://{}/b/ts-abc/config", h.addr)).await,
+        503,
+        "a partner bot is not"
+    );
+}
+
+#[tokio::test]
+async fn a_new_version_is_reparsed_even_with_the_same_updated_at() {
+    // No invalidation: the cached copy expires and is refetched with the same updatedAt.
+    let h = start(&[("SITES_CACHE_SECONDS", "1")]).await;
+    h.sites.set("ts-abc", partner_bot("ts-abc"));
+    let a = ask(&h.addr, "ts-abc", ALPHA_ORIGIN, "What are your hours?").await;
+    assert!(a.contains("8am"), "{a}");
+    let mut changed = partner_bot("ts-abc");
+    changed["knowledgeBase"] = json!("# Hours\n\nPartner opens at 9am.");
+    changed["version"] = json!(4);
+    h.sites.set("ts-abc", changed);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // The first request after expiry is served the old copy while it refreshes.
+    status(format!("http://{}/b/ts-abc/config", h.addr)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let a = ask(&h.addr, "ts-abc", ALPHA_ORIGIN, "What are your hours?").await;
+    assert!(a.contains("9am"), "{a}");
+}

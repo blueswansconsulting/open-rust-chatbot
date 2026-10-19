@@ -42,6 +42,10 @@ pub struct SitesConfig {
     pub cache_ttl: Duration,
     /// How long the last good copy is served while the sites API is unreachable.
     pub stale_ttl: Duration,
+    /// The same, for bots owned by a partner (shorter, so disabling a partner takes effect fast).
+    pub partner_stale_ttl: Duration,
+    /// Approximate memory budget for cached bots; least recently used bots are dropped first.
+    pub max_cache_bytes: usize,
 }
 
 impl std::fmt::Debug for SitesConfig {
@@ -51,6 +55,8 @@ impl std::fmt::Debug for SitesConfig {
             .field("token", &"<redacted>")
             .field("cache_ttl", &self.cache_ttl)
             .field("stale_ttl", &self.stale_ttl)
+            .field("partner_stale_ttl", &self.partner_stale_ttl)
+            .field("max_cache_bytes", &self.max_cache_bytes)
             .finish()
     }
 }
@@ -177,6 +183,14 @@ impl Config {
                 token,
                 cache_ttl: Duration::from_secs(env.num("SITES_CACHE_SECONDS", 30, &mut errors)),
                 stale_ttl: Duration::from_secs(env.num("SITES_STALE_SECONDS", 600, &mut errors)),
+                partner_stale_ttl: Duration::from_secs(env.num(
+                    "SITES_PARTNER_STALE_SECONDS",
+                    60,
+                    &mut errors,
+                )),
+                max_cache_bytes: env
+                    .num::<usize>("SITES_CACHE_MAX_MB", 256, &mut errors)
+                    .saturating_mul(1024 * 1024),
             }
         });
 
