@@ -809,3 +809,53 @@ fn idle_sweep_removes_expired_chats_without_any_new_traffic() {
     shared.sweep_expired_sessions();
     assert_eq!(shared.parked_sessions(), 0);
 }
+
+#[tokio::test]
+async fn text_only_model_requests_a_call_back_via_a_hidden_lead_line() {
+    let prompts: Arc<Mutex<Vec<String>>> = Arc::default();
+    let sink = prompts.clone();
+    let bridge = axum::Router::new().route(
+        "/bridge",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(body["message"].as_str().unwrap_or_default().to_owned());
+                axum::Json(json!({ "text": "Thanks Jo, I'll get the team to call you after 5pm.\nLEAD: {\"name\":\"Jo Bloggs\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":\"after 5pm\",\"message\":\"Wants a demo for a plumbing site\"}" }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_url = format!("http://{}/bridge", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "openclaw"),
+        ("OPENCLAW_BRIDGE_URL", &bridge_url),
+        ("OPENCLAW_BRIDGE_TOKEN", "t"),
+    ])
+    .await;
+    let mut ws = connect(&addr, ORIGIN).await.unwrap();
+    ws.send(Message::Text(
+        "I'm Jo Bloggs, call me on 07700 900123 after 5pm please".into(),
+    ))
+    .await
+    .unwrap();
+    let frames = until_done(&mut ws).await;
+    let visible = text_of(&frames);
+    assert_eq!(
+        visible, "Thanks Jo, I'll get the team to call you after 5pm.",
+        "lead line hidden from the visitor"
+    );
+    let card = frames
+        .iter()
+        .find(|f| f["type"] == "card")
+        .expect("call-back card");
+    assert_eq!(card["card"]["lead"]["phone"], "07700 900123");
+    assert_eq!(card["card"]["lead"]["bestTime"], "after 5pm");
+    assert!(card["card"]["lead"].get("email").is_none());
+    let prompt = prompts.lock().unwrap()[0].clone();
+    assert!(
+        prompt.contains("LEAD:"),
+        "the model is told how to request a call back"
+    );
+}

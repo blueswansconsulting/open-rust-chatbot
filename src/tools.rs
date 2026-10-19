@@ -26,9 +26,13 @@ pub struct ToolDefinition {
 pub struct Lead {
     pub lead_id: String,
     pub name: String,
-    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phone: Option<String>,
+    /// When the visitor would like a call back, in their own words ("after 5pm").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -61,14 +65,15 @@ pub fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "propose_lead",
-            description: "Show the visitor a confirmation card with their contact details. Nothing is sent until the visitor presses confirm. Only use after the visitor has asked to be contacted and given their name and email.",
+            description: "Show the visitor a confirmation card with their contact details so the team can call or email them back. Nothing is sent until the visitor presses confirm. Only use after the visitor has asked to be contacted and given their name plus a phone number or email.",
             parameters: object(
-                &["name", "email", "phone", "message"],
+                &["name", "email", "phone", "best_time", "message"],
                 json!({
                     "name": { "type": "string" },
-                    "email": { "type": "string" },
+                    "email": { "type": ["string", "null"] },
                     "phone": { "type": ["string", "null"] },
-                    "message": { "type": ["string", "null"] },
+                    "best_time": { "type": ["string", "null"], "description": "When they'd like a call back, in their words" },
+                    "message": { "type": ["string", "null"], "description": "One-line summary of what they want to talk about" },
                 }),
             ),
         },
@@ -107,7 +112,14 @@ pub fn execute(kb: &KnowledgeBase, call: &ToolCall) -> ToolOutcome {
         }
         "propose_lead" => {
             let name = clip(string_arg(&call.arguments, "name"), MAX_FIELD_CHARS);
-            let email = clip(string_arg(&call.arguments, "email"), MAX_FIELD_CHARS).to_lowercase();
+            let email =
+                Some(clip(string_arg(&call.arguments, "email"), MAX_FIELD_CHARS).to_lowercase())
+                    .filter(|e| !e.is_empty());
+            let best_time = Some(clip(
+                string_arg(&call.arguments, "best_time"),
+                MAX_FIELD_CHARS,
+            ))
+            .filter(|t| !t.is_empty());
             let phone = Some(clip(string_arg(&call.arguments, "phone"), MAX_FIELD_CHARS))
                 .filter(|p| !p.is_empty());
             let message = Some(clip(
@@ -119,7 +131,10 @@ pub fn execute(kb: &KnowledgeBase, call: &ToolCall) -> ToolOutcome {
             if name.is_empty() {
                 problems.push("name is missing");
             }
-            if !EMAIL_RE.is_match(&email) {
+            if email.is_none() && phone.is_none() {
+                problems.push("a phone or email is needed so the team can get back to them");
+            }
+            if email.as_ref().is_some_and(|e| !EMAIL_RE.is_match(e)) {
                 problems.push("email is not valid");
             }
             if phone.as_ref().is_some_and(|p| !PHONE_RE.is_match(p)) {
@@ -133,6 +148,7 @@ pub fn execute(kb: &KnowledgeBase, call: &ToolCall) -> ToolOutcome {
                 name,
                 email,
                 phone,
+                best_time,
                 message,
             })
         }
@@ -198,7 +214,10 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            (lead.name.as_str(), lead.email.as_str()),
+            (
+                lead.name.as_str(),
+                lead.email.as_deref().unwrap_or_default()
+            ),
             ("Sam", "sam@example.com")
         );
         assert_eq!(lead.lead_id.len(), 36);
@@ -235,6 +254,34 @@ mod tests {
             lead.message.unwrap().chars().count(),
             MAX_LEAD_MESSAGE_CHARS
         );
+    }
+
+    #[test]
+    fn call_back_request_needs_a_phone_or_email_and_keeps_best_time() {
+        let phone_only = execute(
+            &kb(),
+            &call(
+                "propose_lead",
+                json!({"name": "Jo", "email": null, "phone": "07700 900123", "best_time": "after 5pm", "message": "wants a demo"}),
+            ),
+        );
+        let ToolOutcome::LeadProposed(lead) = phone_only else {
+            panic!("phone-only call back must be valid")
+        };
+        assert_eq!(lead.email, None);
+        assert_eq!(lead.best_time.as_deref(), Some("after 5pm"));
+
+        let neither = execute(
+            &kb(),
+            &call(
+                "propose_lead",
+                json!({"name": "Jo", "email": null, "phone": null, "best_time": null, "message": null}),
+            ),
+        );
+        let ToolOutcome::Result(v) = neither else {
+            panic!()
+        };
+        assert!(v["problems"].to_string().contains("phone or email"));
     }
 
     #[test]
