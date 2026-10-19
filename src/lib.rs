@@ -60,6 +60,58 @@ pub struct Shared {
     rate_limiter: RateLimiter,
     open_connections: AtomicUsize,
     model_health: std::sync::Mutex<ModelHealth>,
+    resume_store: std::sync::Mutex<HashMap<String, StoredSession>>,
+}
+
+/// A conversation parked between page loads so the next page can resume it.
+struct StoredSession {
+    history: Vec<llm::Message>,
+    turns: usize,
+    saved: std::time::Instant,
+}
+
+const RESUME_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_STORED_SESSIONS: usize = 10_000;
+
+/// 256 random bits from the OS RNG (two v4 UUIDs) as 64 hex characters.
+pub fn random_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+impl Shared {
+    pub fn save_session(&self, token: &str, history: &[llm::Message], turns: usize) {
+        let mut store = self.resume_store.lock().unwrap();
+        if store.len() >= MAX_STORED_SESSIONS && !store.contains_key(token) {
+            store.retain(|_, s| s.saved.elapsed() < RESUME_TTL);
+            if store.len() >= MAX_STORED_SESSIONS {
+                if let Some(oldest) = store
+                    .iter()
+                    .min_by_key(|(_, s)| s.saved)
+                    .map(|(k, _)| k.clone())
+                {
+                    store.remove(&oldest);
+                }
+            }
+        }
+        store.insert(
+            token.to_owned(),
+            StoredSession {
+                history: history.to_vec(),
+                turns,
+                saved: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Single use: a token can resume one conversation once.
+    pub fn take_session(&self, token: &str) -> Option<(Vec<llm::Message>, usize)> {
+        let stored = self.resume_store.lock().unwrap().remove(token)?;
+        (stored.saved.elapsed() < RESUME_TTL).then_some((stored.history, stored.turns))
+    }
 }
 
 /// Circuit breaker for the model: the widget hides its button while the chat can't answer.
@@ -125,6 +177,7 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
             .collect(),
         open_connections: AtomicUsize::new(0),
         model_health: Default::default(),
+        resume_store: Default::default(),
         kb,
         http,
         config,

@@ -173,3 +173,37 @@ await run('one failed health check while connected shows nothing', async (page) 
   await page.waitForTimeout(1500);
   assert.equal(count(await text(page), 'Sorry'), 0, 'a single blip must not interrupt the chat');
 });
+
+await run('AI disclosure is always shown in the chat panel', async (page) => {
+  await startServer();
+  await page.goto(BASE + '/');
+  await page.click('[data-testid=orc-bubble]');
+  const disclosure = await page.textContent('.orc-disclosure');
+  assert.match(disclosure, /AI assistant/);
+});
+
+await run('chat continues on the next page: transcript, open panel and server context restored', async (page) => {
+  await startServer();
+  const sessions = [];
+  page.on('websocket', (ws) => ws.on('framereceived', (f) => {
+    try {
+      const v = JSON.parse(f.payload);
+      if (v.type === 'session') sessions.push(v);
+    } catch {}
+  }));
+  await page.goto(BASE + '/');
+  await page.click('[data-testid=orc-bubble]');
+  await page.fill('.orc-input', 'What are your opening hours?');
+  await page.press('.orc-input', 'Enter');
+  await page.waitForFunction(() => document.body.textContent.includes('8am'), null, { timeout: 5000 });
+  await page.reload(); // same tab, next page
+  await page.waitForSelector('.orc-panel[data-open="true"]', { timeout: 10000 });
+  const text = await page.textContent('.orc-messages');
+  assert.match(text, /What are your opening hours\?/, 'visitor message restored');
+  assert.match(text, /8am/, 'assistant reply restored');
+  await new Promise((r) => setTimeout(r, 500));
+  assert.equal(sessions.length >= 2, true, 'a session frame on each page');
+  assert.equal(sessions[sessions.length - 1].resumed, true, 'server restored the conversation');
+  assert.equal(sessions[sessions.length - 1].turns, 1);
+  assert.equal(await page.locator('.orc-msg-assistant', { hasText: 'Hi! How can I help' }).count(), 1, 'greeting restored once, not repeated');
+});

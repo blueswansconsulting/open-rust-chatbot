@@ -22,6 +22,7 @@ Anyone on the internet can open the widget, so every visitor is treated as untru
 | Slow-header (slowloris) connections | Run behind a reverse proxy (Caddy, nginx, Traefik, Cloudflare) that enforces header timeouts. The server binds to 127.0.0.1 by default for this reason. |
 | Prompt injection making the bot act | The model only has read-only search and a lead *proposal*. Sending a lead requires the visitor to press confirm in the widget; the model cannot confirm. |
 | One visitor reading or confirming another's data | All conversation and lead state lives on the visitor's own WebSocket connection; lead ids are random UUIDs |
+| Hijacking someone's conversation | Resume tokens are 256-bit random, single-use (each page gets a new one), expire after 30 minutes, live only in server memory, and are sent in the first WebSocket message rather than the URL so they don't reach access logs. The widget keeps them in per-tab `sessionStorage`. |
 | XSS through model output | The widget renders all text with `textContent`, never `innerHTML` |
 | Leaking secrets or provider errors to visitors | Visitors see generic errors; details go to server logs. The API key is never sent to the browser. |
 | PII in logs | Chat content is never logged; emails and phone numbers in log events are redacted |
