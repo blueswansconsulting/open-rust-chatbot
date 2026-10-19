@@ -105,6 +105,76 @@ Point `KNOWLEDGE_BASE_PATH` at a Markdown file. Each heading starts a section; l
 
 Confirmed leads are POSTed as JSON to `LEAD_WEBHOOK_URL` with `X-ORC-Timestamp` and `X-ORC-Signature` headers. Verification examples for Node, Python and Go are in [docs/webhooks.md](docs/webhooks.md). Failed deliveries are retried twice, and the visitor is asked to try again if delivery still fails.
 
+## Multi-site mode
+
+One server can host many bots, each with its own allowed websites, system prompt, knowledge base,
+widget texts and lead routing. Settings come from an HTTP API you run (for example your own dashboard),
+so adding or editing a bot needs no restart. It is on when `SITES_API_URL` is set; without it the
+single-site settings above work exactly as before.
+
+| Variable | |
+| --- | --- |
+| `SITES_API_URL` | Base URL of your sites API. Bot `<id>` is fetched from `SITES_API_URL/<id>`. |
+| `INTERNAL_API_TOKEN` | At least 32 characters. Sent as `Authorization: Bearer …` to the sites API, and required on `/internal/…` calls to this server. |
+| `SITES_CACHE_SECONDS` | Default 30. A fetched bot is reused for this long. |
+| `SITES_STALE_SECONDS` | Default 600. While the sites API is unreachable the last good copy is served this long, then `503`. |
+
+`ALLOWED_ORIGINS`, `SYSTEM_PROMPT` and `KNOWLEDGE_BASE_PATH` are not needed (if `ALLOWED_ORIGINS` is
+set, the single-site bot is also served on the root paths). The model, rate limits, connection caps
+and `LEAD_WEBHOOK_SECRET` are shared by all bots. `LEAD_WEBHOOK_URL` is used as a base: its `site`
+query parameter is set to the bot id, e.g. `https://dash.example/api/leads?site=plumbing-co-7f3a`.
+
+**Install snippet** for a bot:
+
+```html
+<script src="https://chat.your-domain.com/b/plumbing-co-7f3a/widget.js" defer></script>
+```
+
+**Routes per bot** (bot ids are `[a-z0-9-]`, 3 to 40 characters; anything else is `404` without a lookup):
+
+| Path | |
+| --- | --- |
+| `/b/<id>/widget.js`, `/b/<id>/widget.css` | The widget, same for every bot |
+| `/b/<id>/ws` | Chat WebSocket; the `Origin` must be one of the bot's `allowedOrigins` |
+| `/b/<id>/availability` | `200` when the bot exists and the model is up, `404` unknown or paused, `503` model or sites API down |
+| `/b/<id>/config` | Public widget texts `{"title","subtitle","greeting","placeholder","privacyUrl"}` (CORS `*`, cached 60 s) |
+| `POST /internal/bots/<id>/invalidate` | With the bearer token: drop the cached copy now (call it after every edit). Keep `/internal/` off the public internet. |
+
+The widget reads any of `title`, `subtitle`, `greeting`, `placeholder` and `privacyUrl` that the host
+page did not set in `window.openRustChatbot` from `/config`; options on the page always win. The
+widget shows straight away with its defaults and updates the texts when `/config` answers. In
+single-site mode `/config` answers with nulls. If you proxy legacy paths to a bot (for example
+`/widget.js` to `/b/<id>/widget.js`), proxy `/config` too.
+
+**Sites API contract.** `GET SITES_API_URL/<id>` returns `200` with:
+
+```json
+{
+  "id": "plumbing-co-7f3a",
+  "status": "active",
+  "name": "Plumbing Co",
+  "botName": "the Plumbing Co assistant",
+  "title": "Plumbing Co", "subtitle": "Ask us anything", "greeting": "Hi!", "placeholder": "Ask…",
+  "privacyUrl": null,
+  "allowedOrigins": ["https://www.plumbing.example"],
+  "instructions": "You are {bot_name}… {lead_instructions}",
+  "knowledgeBase": "# Markdown…",
+  "leadCapture": true,
+  "updatedAt": "2026-10-19T17:00:00.000Z"
+}
+```
+
+or `404` for an unknown or paused bot (a `status` other than `active` is also treated as not found).
+`instructions` may use `{bot_name}` and `{lead_instructions}`; when empty the default prompt is used.
+The knowledge base is parsed once per `updatedAt`. Once a cached bot is older than
+`SITES_CACHE_SECONDS` it is still served straight away while one background fetch refreshes it, so
+known bots never wait on the sites API; a bot with no usable copy waits at most 2 seconds for a lookup
+slot, then gets `503`. `allowedOrigins` entries must be exact origins
+(`https://…`, or `http://localhost:<port>` / `http://127.0.0.1:<port>`, compared case-insensitively);
+anything else is ignored.
+Unknown ids are remembered for 10 seconds. A conversation's resume token only works on the bot it
+started on, and edits (or pausing the bot) apply to open chats from their next message.
+
 ## Configuration
 
 Every setting is an environment variable, documented in [`.env.example`](.env.example). The server refuses to start with an unsafe configuration (for example no `ALLOWED_ORIGINS`, a `*` origin, plain-http origins, or a weak webhook secret) and tells you exactly what to fix.

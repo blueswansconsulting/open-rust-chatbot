@@ -284,3 +284,111 @@ await run('a reconnect on the same page keeps the server-side conversation', asy
   assert.equal(last.resumed, true, 'the new socket resumed the conversation');
   assert.equal(last.turns, 1);
 });
+
+// Multi-site mode: a fake sites API also serves the host page, so the page's origin is the
+// bot's allowed origin.
+const { createServer } = await import('node:http');
+const SITES_TOKEN = 'browser-test-token-0123456789abcdef0123'; // gitleaks:allow (test fixture)
+const SITES_PORT = PORT + 1;
+const HOST = `http://127.0.0.1:${SITES_PORT}`;
+const demoBot = {
+  id: 'demo-bot',
+  status: 'active',
+  name: 'Demo Co',
+  botName: 'Demo Bot',
+  title: 'Demo Co Chat',
+  subtitle: 'Demo subtitle',
+  greeting: 'Hello from the demo bot!',
+  placeholder: 'Ask Demo Co...',
+  privacyUrl: 'https://demo.example/privacy',
+  allowedOrigins: [HOST],
+  instructions: 'You are {bot_name}. {lead_instructions}',
+  knowledgeBase: '# Opening hours\n\nDemo Co opens at 7am every day.',
+  leadCapture: true,
+  updatedAt: '2026-10-19T17:00:00.000Z',
+};
+
+function startSites() {
+  const sites = createServer((req, res) => {
+    if (req.url.startsWith('/host')) {
+      const opts = req.url.includes('withTitle') ? "<script>window.openRustChatbot = { title: 'Host page title' };</script>" : '';
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(`<!doctype html><title>host</title>${opts}<script src="${BASE}/b/demo-bot/widget.js" defer></script>`);
+    }
+    if (req.headers.authorization !== `Bearer ${SITES_TOKEN}`) {
+      res.writeHead(401);
+      return res.end();
+    }
+    if (req.url === '/internal/bots/demo-bot') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify(demoBot));
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":"not_found"}');
+  });
+  return new Promise((resolve) => sites.listen(SITES_PORT, '127.0.0.1', () => resolve(sites)));
+}
+
+const multiSiteEnv = { SITES_API_URL: `${HOST}/internal/bots`, INTERNAL_API_TOKEN: SITES_TOKEN };
+
+await run('multi-site: widget from /b/<id>/widget.js applies the bot settings and chats with that bot', async (page) => {
+  const sites = await startSites();
+  try {
+    await startServer(5, multiSiteEnv);
+    await page.goto(HOST + '/host');
+    await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+    await page.click('[data-testid=orc-bubble]');
+    assert.equal(await page.textContent('.orc-header-title'), 'Demo Co Chat');
+    assert.equal(await page.textContent('.orc-header-subtitle'), 'Demo subtitle');
+    assert.equal(await page.getAttribute('.orc-input', 'placeholder'), 'Ask Demo Co...');
+    assert.equal(await page.getAttribute('.orc-disclosure-link', 'href'), 'https://demo.example/privacy');
+    await page.waitForFunction(() => document.body.textContent.includes('Hello from the demo bot!'), null, { timeout: 5000 });
+    await page.fill('.orc-input', 'What are your opening hours?');
+    await page.press('.orc-input', 'Enter');
+    await page.waitForFunction(() => document.body.textContent.includes('Demo Co opens at 7am'), null, { timeout: 5000 });
+  } finally {
+    sites.close();
+  }
+});
+
+await run('multi-site: options set by the host page win over the bot settings', async (page) => {
+  const sites = await startSites();
+  try {
+    await startServer(5, multiSiteEnv);
+    await page.goto(HOST + '/host?withTitle');
+    await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+    await page.click('[data-testid=orc-bubble]');
+    assert.equal(await page.textContent('.orc-header-title'), 'Host page title');
+    await page.waitForFunction(() => document.body.textContent.includes('Hello from the demo bot!'), null, { timeout: 5000 });
+  } finally {
+    sites.close();
+  }
+});
+
+await run('single-site: /config has no texts, so the defaults stay', async (page) => {
+  await startServer();
+  await page.goto(BASE + '/');
+  await page.click('[data-testid=orc-bubble]');
+  assert.equal(await page.textContent('.orc-header-title'), 'Chat with us');
+  await page.waitForFunction(() => document.body.textContent.includes('Hi! How can I help you today?'), null, { timeout: 5000 });
+});
+
+await run('multi-site: a slow /config never holds the widget back; texts update when it arrives', async (page) => {
+  const sites = await startSites();
+  try {
+    await startServer(5, multiSiteEnv);
+    await page.route('**/b/demo-bot/config', async (route) => {
+      await new Promise((r) => setTimeout(r, 2500));
+      await route.continue();
+    });
+    await page.goto(HOST + '/host');
+    await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 1500 });
+    await page.click('[data-testid=orc-bubble]');
+    assert.equal(await page.textContent('.orc-header-title'), 'Chat with us', 'defaults first');
+    await page.waitForFunction(() => document.querySelector('.orc-header-title').textContent === 'Demo Co Chat', null, { timeout: 5000 });
+    await page.waitForFunction(() => document.body.textContent.includes('Hello from the demo bot!'), null, { timeout: 5000 });
+    assert.equal(await page.locator('.orc-msg-assistant').count(), 1, 'greeting replaced, not duplicated');
+  } finally {
+    sites.close();
+  }
+});

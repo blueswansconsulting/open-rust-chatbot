@@ -7,21 +7,23 @@ pub mod kb;
 pub mod llm;
 pub mod log;
 pub mod rate_limit;
+pub mod sites;
 pub mod tools;
 pub mod webhook;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chat::ChatSession;
 use config::Config;
 use futures_util::{SinkExt, StreamExt};
 use rate_limit::{MessageResult, RateLimiter};
 use serde_json::json;
+use sites::{Site, SiteError, SiteStore};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,10 +55,12 @@ const WS_BUFFER_BYTES: usize = 4 * 1024;
 /// Read-only state shared by every connection.
 pub struct Shared {
     pub config: Config,
-    pub kb: kb::KnowledgeBase,
+    /// The single-site bot (from the environment). Unused in multi-site mode without origins.
+    pub default_site: Arc<Site>,
+    /// Multi-site mode: bots loaded from the sites API.
+    pub sites: Option<Arc<SiteStore>>,
     pub llm: llm::Llm,
     pub http: reqwest::Client,
-    pub tool_definitions: Vec<tools::ToolDefinition>,
     rate_limiter: RateLimiter,
     open_connections: AtomicUsize,
     model_health: std::sync::Mutex<ModelHealth>,
@@ -67,6 +71,9 @@ pub struct Shared {
 /// prompt is not stored (the current one is used on resume).
 #[derive(Clone, Default)]
 pub struct ParkedChat {
+    /// The bot the conversation belongs to (empty for the single-site bot); a token only
+    /// resumes on the same bot.
+    pub site: String,
     pub history: Vec<llm::Message>,
     pub turns: usize,
     pub leads: Vec<tools::Lead>,
@@ -129,7 +136,17 @@ impl Shared {
 
     /// Single use: a token can resume one conversation once.
     pub fn take_session(&self, token: &str) -> Option<ParkedChat> {
-        let stored = self.resume_store.lock().unwrap().sessions.remove(token)?;
+        self.take_session_for(token, "")
+    }
+
+    /// Like `take_session`, but only for a conversation parked on bot `site`. A token presented
+    /// on another bot is left in place (and not resumed).
+    pub fn take_session_for(&self, token: &str, site: &str) -> Option<ParkedChat> {
+        let mut store = self.resume_store.lock().unwrap();
+        if store.sessions.get(token)?.chat.site != site {
+            return None;
+        }
+        let stored = store.sessions.remove(token)?;
         (stored.saved.elapsed() < self.config.limits.resume_ttl).then_some(stored.chat)
     }
 
@@ -198,6 +215,10 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
         .build()
         .map_err(std::io::Error::other)?;
     let limits = &config.limits;
+    let sites = config
+        .sites
+        .clone()
+        .map(|settings| Arc::new(SiteStore::new(&config, settings, http.clone())));
     Ok(Arc::new(Shared {
         rate_limiter: RateLimiter::new(
             limits.max_messages_per_window,
@@ -205,14 +226,11 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
             limits.max_connections_per_ip,
         ),
         llm: llm::Llm::new(config.llm.clone(), http.clone()),
-        tool_definitions: tools::definitions()
-            .into_iter()
-            .filter(|t| config.lead_capture || t.name != "propose_lead")
-            .collect(),
+        default_site: Arc::new(Site::from_config(&config, kb)),
+        sites,
         open_connections: AtomicUsize::new(0),
         model_health: Default::default(),
         resume_store: Default::default(),
-        kb,
         http,
         config,
     }))
@@ -231,9 +249,26 @@ pub fn app(state: Arc<Shared>) -> Router {
         .layer(CompressionLayer::new());
     let mut router = Router::new()
         .route("/health", get(|| async { Json(json!({ "ok": true })) }))
-        .route("/availability", get(availability))
-        .route("/ws", get(ws_upgrade))
         .merge(assets);
+    // The single-site bot. In multi-site mode it is only served if ALLOWED_ORIGINS is set.
+    if !state.config.allowed_origins.is_empty() {
+        router = router
+            .route("/availability", get(availability))
+            .route("/config", get(single_site_config))
+            .route("/ws", get(ws_upgrade));
+    }
+    if state.sites.is_some() {
+        let bot_assets = Router::new()
+            .route("/b/{id}/widget.js", get(bot_widget_js))
+            .route("/b/{id}/widget.css", get(bot_widget_css))
+            .layer(CompressionLayer::new());
+        router = router
+            .route("/b/{id}/ws", get(bot_ws_upgrade))
+            .route("/b/{id}/availability", get(bot_availability))
+            .route("/b/{id}/config", get(bot_config))
+            .route("/internal/bots/{id}/invalidate", post(invalidate_bot))
+            .merge(bot_assets);
+    }
     if !state.config.production {
         router = router.route("/", get(|| async { Html(DEMO_HTML) }));
     }
@@ -261,6 +296,108 @@ async fn availability(State(shared): State<Arc<Shared>>) -> Response {
         Json(json!({ "ok": ok })),
     )
         .into_response()
+}
+
+/// Loads a bot for a `/b/<id>/...` request, or the 404/503 response to send instead.
+async fn load_site(shared: &Shared, id: &str) -> Result<Arc<Site>, Response> {
+    let store = shared
+        .sites
+        .as_ref()
+        .expect("bot routes exist only in multi-site mode");
+    store.get(id).await.map_err(|e| {
+        let (status, error) = match e {
+            SiteError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+            SiteError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        };
+        (
+            status,
+            [
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            Json(json!({ "ok": false, "error": error })),
+        )
+            .into_response()
+    })
+}
+
+async fn bot_widget_js(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -> Response {
+    match load_site(&shared, &id).await {
+        Ok(_) => asset("text/javascript; charset=utf-8", WIDGET_JS),
+        Err(r) => r,
+    }
+}
+
+async fn bot_widget_css(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -> Response {
+    match load_site(&shared, &id).await {
+        Ok(_) => asset("text/css; charset=utf-8", WIDGET_CSS),
+        Err(r) => r,
+    }
+}
+
+async fn bot_availability(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -> Response {
+    match load_site(&shared, &id).await {
+        Ok(_) => availability(State(shared)).await,
+        Err(r) => r,
+    }
+}
+
+/// The single-site bot has no server-side widget texts (they are set on the host page), so
+/// this answers with nulls rather than a 404 on every page view.
+async fn single_site_config(State(shared): State<Arc<Shared>>) -> Response {
+    public_config(&shared.default_site)
+}
+
+fn public_config(site: &Site) -> Response {
+    (
+        [
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (header::CACHE_CONTROL, "public, max-age=60"),
+        ],
+        Json(site.public_config.clone()),
+    )
+        .into_response()
+}
+
+/// Public widget settings (title, greeting...) for the widget to apply.
+async fn bot_config(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -> Response {
+    match load_site(&shared, &id).await {
+        Ok(site) => public_config(&site),
+        Err(r) => r,
+    }
+}
+
+/// Compares in time that depends only on the lengths, not on where the bytes differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `POST /internal/bots/<id>/invalidate`: the sites API tells us a bot changed.
+async fn invalidate_bot(
+    State(shared): State<Arc<Shared>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let store = shared.sites.as_ref().expect("multi-site mode");
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    let expected = shared
+        .config
+        .sites
+        .as_ref()
+        .map(|s| s.token.as_str())
+        .unwrap_or_default();
+    if expected.is_empty() || !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return reject(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    if !sites::valid_id(&id) {
+        return reject(StatusCode::NOT_FOUND, "not found");
+    }
+    store.invalidate(&id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn asset(content_type: &'static str, body: &'static str) -> Response {
@@ -320,7 +457,13 @@ pub fn client_ip(config: &Config, headers: &HeaderMap, peer: SocketAddr) -> Stri
     }
 }
 
-async fn verify_turnstile(shared: &Shared, token: &str, secret: &str, ip: &str) -> bool {
+async fn verify_turnstile(
+    shared: &Shared,
+    site: &Site,
+    token: &str,
+    secret: &str,
+    ip: &str,
+) -> bool {
     let res = shared
         .http
         .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
@@ -333,7 +476,7 @@ async fn verify_turnstile(shared: &Shared, token: &str, secret: &str, ip: &str) 
         Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.is_ok_and(|v| {
             v["success"] == true
                 && v["hostname"].as_str().is_some_and(|host| {
-                    shared.config.allowed_origins.iter().any(|origin| {
+                    site.allowed_origins.iter().any(|origin| {
                         origin
                             .split("://")
                             .nth(1)
@@ -362,18 +505,46 @@ fn reject(status: StatusCode, message: &'static str) -> Response {
     (status, message).into_response()
 }
 
+type WsResult = Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>;
+
 async fn ws_upgrade(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+    ws: WsResult,
+) -> Response {
+    let site = shared.default_site.clone();
+    upgrade(shared, site, peer, query, headers, ws).await
+}
+
+async fn bot_ws_upgrade(
+    State(shared): State<Arc<Shared>>,
+    Path(id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    ws: WsResult,
+) -> Response {
+    match load_site(&shared, &id).await {
+        Ok(site) => upgrade(shared, site, peer, query, headers, ws).await,
+        Err(r) => r,
+    }
+}
+
+async fn upgrade(
+    shared: Arc<Shared>,
+    site: Arc<Site>,
+    peer: SocketAddr,
+    query: HashMap<String, String>,
+    headers: HeaderMap,
+    ws: WsResult,
 ) -> Response {
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .map(|o| o.trim_end_matches('/'));
-    if !origin.is_some_and(|o| shared.config.allowed_origins.iter().any(|a| a == o)) {
+    if !origin.is_some_and(|o| site.allows_origin(o)) {
         return reject(StatusCode::FORBIDDEN, "origin not allowed");
     }
     let ws = match ws {
@@ -401,7 +572,7 @@ async fn ws_upgrade(
         let Some(token) = query.get("ts").filter(|t| !t.is_empty() && t.len() < 4096) else {
             return reject(StatusCode::FORBIDDEN, "verification required");
         };
-        if !verify_turnstile(&shared, token, secret, &slot.ip).await {
+        if !verify_turnstile(&shared, &site, token, secret, &slot.ip).await {
             return reject(StatusCode::FORBIDDEN, "verification failed");
         }
     }
@@ -411,10 +582,10 @@ async fn ws_upgrade(
         .read_buffer_size(WS_BUFFER_BYTES)
         .write_buffer_size(WS_BUFFER_BYTES)
         // If the upgrade fails the closure (and the slot inside it) is dropped, releasing it.
-        .on_upgrade(move |socket| run_socket(socket, slot, session_id))
+        .on_upgrade(move |socket| run_socket(socket, slot, site, session_id))
 }
 
-async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String) {
+async fn run_socket(socket: WebSocket, slot: ConnectionSlot, site: Arc<Site>, session_id: String) {
     let shared = slot.shared.clone();
     let (mut sink, mut inbound) = socket.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -431,7 +602,9 @@ async fn run_socket(socket: WebSocket, slot: ConnectionSlot, session_id: String)
 
     // One worker per socket keeps a visitor's messages strictly in order.
     let worker_tx = out_tx.clone();
-    let mut session = ChatSession::new(shared.clone(), session_id).with_client(slot.ip.clone());
+    let mut session = ChatSession::new(shared.clone(), session_id)
+        .with_site(site)
+        .with_client(slot.ip.clone());
     let worker = tokio::spawn(async move {
         while let Some(text) = msg_rx.recv().await {
             session.handle_message(&text, &worker_tx).await;

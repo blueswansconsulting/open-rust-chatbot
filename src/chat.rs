@@ -3,6 +3,7 @@
 
 use crate::llm::{LlmEvent, Message, Role};
 use crate::log::log_event;
+use crate::sites::{Site, SiteError};
 use crate::tools::{self, Lead, ToolCall, ToolOutcome};
 use crate::Shared;
 use futures_util::StreamExt;
@@ -121,6 +122,8 @@ fn parse_confirmation(text: &str) -> Option<String> {
 
 pub struct ChatSession {
     shared: Arc<Shared>,
+    /// The bot this conversation is with (refreshed each message in multi-site mode).
+    site: Arc<Site>,
     session_id: String,
     history: Vec<Message>,
     pending_leads: HashMap<String, Lead>,
@@ -134,9 +137,11 @@ pub struct ChatSession {
 
 impl ChatSession {
     pub fn new(shared: Arc<Shared>, session_id: String) -> Self {
-        let system = Message::new(Role::System, shared.config.system_prompt.clone());
+        let site = shared.default_site.clone();
+        let system = Message::new(Role::System, site.system_prompt.clone());
         Self {
             shared,
+            site,
             session_id,
             history: vec![system],
             pending_leads: HashMap::new(),
@@ -144,6 +149,41 @@ impl ChatSession {
             client: String::new(),
             resume_token: None,
             seen_first_message: false,
+        }
+    }
+
+    pub fn with_site(mut self, site: Arc<Site>) -> Self {
+        self.history[0].content = site.system_prompt.clone();
+        self.site = site;
+        self
+    }
+
+    /// Picks up the bot's latest settings, so edits apply mid-chat and a paused or deleted bot
+    /// stops answering. Returns false if the bot is gone. While the sites API is down the
+    /// current settings are kept.
+    async fn refresh_site(&mut self) -> bool {
+        let Some(store) = self
+            .shared
+            .sites
+            .as_ref()
+            .filter(|_| !self.site.id.is_empty())
+        else {
+            return true;
+        };
+        match store.get(&self.site.id).await {
+            Ok(site) => {
+                if !Arc::ptr_eq(&site, &self.site) {
+                    self.history[0].content = site.system_prompt.clone();
+                    // Lead cards from a bot that no longer captures leads can't be confirmed.
+                    if !site.lead_capture {
+                        self.pending_leads.clear();
+                    }
+                    self.site = site;
+                }
+                true
+            }
+            Err(SiteError::NotFound) => false,
+            Err(SiteError::Unavailable) => true,
         }
     }
 
@@ -155,6 +195,13 @@ impl ChatSession {
     pub async fn handle_message(&mut self, text: &str, tx: &Sender) {
         let first = !self.seen_first_message;
         self.seen_first_message = true;
+        if !self.refresh_site().await {
+            send(
+                tx,
+                json!({ "type": "error", "message": "Sorry, this chat is no longer available." }),
+            );
+            return;
+        }
         if let Some(token) = parse_resume(text) {
             // Only honoured as a connection's first message, so a live chat can't be swapped.
             if first {
@@ -168,6 +215,7 @@ impl ChatSession {
 
     fn park(&self) -> crate::ParkedChat {
         crate::ParkedChat {
+            site: self.site.id.clone(),
             history: self.history.iter().skip(1).cloned().collect(),
             turns: self.turns,
             leads: self.pending_leads.values().cloned().collect(),
@@ -183,7 +231,7 @@ impl ChatSession {
     fn resume(&mut self, token: Option<&str>, tx: &Sender) {
         let restored = token
             .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
-            .and_then(|t| self.shared.take_session(t));
+            .and_then(|t| self.shared.take_session_for(t, &self.site.id));
         let resumed = restored.is_some();
         let mut leads = Vec::new();
         if let Some(chat) = restored {
@@ -195,7 +243,8 @@ impl ChatSession {
         }
         let token = crate::random_token();
         self.resume_token = Some(token.clone());
-        for lead in leads {
+        // Cards from before lead capture was turned off can no longer be confirmed.
+        for lead in leads.into_iter().filter(|_| self.site.lead_capture) {
             self.pending_leads.insert(lead.lead_id.clone(), lead);
         }
         self.save();
@@ -270,7 +319,7 @@ impl ChatSession {
                 .llm
                 .stream(
                     &trim_history(&self.history, max_history),
-                    &self.shared.tool_definitions,
+                    &self.site.tool_definitions,
                 )
                 .await?;
             while let Some(event) = stream.next().await {
@@ -313,7 +362,7 @@ impl ChatSession {
         let max_history = self.shared.config.limits.max_history_messages;
         let mut messages = trim_history(&self.history, max_history);
         let excerpts: Vec<String> = self
-            .shared
+            .site
             .kb
             .search(&retrieval_query(&self.history, text), 3)
             .iter()
@@ -326,7 +375,7 @@ impl ChatSession {
                 "\n\nKnowledge-base excerpts (the only facts you may state about the business):\n"
             });
             system.content.push_str(&excerpts.join("\n"));
-            if self.shared.config.lead_capture {
+            if self.site.lead_capture {
                 system.content.push_str(TEXT_ONLY_LEAD_INSTRUCTIONS);
             }
         }
@@ -345,13 +394,13 @@ impl ChatSession {
         self.history.push(Message::new(Role::Assistant, reply));
         self.history = trim_history(&self.history, max_history);
 
-        if let Some(arguments) = lead_args.filter(|_| self.shared.config.lead_capture) {
+        if let Some(arguments) = lead_args.filter(|_| self.site.lead_capture) {
             let call = ToolCall {
                 id: "text-lead".into(),
                 name: "propose_lead".into(),
                 arguments,
             };
-            if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.shared.kb, &call) {
+            if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, &call) {
                 self.offer_lead(lead, tx);
             }
             send(tx, json!({ "type": "done" }));
@@ -363,9 +412,7 @@ impl ChatSession {
         }
 
         // Fallback when the model didn't add a lead line: offer a card for an email in the text.
-        let email = EMAIL_IN_TEXT
-            .find(text)
-            .filter(|_| self.shared.config.lead_capture);
+        let email = EMAIL_IN_TEXT.find(text).filter(|_| self.site.lead_capture);
         if let Some(email) = email {
             let mut arguments = serde_json::Map::new();
             arguments.insert("name".into(), json!("Website visitor"));
@@ -377,7 +424,7 @@ impl ChatSession {
                 name: "propose_lead".into(),
                 arguments,
             };
-            if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.shared.kb, &call) {
+            if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, &call) {
                 self.offer_lead(lead, tx);
             }
         }
@@ -409,12 +456,12 @@ impl ChatSession {
             json!({ "session": self.session_id, "tool": call.name }),
         );
         let offered = self
-            .shared
+            .site
             .tool_definitions
             .iter()
             .any(|t| t.name == call.name);
         let outcome = if offered {
-            tools::execute(&self.shared.kb, call)
+            tools::execute(&self.site.kb, call)
         } else {
             ToolOutcome::Result(json!({ "error": format!("unknown tool {}", call.name) }))
         };
@@ -442,10 +489,12 @@ impl ChatSession {
             send(tx, json!({ "type": "done" }));
             return;
         };
-        let config = &self.shared.config;
-        let delivered = match (&config.lead_webhook_url, &config.lead_webhook_secret) {
+        let delivered = match (
+            &self.site.lead_webhook_url,
+            &self.shared.config.lead_webhook_secret,
+        ) {
             (Some(url), Some(secret)) => {
-                let body = crate::webhook::payload(&lead, &config.bot_name);
+                let body = crate::webhook::payload(&lead, &self.site.bot_name);
                 crate::webhook::deliver(&self.shared.http, url, secret, body).await
             }
             // No webhook configured: record that a lead arrived (PII redacted) so local demos work.
