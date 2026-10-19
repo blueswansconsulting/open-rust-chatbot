@@ -227,6 +227,7 @@ impl Cache {
             self.bytes -= old.size();
         }
     }
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.map.len()
     }
