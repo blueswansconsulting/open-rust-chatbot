@@ -302,14 +302,9 @@ impl ChatSession {
             (Ok(()), Some(m)) if m.role == Role::Assistant => m.content.len(),
             _ => 0,
         };
-        self.shared.meter.record(
-            &self.site,
-            &self.client,
-            result.is_ok(),
-            text.len(),
-            reply_chars,
-            now,
-        );
+        self.shared
+            .meter
+            .record(&self.site, result.is_ok(), text.len(), reply_chars);
         match &result {
             Ok(()) => self.shared.record_model_result(true, &self.client),
             // Only outages count, so a visitor can't hide the bot by sending rejected input.

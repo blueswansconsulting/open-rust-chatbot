@@ -11,7 +11,7 @@
 //! use it all up.
 
 use crate::log::log_event;
-use crate::sites::Site;
+use crate::sites::{Site, SpendCaps};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -19,8 +19,10 @@ use std::sync::Mutex;
 
 const HOUR: u64 = 3600;
 const DAY: u64 = 86_400;
-/// One visitor may use at most this share (1/n) of a bot's daily cap.
+/// One visitor may use at most this share (1/n) of a bot's daily cap...
 const PER_VISITOR_SHARE: u32 = 10;
+/// ...but never fewer than this many turns a day.
+const MIN_PER_VISITOR: u32 = 10;
 /// Visitors tracked per bot per day; beyond this new visitors share one bucket.
 const MAX_VISITORS_TRACKED: usize = 4096;
 
@@ -104,6 +106,7 @@ pub struct SeedBot {
 
 pub struct Meter {
     instance_id: String,
+    reporting: bool,
     state: Mutex<State>,
 }
 
@@ -122,12 +125,14 @@ pub fn unix_now() -> u64 {
 }
 
 impl BotWindow {
+    /// Moves to a new hour or day. Only ever forwards, so a late call with an older time
+    /// can't reset the current counts.
     fn roll(&mut self, now: u64) {
-        if self.hour != now / HOUR {
+        if now / HOUR > self.hour {
             self.hour = now / HOUR;
             self.hour_count = 0;
         }
-        if self.day != now / DAY {
+        if now / DAY > self.day {
             self.day = now / DAY;
             self.day_count = 0;
             self.visitors.clear();
@@ -135,47 +140,111 @@ impl BotWindow {
     }
 }
 
-impl Default for Meter {
-    fn default() -> Self {
-        Self::new()
+/// Defaults applied to partner bots whose record doesn't carry caps, so a missing field never
+/// means "unlimited" for a bot someone else is billed for.
+const PARTNER_DEFAULT_CAPS: SpendCaps = SpendCaps {
+    replies_per_hour: Some(60),
+    replies_per_day: Some(300),
+    partner_replies_per_day: Some(20_000),
+};
+
+fn effective_caps(site: &Site) -> SpendCaps {
+    let caps = site.caps;
+    if site.partner_id.is_none() {
+        return caps;
+    }
+    SpendCaps {
+        replies_per_hour: caps
+            .replies_per_hour
+            .or(PARTNER_DEFAULT_CAPS.replies_per_hour),
+        replies_per_day: caps
+            .replies_per_day
+            .or(PARTNER_DEFAULT_CAPS.replies_per_day),
+        partner_replies_per_day: caps
+            .partner_replies_per_day
+            .or(PARTNER_DEFAULT_CAPS.partner_replies_per_day),
+    }
+}
+
+fn partner_used(partners: &HashMap<String, (u64, u32)>, partner: &str, now: u64) -> u32 {
+    match partners.get(partner) {
+        Some(&(day, used)) if day == now / DAY => used,
+        _ => 0,
     }
 }
 
 impl Meter {
-    pub fn new() -> Self {
+    /// `reporting` is false when usage isn't sent anywhere; counts for caps are still kept.
+    pub fn new(reporting: bool) -> Self {
         Self {
             // Fresh on every boot, so batch ids from before a restart are never reused.
             instance_id: crate::random_token()[..16].to_owned(),
+            reporting,
             state: Mutex::default(),
         }
     }
 
-    /// True if this visitor may start another turn with this bot. A refusal marks the hour
-    /// as capped in the usage report.
+    fn pending<'a>(&self, st: &'a mut State, bot: &str, now: u64) -> Option<&'a mut Counts> {
+        self.reporting.then(|| {
+            st.pending
+                .entry((bot.to_owned(), now / HOUR * HOUR))
+                .or_default()
+        })
+    }
+
+    /// Checks the caps and, if this visitor may start another turn, counts it straight away
+    /// (as one model call), before the model is asked. Counting up front means a visitor who
+    /// disconnects mid-reply is still counted, and concurrent turns can't overshoot the caps.
     pub fn admit(&self, site: &Site, visitor: &str, now: u64) -> bool {
         if site.id.is_empty() {
             return true;
         }
+        let caps = effective_caps(site);
         let mut st = self.state.lock().unwrap();
-        let caps = site.caps;
+        let partner_ok = match (&site.partner_id, caps.partner_replies_per_day) {
+            (Some(p), Some(cap)) => partner_used(&st.partners, p, now) < cap,
+            _ => true,
+        };
         let window = st.bots.entry(site.id.clone()).or_default();
         window.roll(now);
-        let visitor_cap = caps.replies_per_day.map(|d| (d / PER_VISITOR_SHARE).max(1));
-        let visitor_used = window.visitors.get(visitor).copied().unwrap_or(0);
-        let mut ok = caps.replies_per_hour.is_none_or(|c| window.hour_count < c)
-            && caps.replies_per_day.is_none_or(|c| window.day_count < c)
-            && visitor_cap.is_none_or(|c| visitor_used < c);
-        if let (Some(partner), Some(cap)) = (&site.partner_id, caps.partner_replies_per_day) {
-            let (day, used) = st.partners.get(partner).copied().unwrap_or((now / DAY, 0));
-            ok &= day != now / DAY || used < cap;
+        let bot_ok = caps.replies_per_hour.is_none_or(|c| window.hour_count < c)
+            && caps.replies_per_day.is_none_or(|c| window.day_count < c);
+        let visitor_key = if window.visitors.len() < MAX_VISITORS_TRACKED
+            || window.visitors.contains_key(visitor)
+        {
+            visitor.to_owned()
+        } else {
+            String::from("~overflow")
+        };
+        let visitor_cap = caps
+            .replies_per_day
+            .map(|d| (d / PER_VISITOR_SHARE).max(MIN_PER_VISITOR));
+        let visitor_used = window.visitors.get(&visitor_key).copied().unwrap_or(0);
+        // The shared overflow bucket isn't limited, so it can't be used to lock out new visitors.
+        let visitor_ok = visitor_key == "~overflow" || visitor_cap.is_none_or(|c| visitor_used < c);
+        if !(bot_ok && partner_ok) {
+            if let Some(counts) = self.pending(&mut st, &site.id, now) {
+                counts.capped = true;
+            }
+            return false;
         }
-        if !ok {
-            st.pending
-                .entry((site.id.clone(), now / HOUR * HOUR))
-                .or_default()
-                .capped = true;
+        if !visitor_ok {
+            return false;
         }
-        ok
+        window.hour_count = window.hour_count.saturating_add(1);
+        window.day_count = window.day_count.saturating_add(1);
+        *window.visitors.entry(visitor_key).or_default() += 1;
+        if let Some(partner) = &site.partner_id {
+            let entry = st.partners.entry(partner.clone()).or_insert((now / DAY, 0));
+            if now / DAY > entry.0 {
+                *entry = (now / DAY, 0);
+            }
+            entry.1 = entry.1.saturating_add(1);
+        }
+        if let Some(counts) = self.pending(&mut st, &site.id, now) {
+            counts.model_calls += 1;
+        }
+        true
     }
 
     /// True if the bot (or its partner) is out of replies for now; per-visitor limits don't count.
@@ -183,91 +252,60 @@ impl Meter {
         if site.id.is_empty() {
             return false;
         }
+        let caps = effective_caps(site);
         let mut st = self.state.lock().unwrap();
-        let caps = site.caps;
-        let capped = {
-            let window = st.bots.entry(site.id.clone()).or_default();
-            window.roll(now);
-            caps.replies_per_hour
-                .is_some_and(|c| window.hour_count >= c)
-                || caps.replies_per_day.is_some_and(|c| window.day_count >= c)
-        };
         let partner_capped = match (&site.partner_id, caps.partner_replies_per_day) {
-            (Some(p), Some(cap)) => st
-                .partners
-                .get(p)
-                .is_some_and(|&(day, used)| day == now / DAY && used >= cap),
+            (Some(p), Some(cap)) => partner_used(&st.partners, p, now) >= cap,
             _ => false,
         };
-        capped || partner_capped
+        let window = st.bots.entry(site.id.clone()).or_default();
+        window.roll(now);
+        partner_capped
+            || caps
+                .replies_per_hour
+                .is_some_and(|c| window.hour_count >= c)
+            || caps.replies_per_day.is_some_and(|c| window.day_count >= c)
     }
 
-    /// Counts one turn that reached the model. `completed` turns are billable replies; failed
-    /// ones still cost a model call, so they count towards caps and are reported.
-    pub fn record(
-        &self,
-        site: &Site,
-        visitor: &str,
-        completed: bool,
-        chars_in: usize,
-        chars_out: usize,
-        now: u64,
-    ) {
+    /// Records how an admitted turn ended: a completed reply is billable; either way the
+    /// characters in and out are kept for reconciliation.
+    pub fn record(&self, site: &Site, completed: bool, chars_in: usize, chars_out: usize) {
         if site.id.is_empty() {
             return;
         }
         let mut st = self.state.lock().unwrap();
-        let window = st.bots.entry(site.id.clone()).or_default();
-        window.roll(now);
-        window.hour_count = window.hour_count.saturating_add(1);
-        window.day_count = window.day_count.saturating_add(1);
-        let key = if window.visitors.len() < MAX_VISITORS_TRACKED
-            || window.visitors.contains_key(visitor)
-        {
-            visitor.to_owned()
-        } else {
-            String::from("~overflow")
-        };
-        *window.visitors.entry(key).or_default() += 1;
-        if let Some(partner) = &site.partner_id {
-            let entry = st.partners.entry(partner.clone()).or_insert((now / DAY, 0));
-            if entry.0 != now / DAY {
-                *entry = (now / DAY, 0);
-            }
-            entry.1 = entry.1.saturating_add(1);
+        if let Some(counts) = self.pending(&mut st, &site.id, unix_now()) {
+            counts.replies += u64::from(completed);
+            counts.chars_in += chars_in as u64;
+            counts.chars_out += chars_out as u64;
         }
-        let counts = st
-            .pending
-            .entry((site.id.clone(), now / HOUR * HOUR))
-            .or_default();
-        counts.model_calls += 1;
-        counts.replies += u64::from(completed);
-        counts.chars_in += chars_in as u64;
-        counts.chars_out += chars_out as u64;
     }
 
-    /// Restores today's totals after a restart. Only raises counters, never lowers them.
+    /// Adds today's totals from the dashboard after a restart (before anything counted since
+    /// boot has been reported, so nothing is counted twice).
     pub fn seed(&self, seed: &Seed, now: u64) {
         let mut st = self.state.lock().unwrap();
         for (id, counts) in &seed.bots {
             let window = st.bots.entry(id.clone()).or_default();
             window.roll(now);
-            window.hour_count = window.hour_count.max(counts.hour);
-            window.day_count = window.day_count.max(counts.day);
+            window.hour_count = window.hour_count.saturating_add(counts.hour);
+            window.day_count = window.day_count.saturating_add(counts.day);
         }
         for (id, &used) in &seed.partners {
             let entry = st.partners.entry(id.clone()).or_insert((now / DAY, 0));
-            if entry.0 != now / DAY {
+            if now / DAY > entry.0 {
                 *entry = (now / DAY, 0);
             }
-            entry.1 = entry.1.max(used);
+            entry.1 = entry.1.saturating_add(used);
         }
     }
 
     /// The batch to send now: the one still in flight if its last send failed, otherwise a new
-    /// one holding everything counted so far.
+    /// one holding everything counted so far. Also forgets counters from earlier days.
     pub fn next_batch(&self, now: u64) -> Batch {
         let mut st = self.state.lock().unwrap();
+        st.bots.retain(|_, w| w.day >= now / DAY);
+        st.partners.retain(|_, (day, _)| *day >= now / DAY);
         if let Some(batch) = &st.inflight {
             return batch.clone();
         }
@@ -290,6 +328,12 @@ impl Meter {
         };
         st.inflight = Some(batch.clone());
         batch
+    }
+
+    /// True if there is anything to send (counts, or a batch waiting to be resent).
+    pub fn has_unsent(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        st.inflight.is_some() || !st.pending.is_empty()
     }
 
     pub fn finish_batch(&self, batch: &Batch, sent: Sent) {
@@ -322,7 +366,9 @@ pub async fn send(http: &reqwest::Client, url: &str, token: &str, batch: &Batch)
         .await;
     match res {
         Ok(r) if r.status().is_success() => Sent::Accepted,
-        Ok(r) if r.status().is_client_error() && r.status().as_u16() != 429 => Sent::Rejected,
+        // Only "this batch is invalid" is final; auth or routing errors (401, 403, 404) are
+        // configuration problems that a fix will clear, so the batch is kept and retried.
+        Ok(r) if matches!(r.status().as_u16(), 400 | 409 | 422) => Sent::Rejected,
         Ok(r) => {
             log_event(
                 "usage_flush_failed",
@@ -358,7 +404,6 @@ pub async fn fetch_seed(http: &reqwest::Client, url: &str, token: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sites::SpendCaps;
 
     const T0: u64 = 1_760_000_400; // some time on a UTC day, not on an hour boundary
 
@@ -377,48 +422,62 @@ mod tests {
         }
     }
 
+    fn turn(m: &Meter, s: &Site, visitor: &str, now: u64) -> bool {
+        let ok = m.admit(s, visitor, now);
+        if ok {
+            m.record(s, true, 1, 1);
+        }
+        ok
+    }
+
     #[test]
     fn counts_are_per_bot_and_hour_and_include_failed_model_calls() {
-        let m = Meter::new();
+        let m = Meter::new(true);
         let a = site("a", None, SpendCaps::default());
-        let b = site("b", None, SpendCaps::default());
-        m.record(&a, "1", true, 10, 20, T0);
-        m.record(&a, "1", false, 5, 0, T0 + 1);
-        m.record(&b, "2", true, 1, 2, T0 + HOUR);
-        let batch = m.next_batch(T0 + HOUR);
-        assert_eq!(batch.entries.len(), 2);
-        let ea = batch.entries.iter().find(|e| e.bot_id == "a").unwrap();
-        assert_eq!(
-            ea.counts,
-            Counts {
-                replies: 1,
-                model_calls: 2,
-                chars_in: 15,
-                chars_out: 20,
-                capped: false
-            }
+        assert!(m.admit(&a, "1", T0));
+        m.record(&a, true, 10, 20);
+        assert!(m.admit(&a, "1", T0));
+        m.record(&a, false, 5, 0);
+        assert!(
+            m.admit(&a, "1", T0),
+            "admitted but never finished (visitor left)"
         );
-        assert_eq!(ea.hour, hour_iso(T0 / HOUR * HOUR));
-        assert_eq!(batch.watermark_hour, hour_iso((T0 + HOUR) / HOUR * HOUR));
+        let batch = m.next_batch(unix_now());
+        let ea = batch
+            .entries
+            .iter()
+            .find(|e| e.bot_id == "a" && e.hour == hour_iso(T0 / HOUR * HOUR))
+            .unwrap();
+        assert_eq!(ea.counts.model_calls, 3);
+        let total: u64 = batch.entries.iter().map(|e| e.counts.replies).sum();
+        assert_eq!(total, 1);
     }
 
     #[test]
     fn the_single_site_bot_is_never_metered_or_capped() {
-        let m = Meter::new();
+        let m = Meter::new(true);
         let s = site("", None, caps(Some(0), Some(0), None));
-        assert!(m.admit(&s, "1", T0));
-        m.record(&s, "1", true, 1, 1, T0);
+        assert!(turn(&m, &s, "1", T0));
         assert!(m.next_batch(T0).entries.is_empty());
     }
 
     #[test]
+    fn without_reporting_nothing_piles_up_but_caps_still_work() {
+        let m = Meter::new(false);
+        let s = site("a", None, caps(Some(1), None, None));
+        assert!(turn(&m, &s, "1", T0));
+        assert!(!m.admit(&s, "2", T0));
+        assert!(!m.has_unsent());
+    }
+
+    #[test]
     fn a_failed_batch_is_resent_with_the_same_id_and_new_counts_wait_for_the_next() {
-        let m = Meter::new();
+        let m = Meter::new(true);
         let a = site("a", None, SpendCaps::default());
-        m.record(&a, "1", true, 1, 1, T0);
+        turn(&m, &a, "1", T0);
         let first = m.next_batch(T0);
         m.finish_batch(&first, Sent::Failed);
-        m.record(&a, "1", true, 1, 1, T0);
+        turn(&m, &a, "1", T0);
         let again = m.next_batch(T0);
         assert_eq!(
             again, first,
@@ -428,16 +487,20 @@ mod tests {
         let next = m.next_batch(T0);
         assert_ne!(next.batch_id, first.batch_id);
         assert_eq!(
-            next.entries[0].counts.replies, 1,
-            "the later reply is not lost"
+            next.entries
+                .iter()
+                .map(|e| e.counts.model_calls)
+                .sum::<u64>(),
+            1,
+            "the later turn is not lost"
         );
     }
 
     #[test]
     fn a_rejected_batch_is_dropped_not_retried_forever() {
-        let m = Meter::new();
+        let m = Meter::new(true);
         let a = site("a", None, SpendCaps::default());
-        m.record(&a, "1", true, 1, 1, T0);
+        turn(&m, &a, "1", T0);
         let b = m.next_batch(T0);
         m.finish_batch(&b, Sent::Rejected);
         assert_ne!(m.next_batch(T0).batch_id, b.batch_id);
@@ -446,23 +509,19 @@ mod tests {
     #[test]
     fn batch_ids_differ_between_boots() {
         assert_ne!(
-            Meter::new().next_batch(T0).batch_id,
-            Meter::new().next_batch(T0).batch_id
+            Meter::new(true).next_batch(T0).batch_id,
+            Meter::new(true).next_batch(T0).batch_id
         );
     }
 
     #[test]
     fn hourly_and_daily_caps_stop_turns_and_mark_the_hour() {
-        let m = Meter::new();
+        let m = Meter::new(true);
         let s = site("a", None, caps(Some(2), Some(3), None));
-        for v in ["v1", "v2"] {
-            assert!(m.admit(&s, v, T0));
-            m.record(&s, v, true, 1, 1, T0);
-        }
+        assert!(turn(&m, &s, "v1", T0) && turn(&m, &s, "v2", T0));
         assert!(!m.admit(&s, "v3", T0), "hourly cap");
         assert!(m.bot_capped(&s, T0));
-        assert!(m.admit(&s, "v3", T0 + HOUR), "new hour");
-        m.record(&s, "v3", true, 1, 1, T0 + HOUR);
+        assert!(turn(&m, &s, "v3", T0 + HOUR), "new hour");
         assert!(!m.admit(&s, "v4", T0 + HOUR), "daily cap");
         let capped: Vec<bool> = m
             .next_batch(T0 + HOUR)
@@ -475,28 +534,68 @@ mod tests {
     }
 
     #[test]
-    fn one_visitor_cannot_use_up_the_whole_day() {
-        let m = Meter::new();
-        let s = site("a", None, caps(None, Some(100), None));
-        let mut used = 0;
-        while m.admit(&s, "attacker", T0) {
-            m.record(&s, "attacker", true, 1, 1, T0);
-            used += 1;
-            assert!(used <= 100);
+    fn admitting_reserves_so_unfinished_turns_still_count_towards_caps() {
+        let m = Meter::new(true);
+        let s = site("a", None, caps(Some(5), None, None));
+        let admitted = (0..50)
+            .filter(|i| m.admit(&s, &format!("v{i}"), T0))
+            .count();
+        assert_eq!(
+            admitted, 5,
+            "never more than the cap, even with no turn finished"
+        );
+    }
+
+    #[test]
+    fn a_late_call_with_an_older_time_never_resets_the_current_hour() {
+        let m = Meter::new(true);
+        let s = site("a", None, caps(Some(5), None, None));
+        for i in 0..5 {
+            assert!(m.admit(&s, &format!("v{i}"), T0 + HOUR));
         }
-        assert_eq!(used, 10, "a tenth of the daily cap");
+        assert!(
+            !m.admit(&s, "late", T0),
+            "an older time doesn't roll the window back"
+        );
+        assert!(
+            !m.admit(&s, "next", T0 + HOUR),
+            "still capped in the current hour"
+        );
+    }
+
+    #[test]
+    fn one_visitor_cannot_use_up_the_whole_day() {
+        let m = Meter::new(true);
+        let s = site("a", None, caps(None, Some(1000), None));
+        let mut used = 0;
+        while turn(&m, &s, "attacker", T0) {
+            used += 1;
+            assert!(used <= 1000);
+        }
+        assert_eq!(used, 100, "a tenth of the daily cap");
         assert!(m.admit(&s, "real visitor", T0));
         assert!(!m.bot_capped(&s, T0), "the bot itself is still available");
+        let capped = m.next_batch(T0).entries.iter().any(|e| e.counts.capped);
+        assert!(
+            !capped,
+            "one visitor's limit doesn't mark the bot's hour as capped"
+        );
+    }
+
+    #[test]
+    fn small_daily_caps_still_allow_a_real_conversation() {
+        let m = Meter::new(true);
+        let s = site("a", None, caps(None, Some(20), None));
+        assert_eq!((0..20).filter(|_| turn(&m, &s, "v", T0)).count(), 10);
     }
 
     #[test]
     fn the_partner_ceiling_spans_all_its_bots_and_not_other_partners() {
-        let m = Meter::new();
+        let m = Meter::new(true);
         let a = site("ts-a", Some("ts"), caps(None, None, Some(2)));
         let b = site("ts-b", Some("ts"), caps(None, None, Some(2)));
         let other = site("zz-a", Some("zz"), caps(None, None, Some(2)));
-        m.record(&a, "1", true, 1, 1, T0);
-        m.record(&b, "2", true, 1, 1, T0);
+        assert!(turn(&m, &a, "1", T0) && turn(&m, &b, "2", T0));
         assert!(!m.admit(&a, "3", T0) && !m.admit(&b, "3", T0));
         assert!(m.bot_capped(&b, T0));
         assert!(m.admit(&other, "3", T0));
@@ -504,18 +603,46 @@ mod tests {
     }
 
     #[test]
+    fn partner_bots_without_caps_get_the_default_caps() {
+        let m = Meter::new(true);
+        let s = site("ts-a", Some("ts"), SpendCaps::default());
+        let admitted = (0..100)
+            .filter(|i| m.admit(&s, &format!("v{i}"), T0))
+            .count();
+        assert_eq!(admitted, 60);
+        let own = site("own", None, SpendCaps::default());
+        assert_eq!(
+            (0..100)
+                .filter(|i| m.admit(&own, &format!("v{i}"), T0))
+                .count(),
+            100
+        );
+    }
+
+    #[test]
     fn caps_survive_a_restart_through_the_seed() {
-        let m = Meter::new();
+        let m = Meter::new(true);
         let s = site("ts-a", Some("ts"), caps(Some(5), Some(10), Some(50)));
         let seed: Seed = serde_json::from_value(json!({
-            "bots": {"ts-a": {"hour": 5, "day": 7}}, "partners": {"ts": 3}
+            "bots": {"ts-a": {"hour": 4, "day": 7}}, "partners": {"ts": 3}
         }))
         .unwrap();
+        assert!(m.admit(&s, "before seed", T0));
         m.seed(&seed, T0);
         assert!(
             !m.admit(&s, "1", T0),
-            "hour already used up before the restart"
+            "4 before the restart + 1 since = the hourly cap"
         );
         assert!(m.admit(&s, "1", T0 + HOUR));
+    }
+
+    #[test]
+    fn counters_from_earlier_days_are_forgotten() {
+        let m = Meter::new(true);
+        let s = site("a", Some("p"), caps(Some(100), Some(100), Some(100)));
+        assert!(m.admit(&s, "v", T0));
+        m.next_batch(T0 + DAY);
+        assert!(m.state.lock().unwrap().bots.is_empty());
+        assert!(m.state.lock().unwrap().partners.is_empty());
     }
 }

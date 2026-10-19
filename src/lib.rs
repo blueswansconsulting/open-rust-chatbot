@@ -234,7 +234,12 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
         open_connections: AtomicUsize::new(0),
         model_health: Default::default(),
         resume_store: Default::default(),
-        meter: usage::Meter::new(),
+        meter: usage::Meter::new(
+            config
+                .sites
+                .as_ref()
+                .is_some_and(|s| s.usage_url.is_some() && s.usage_token.is_some()),
+        ),
         http,
         config,
     });
@@ -255,9 +260,19 @@ async fn report_usage(shared: Arc<Shared>) {
     else {
         return;
     };
-    match usage::fetch_seed(&shared.http, &url, &token).await {
-        Some(seed) => shared.meter.seed(&seed, usage::unix_now()),
-        None => log::log_event("usage_seed_failed", json!({})),
+    // Today's totals, so a restart doesn't reset caps. Read before the first report, so turns
+    // counted since boot aren't in the dashboard's totals yet and nothing is counted twice.
+    let mut seeded = false;
+    for attempt in 0..5u32 {
+        if let Some(seed) = usage::fetch_seed(&shared.http, &url, &token).await {
+            shared.meter.seed(&seed, usage::unix_now());
+            seeded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
+    }
+    if !seeded {
+        log::log_event("usage_seed_failed", json!({}));
     }
     let mut tick = tokio::time::interval(every);
     tick.tick().await;
@@ -281,7 +296,13 @@ pub async fn flush_usage_now(shared: &Shared) {
         .as_ref()
         .and_then(|s| Some((s.usage_url.clone()?, s.usage_token.clone()?)))
     {
-        flush_usage(shared, &url, &token).await;
+        // A batch waiting to be resent goes first; then whatever was counted after it.
+        for _ in 0..3 {
+            if !shared.meter.has_unsent() {
+                break;
+            }
+            flush_usage(shared, &url, &token).await;
+        }
     }
 }
 

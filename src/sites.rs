@@ -403,10 +403,12 @@ impl SiteStore {
                     Some(Entry::Found { site, .. }) => Some(site.clone()),
                     _ => None,
                 };
-                let site = match previous {
-                    Some(site) if !site.version_key.is_empty() && site.version_key == key => site,
-                    _ => Arc::new(self.build(id, *record)),
-                };
+                // Only the parsed knowledge base is reused; everything else (caps, origins, the
+                // partner) is rebuilt from the record, so it can't go stale under one version.
+                let kb = previous
+                    .filter(|site| !site.version_key.is_empty() && site.version_key == key)
+                    .map(|site| site.kb.clone());
+                let site = Arc::new(self.build(id, *record, kb));
                 (Some(site), Fetched::Missing)
             }
             other => (None, other),
@@ -567,7 +569,7 @@ impl SiteStore {
         }
     }
 
-    fn build(&self, id: &str, record: BotRecord) -> Site {
+    fn build(&self, id: &str, record: BotRecord, kb: Option<Arc<KnowledgeBase>>) -> Site {
         let version_key = record.version_key();
         let size = record.knowledge_base.len() * 3
             + record.instructions.as_deref().map_or(0, str::len)
@@ -596,7 +598,8 @@ impl SiteStore {
         Site {
             id: id.to_owned(),
             system_prompt: render_system_prompt(&template, &bot_name, lead_capture),
-            kb: Arc::new(KnowledgeBase::from_markdown(&record.knowledge_base)),
+            kb: kb
+                .unwrap_or_else(|| Arc::new(KnowledgeBase::from_markdown(&record.knowledge_base))),
             tool_definitions: tool_definitions(lead_capture),
             lead_capture,
             lead_webhook_url,

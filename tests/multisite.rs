@@ -36,6 +36,8 @@ struct FakeSites {
     usage: Mutex<Vec<(String, Value)>>,
     /// Answer usage batches with 503.
     usage_down: AtomicBool,
+    /// When non-zero, answer usage batches with this status instead.
+    usage_status: AtomicU64,
     /// What `GET /internal/usage/today` returns.
     seed: Mutex<Value>,
 }
@@ -108,7 +110,10 @@ async fn fake_usage(
         .unwrap_or_default()
         .to_owned();
     sites.usage.lock().unwrap().push((auth, body));
-    if sites.usage_down.load(Ordering::SeqCst) {
+    let forced = sites.usage_status.load(Ordering::SeqCst);
+    if forced != 0 {
+        StatusCode::from_u16(forced as u16).unwrap()
+    } else if sites.usage_down.load(Ordering::SeqCst) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
@@ -1032,4 +1037,111 @@ async fn wait_for_status(h: &Harness, bot: &str, want: u16) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("{bot} availability never became {want}");
+}
+
+#[tokio::test]
+async fn leaving_mid_reply_still_counts_towards_caps_and_usage() {
+    let h = start(&[
+        ("USAGE_TOKEN", USAGE_TOKEN),
+        ("USAGE_FLUSH_SECONDS", "1"),
+        ("MOCK_TOKEN_DELAY_MS", "300"),
+    ])
+    .await;
+    h.sites.set("ts-cap", capped_bot("ts-cap", 1));
+    let mut ws = connect(&h.addr, "ts-cap", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text("What are your hours?".into()))
+        .await
+        .unwrap();
+    // Wait for the reply to start, then leave.
+    let started = async {
+        while let Some(Ok(frame)) = ws.next().await {
+            if matches!(&frame, Message::Text(t) if t.contains("\"token\"")) {
+                return;
+            }
+        }
+        panic!("socket closed before the reply started");
+    };
+    tokio::time::timeout(Duration::from_secs(5), started)
+        .await
+        .expect("reply started");
+    drop(ws);
+    wait_for_status(&h, "ts-cap", 503).await;
+    let calls = || -> u64 {
+        h.sites
+            .usage
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, b)| b["entries"].as_array().cloned().unwrap_or_default())
+            .filter(|e| e["botId"] == "ts-cap")
+            .map(|e| e["modelCalls"].as_u64().unwrap())
+            .sum()
+    };
+    wait_for(|| calls() == 1).await;
+}
+
+#[tokio::test]
+async fn new_caps_apply_even_when_the_version_is_unchanged() {
+    let h = start(&[("SITES_CACHE_SECONDS", "1")]).await;
+    h.sites.set("ts-cap", capped_bot("ts-cap", 100));
+    assert!(ask(&h.addr, "ts-cap", ALPHA_ORIGIN, "What are your hours?")
+        .await
+        .contains("8am"));
+    h.sites.set("ts-cap", capped_bot("ts-cap", 1));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    status(format!("http://{}/b/ts-cap/config", h.addr)).await; // triggers the refresh
+    wait_for_status(&h, "ts-cap", 503).await;
+}
+
+#[tokio::test]
+async fn an_auth_error_keeps_the_batch_for_a_retry() {
+    let h = start(&[("USAGE_TOKEN", USAGE_TOKEN), ("USAGE_FLUSH_SECONDS", "1")]).await;
+    h.sites.usage_status.store(401, Ordering::SeqCst);
+    ask(
+        &h.addr,
+        "alpha",
+        ALPHA_ORIGIN,
+        "What are your opening hours?",
+    )
+    .await;
+    let ids = |h: &Harness| -> Vec<String> {
+        h.sites
+            .usage
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, b)| !b["entries"].as_array().unwrap().is_empty())
+            .map(|(_, b)| b["batchId"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    wait_for(|| ids(&h).len() >= 2).await;
+    h.sites.usage_status.store(0, Ordering::SeqCst);
+    let before = h.sites.usage.lock().unwrap().len();
+    wait_for(|| h.sites.usage.lock().unwrap().len() > before).await;
+    let all = ids(&h);
+    assert!(
+        all.iter().all(|i| i == &all[0]),
+        "the same batch until accepted: {all:?}"
+    );
+    assert_eq!(
+        reported(&h, "alpha"),
+        all.len() as u64,
+        "one reply, sent in every attempt"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_batch_is_dropped() {
+    let h = start(&[("USAGE_TOKEN", USAGE_TOKEN), ("USAGE_FLUSH_SECONDS", "1")]).await;
+    h.sites.usage_status.store(400, Ordering::SeqCst);
+    ask(
+        &h.addr,
+        "alpha",
+        ALPHA_ORIGIN,
+        "What are your opening hours?",
+    )
+    .await;
+    wait_for(|| reported(&h, "alpha") == 1).await;
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_eq!(reported(&h, "alpha"), 1, "not resent after a 400");
 }

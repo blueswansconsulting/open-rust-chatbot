@@ -193,7 +193,7 @@ started on, and edits (or pausing the bot) apply to open chats from their next m
 
 **Reply caps.** With `caps`, a bot answers at most `repliesPerHour` and `repliesPerDay` turns, and all
 bots with the same `partnerId` together at most `partnerRepliesPerDay` a day (UTC). One visitor can
-use at most a tenth of a bot's daily cap, so a single source can't use it all up. A capped bot
+use at most a tenth of a bot's daily cap (but at least 10 turns), so a single source can't use it all up. A capped bot
 answers with `{"type":"error","code":"budget_exceeded",…}` and its `/availability` is `503`, which
 hides the widget button. Origin checks only stop other websites embedding a bot; caps are what
 limit the cost of scripted abuse. Caps assume a single server process.
@@ -213,13 +213,17 @@ UTC hour and sent to `USAGE_API_URL` every `USAGE_FLUSH_SECONDS` (and on shutdow
 }
 ```
 
-`replies` are completed answers; `modelCalls` also counts turns that failed after reaching the
-model. Counts for hours before `watermarkHour` have all been sent. If a send fails (network, `5xx`,
-`429`) the same batch, with the same `batchId`, is sent again until it is accepted, so store batches
-idempotently by `batchId`. A `4xx` drops the batch. Reports contain ids and counts only, never chat
+`modelCalls` counts every turn that reached the model, counted when the turn starts (so a visitor
+who leaves mid-reply is still counted); `replies` are the ones that completed. Counts for hours before
+`watermarkHour` have all been sent. If a send fails for any reason other than `400`, `409` or `422`
+(network, `5xx`, `429`, or an auth or routing error such as `401` or `404`) the same batch, with the
+same `batchId`, is sent again until it is accepted, so store batches idempotently by `batchId`. A
+`400`, `409` or `422` means the batch is invalid and it is dropped. Reports contain ids and counts only, never chat
 text. On startup the server reads today's totals from `GET USAGE_API_URL/today`
 (`{"bots":{"<id>":{"hour":n,"day":n}},"partners":{"<partnerId>":n}}`) so a restart doesn't reset caps.
-Up to one flush interval of counts can be lost if the process is killed without a clean shutdown.
+On a clean shutdown pending counts are sent once more. Up to one flush interval of counts can be
+lost if the process is killed, or the dashboard is unreachable, at shutdown. Partner bots (with a
+`partnerId`) whose record has no `caps` get 60 replies an hour, 300 a day and a 20,000 partner ceiling.
 
 ## Configuration
 
