@@ -299,13 +299,20 @@ async fn availability(State(shared): State<Arc<Shared>>) -> Response {
 }
 
 /// Loads a bot for a `/b/<id>/...` request, or the 404/503 response to send instead.
-async fn load_site(shared: &Shared, id: &str) -> Result<Arc<Site>, Response> {
+async fn load_site(shared: &Shared, id: &str) -> Result<Arc<Site>, SiteResponse> {
     let store = shared
         .sites
         .as_ref()
         .expect("bot routes exist only in multi-site mode");
-    store.get(id).await.map_err(|e| {
-        let (status, error) = match e {
+    store.get(id).await.map_err(SiteResponse)
+}
+
+/// The 404/503 for a bot that can't be loaded (kept small so `Result`s stay cheap).
+struct SiteResponse(SiteError);
+
+impl IntoResponse for SiteResponse {
+    fn into_response(self) -> Response {
+        let (status, error) = match self.0 {
             SiteError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             SiteError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         };
@@ -318,27 +325,27 @@ async fn load_site(shared: &Shared, id: &str) -> Result<Arc<Site>, Response> {
             Json(json!({ "ok": false, "error": error })),
         )
             .into_response()
-    })
+    }
 }
 
 async fn bot_widget_js(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -> Response {
     match load_site(&shared, &id).await {
         Ok(_) => asset("text/javascript; charset=utf-8", WIDGET_JS),
-        Err(r) => r,
+        Err(r) => r.into_response(),
     }
 }
 
 async fn bot_widget_css(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -> Response {
     match load_site(&shared, &id).await {
         Ok(_) => asset("text/css; charset=utf-8", WIDGET_CSS),
-        Err(r) => r,
+        Err(r) => r.into_response(),
     }
 }
 
 async fn bot_availability(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -> Response {
     match load_site(&shared, &id).await {
         Ok(_) => availability(State(shared)).await,
-        Err(r) => r,
+        Err(r) => r.into_response(),
     }
 }
 
@@ -363,7 +370,7 @@ fn public_config(site: &Site) -> Response {
 async fn bot_config(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -> Response {
     match load_site(&shared, &id).await {
         Ok(site) => public_config(&site),
-        Err(r) => r,
+        Err(r) => r.into_response(),
     }
 }
 
@@ -528,7 +535,7 @@ async fn bot_ws_upgrade(
 ) -> Response {
     match load_site(&shared, &id).await {
         Ok(site) => upgrade(shared, site, peer, query, headers, ws).await,
-        Err(r) => r,
+        Err(r) => r.into_response(),
     }
 }
 
