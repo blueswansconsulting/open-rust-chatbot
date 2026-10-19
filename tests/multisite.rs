@@ -32,6 +32,14 @@ struct FakeSites {
     down: AtomicBool,
     /// Delay after reading the bot, to simulate a slow response carrying old settings.
     delay_ms: AtomicU64,
+    /// Usage batches received: (authorization header, body).
+    usage: Mutex<Vec<(String, Value)>>,
+    /// Answer usage batches with 503.
+    usage_down: AtomicBool,
+    /// When non-zero, answer usage batches with this status instead.
+    usage_status: AtomicU64,
+    /// What `GET /internal/usage/today` returns.
+    seed: Mutex<Value>,
 }
 
 impl FakeSites {
@@ -91,6 +99,31 @@ async fn fake_bot(
     }
 }
 
+async fn fake_usage(
+    State(sites): State<Arc<FakeSites>>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> StatusCode {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    sites.usage.lock().unwrap().push((auth, body));
+    let forced = sites.usage_status.load(Ordering::SeqCst);
+    if forced != 0 {
+        StatusCode::from_u16(forced as u16).unwrap()
+    } else if sites.usage_down.load(Ordering::SeqCst) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
+}
+
+async fn fake_seed(State(sites): State<Arc<FakeSites>>) -> axum::Json<Value> {
+    axum::Json(sites.seed.lock().unwrap().clone())
+}
+
 async fn spawn(router: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -111,6 +144,10 @@ struct Harness {
 }
 
 async fn start(extra: &[(&str, &str)]) -> Harness {
+    start_with_seed(json!({}), extra).await
+}
+
+async fn start_with_seed(seed: Value, extra: &[(&str, &str)]) -> Harness {
     let sites = Arc::new(FakeSites::default());
     sites.set(
         "alpha",
@@ -134,8 +171,11 @@ async fn start(extra: &[(&str, &str)]) -> Harness {
     paused["status"] = json!("paused");
     sites.set("paused", paused);
 
+    *sites.seed.lock().unwrap() = seed;
     let api = axum::Router::new()
         .route("/internal/bots/{id}", get(fake_bot))
+        .route("/internal/usage", post(fake_usage))
+        .route("/internal/usage/today", get(fake_seed))
         .with_state(sites.clone());
     let api_addr = spawn(api).await;
     let api_url = format!("http://{api_addr}/internal/bots");
@@ -560,6 +600,9 @@ async fn lead_webhook_url_carries_the_bot_id_as_site() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "x=1&site=beta-02");
     assert_eq!(calls[0].1["bot"], "Beta Bot");
+    // The bot id is inside the signed body too, so a captured request can't be replayed
+    // against another site by changing the query string.
+    assert_eq!(calls[0].1["siteId"], "beta-02");
 }
 
 #[tokio::test]
@@ -739,4 +782,366 @@ async fn parked_lead_cards_are_dropped_when_lead_capture_is_turned_off() {
     assert_eq!(session_frame(&mut ws).await["resumed"], json!(true));
     let extra = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
     assert!(extra.is_err(), "no lead card is shown again: {extra:?}");
+}
+
+fn partner_bot(id: &str) -> Value {
+    let mut b = bot(
+        id,
+        ALPHA_ORIGIN,
+        "# Hours\n\nPartner opens at 8am.",
+        "Partner",
+    );
+    b["partnerId"] = json!("tradesites");
+    b["version"] = json!(3);
+    b["caps"] = json!({"repliesPerHour": 60, "repliesPerDay": 300, "partnerRepliesPerDay": 20000});
+    b
+}
+
+#[tokio::test]
+async fn partner_details_never_reach_the_public_config() {
+    let h = start(&[]).await;
+    h.sites.set("ts-abc", partner_bot("ts-abc"));
+    let v: Value = reqwest::get(format!("http://{}/b/ts-abc/config", h.addr))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["greeting", "placeholder", "privacyUrl", "subtitle", "title"]
+    );
+    assert!(!v.to_string().contains("tradesites"));
+}
+
+#[tokio::test]
+async fn partner_bots_are_served_stale_for_less_time() {
+    let h = start(&[
+        ("SITES_CACHE_SECONDS", "1"),
+        ("SITES_STALE_SECONDS", "600"),
+        ("SITES_PARTNER_STALE_SECONDS", "2"),
+    ])
+    .await;
+    h.sites.set("ts-abc", partner_bot("ts-abc"));
+    for id in ["alpha", "ts-abc"] {
+        assert_eq!(
+            status(format!("http://{}/b/{id}/config", h.addr)).await,
+            200
+        );
+    }
+    h.sites.down.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    assert_eq!(
+        status(format!("http://{}/b/alpha/config", h.addr)).await,
+        200,
+        "a normal bot is still served stale"
+    );
+    assert_eq!(
+        status(format!("http://{}/b/ts-abc/config", h.addr)).await,
+        503,
+        "a partner bot is not"
+    );
+}
+
+#[tokio::test]
+async fn a_new_version_is_reparsed_even_with_the_same_updated_at() {
+    // No invalidation: the cached copy expires and is refetched with the same updatedAt.
+    let h = start(&[("SITES_CACHE_SECONDS", "1")]).await;
+    h.sites.set("ts-abc", partner_bot("ts-abc"));
+    let a = ask(&h.addr, "ts-abc", ALPHA_ORIGIN, "What are your hours?").await;
+    assert!(a.contains("8am"), "{a}");
+    let mut changed = partner_bot("ts-abc");
+    changed["knowledgeBase"] = json!("# Hours\n\nPartner opens at 9am.");
+    changed["version"] = json!(4);
+    h.sites.set("ts-abc", changed);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // The first request after expiry is served the old copy while it refreshes.
+    status(format!("http://{}/b/ts-abc/config", h.addr)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let a = ask(&h.addr, "ts-abc", ALPHA_ORIGIN, "What are your hours?").await;
+    assert!(a.contains("9am"), "{a}");
+}
+
+const USAGE_TOKEN: &str = "usage-token-0123456789abcdef0123456789ab"; // gitleaks:allow (test fixture)
+
+/// Replies reported for a bot across all batches the fake dashboard accepted.
+fn reported(h: &Harness, bot: &str) -> u64 {
+    h.sites
+        .usage
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(_, b)| b["entries"].as_array().cloned().unwrap_or_default())
+        .filter(|e| e["botId"] == bot)
+        .map(|e| e["replies"].as_u64().unwrap())
+        .sum()
+}
+
+async fn wait_for(mut check: impl FnMut() -> bool) {
+    for _ in 0..60 {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("condition not met within 6s");
+}
+
+#[tokio::test]
+async fn usage_is_reported_per_bot_with_the_usage_token() {
+    let h = start(&[("USAGE_TOKEN", USAGE_TOKEN), ("USAGE_FLUSH_SECONDS", "1")]).await;
+    ask(
+        &h.addr,
+        "alpha",
+        ALPHA_ORIGIN,
+        "What are your opening hours?",
+    )
+    .await;
+    ask(&h.addr, "alpha", ALPHA_ORIGIN, "And on Sundays?").await;
+    ask(
+        &h.addr,
+        "beta-02",
+        BETA_ORIGIN,
+        "What are your opening hours?",
+    )
+    .await;
+    wait_for(|| reported(&h, "alpha") == 2 && reported(&h, "beta-02") == 1).await;
+    let posts = h.sites.usage.lock().unwrap().clone();
+    assert!(posts
+        .iter()
+        .all(|(auth, _)| auth == &format!("Bearer {USAGE_TOKEN}")));
+    let body = &posts
+        .iter()
+        .find(|(_, b)| !b["entries"].as_array().unwrap().is_empty())
+        .unwrap()
+        .1;
+    assert!(body["batchId"].as_str().unwrap().contains(':'));
+    assert!(body["watermarkHour"].as_str().unwrap().ends_with(":00:00Z"));
+    let entry = &body["entries"][0];
+    assert!(entry["modelCalls"].as_u64().unwrap() >= 1 && entry["charsIn"].as_u64().unwrap() > 0);
+    // Only counts and ids: no visitor text reaches the usage report.
+    assert!(!body.to_string().contains("opening hours"));
+}
+
+#[tokio::test]
+async fn a_failed_usage_report_is_retried_with_the_same_batch_id() {
+    let h = start(&[("USAGE_TOKEN", USAGE_TOKEN), ("USAGE_FLUSH_SECONDS", "1")]).await;
+    h.sites.usage_down.store(true, Ordering::SeqCst);
+    ask(
+        &h.addr,
+        "alpha",
+        ALPHA_ORIGIN,
+        "What are your opening hours?",
+    )
+    .await;
+    let with_entries = |h: &Harness| -> Vec<String> {
+        h.sites
+            .usage
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, b)| !b["entries"].as_array().unwrap().is_empty())
+            .map(|(_, b)| b["batchId"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    wait_for(|| with_entries(&h).len() >= 2).await;
+    let ids = with_entries(&h);
+    assert_eq!(ids[0], ids[1], "the same batch is resent");
+    h.sites.usage_down.store(false, Ordering::SeqCst);
+    let sent_before = h.sites.usage.lock().unwrap().len();
+    wait_for(|| h.sites.usage.lock().unwrap().len() > sent_before + 1).await;
+    let ids = with_entries(&h);
+    assert!(ids.iter().all(|i| i == &ids[0]), "counted once: {ids:?}");
+}
+
+#[tokio::test]
+async fn usage_reporting_is_off_without_a_usage_token() {
+    let h = start(&[("USAGE_FLUSH_SECONDS", "1")]).await;
+    ask(
+        &h.addr,
+        "alpha",
+        ALPHA_ORIGIN,
+        "What are your opening hours?",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(h.sites.usage.lock().unwrap().is_empty());
+}
+
+fn capped_bot(id: &str, per_hour: u32) -> Value {
+    let mut b = partner_bot(id);
+    b["caps"] =
+        json!({"repliesPerHour": per_hour, "repliesPerDay": 1000, "partnerRepliesPerDay": 20000});
+    b
+}
+
+#[tokio::test]
+async fn a_bot_over_its_cap_stops_answering_and_reports_busy() {
+    let h = start(&[]).await;
+    h.sites.set("ts-cap", capped_bot("ts-cap", 2));
+    for q in ["What are your hours?", "Hours again?"] {
+        assert!(ask(&h.addr, "ts-cap", ALPHA_ORIGIN, q)
+            .await
+            .contains("8am"));
+    }
+    let mut ws = connect(&h.addr, "ts-cap", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text("What are your hours?".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut ws).await;
+    let last = frames.last().unwrap();
+    assert_eq!(last["type"], "error");
+    assert_eq!(last["code"], "budget_exceeded");
+    assert_eq!(
+        status(format!("http://{}/b/ts-cap/availability", h.addr)).await,
+        503
+    );
+    // Other bots are unaffected.
+    assert_eq!(
+        status(format!("http://{}/b/alpha/availability", h.addr)).await,
+        200
+    );
+}
+
+#[tokio::test]
+async fn caps_are_not_reset_when_the_bot_leaves_the_cache() {
+    let h = start(&[("SITES_CACHE_SECONDS", "300")]).await;
+    h.sites.set("ts-cap", capped_bot("ts-cap", 1));
+    ask(&h.addr, "ts-cap", ALPHA_ORIGIN, "What are your hours?").await;
+    assert_eq!(invalidate(&h.addr, "ts-cap", TOKEN).await, 204);
+    assert_eq!(
+        status(format!("http://{}/b/ts-cap/availability", h.addr)).await,
+        503,
+        "still capped after the cached copy was dropped"
+    );
+}
+
+#[tokio::test]
+async fn todays_usage_is_restored_on_startup() {
+    let h = start_with_seed(
+        json!({"bots": {"ts-cap": {"hour": 1, "day": 1}}}),
+        &[("USAGE_TOKEN", USAGE_TOKEN), ("USAGE_FLUSH_SECONDS", "60")],
+    )
+    .await;
+    h.sites.set("ts-cap", capped_bot("ts-cap", 1));
+    wait_for_status(&h, "ts-cap", 503).await;
+}
+
+async fn wait_for_status(h: &Harness, bot: &str, want: u16) {
+    for _ in 0..30 {
+        if status(format!("http://{}/b/{bot}/availability", h.addr)).await == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{bot} availability never became {want}");
+}
+
+#[tokio::test]
+async fn leaving_mid_reply_still_counts_towards_caps_and_usage() {
+    let h = start(&[
+        ("USAGE_TOKEN", USAGE_TOKEN),
+        ("USAGE_FLUSH_SECONDS", "1"),
+        ("MOCK_TOKEN_DELAY_MS", "300"),
+    ])
+    .await;
+    h.sites.set("ts-cap", capped_bot("ts-cap", 1));
+    let mut ws = connect(&h.addr, "ts-cap", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text("What are your hours?".into()))
+        .await
+        .unwrap();
+    // Wait for the reply to start, then leave.
+    let started = async {
+        while let Some(Ok(frame)) = ws.next().await {
+            if matches!(&frame, Message::Text(t) if t.contains("\"token\"")) {
+                return;
+            }
+        }
+        panic!("socket closed before the reply started");
+    };
+    tokio::time::timeout(Duration::from_secs(5), started)
+        .await
+        .expect("reply started");
+    drop(ws);
+    wait_for_status(&h, "ts-cap", 503).await;
+    let calls = || -> u64 {
+        h.sites
+            .usage
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, b)| b["entries"].as_array().cloned().unwrap_or_default())
+            .filter(|e| e["botId"] == "ts-cap")
+            .map(|e| e["modelCalls"].as_u64().unwrap())
+            .sum()
+    };
+    wait_for(|| calls() == 1).await;
+}
+
+#[tokio::test]
+async fn new_caps_apply_even_when_the_version_is_unchanged() {
+    let h = start(&[("SITES_CACHE_SECONDS", "1")]).await;
+    h.sites.set("ts-cap", capped_bot("ts-cap", 100));
+    assert!(ask(&h.addr, "ts-cap", ALPHA_ORIGIN, "What are your hours?")
+        .await
+        .contains("8am"));
+    h.sites.set("ts-cap", capped_bot("ts-cap", 1));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    status(format!("http://{}/b/ts-cap/config", h.addr)).await; // triggers the refresh
+    wait_for_status(&h, "ts-cap", 503).await;
+}
+
+#[tokio::test]
+async fn an_auth_error_keeps_the_batch_for_a_retry() {
+    let h = start(&[("USAGE_TOKEN", USAGE_TOKEN), ("USAGE_FLUSH_SECONDS", "1")]).await;
+    h.sites.usage_status.store(401, Ordering::SeqCst);
+    ask(
+        &h.addr,
+        "alpha",
+        ALPHA_ORIGIN,
+        "What are your opening hours?",
+    )
+    .await;
+    let ids = |h: &Harness| -> Vec<String> {
+        h.sites
+            .usage
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, b)| !b["entries"].as_array().unwrap().is_empty())
+            .map(|(_, b)| b["batchId"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    wait_for(|| ids(&h).len() >= 2).await;
+    h.sites.usage_status.store(0, Ordering::SeqCst);
+    let before = h.sites.usage.lock().unwrap().len();
+    wait_for(|| h.sites.usage.lock().unwrap().len() > before).await;
+    let all = ids(&h);
+    assert!(
+        all.iter().all(|i| i == &all[0]),
+        "the same batch until accepted: {all:?}"
+    );
+    assert_eq!(
+        reported(&h, "alpha"),
+        all.len() as u64,
+        "one reply, sent in every attempt"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_batch_is_dropped() {
+    let h = start(&[("USAGE_TOKEN", USAGE_TOKEN), ("USAGE_FLUSH_SECONDS", "1")]).await;
+    h.sites.usage_status.store(400, Ordering::SeqCst);
+    ask(
+        &h.addr,
+        "alpha",
+        ALPHA_ORIGIN,
+        "What are your opening hours?",
+    )
+    .await;
+    wait_for(|| reported(&h, "alpha") == 1).await;
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_eq!(reported(&h, "alpha"), 1, "not resent after a 400");
 }

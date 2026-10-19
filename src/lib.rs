@@ -9,6 +9,7 @@ pub mod log;
 pub mod rate_limit;
 pub mod sites;
 pub mod tools;
+pub mod usage;
 pub mod webhook;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -65,6 +66,8 @@ pub struct Shared {
     open_connections: AtomicUsize,
     model_health: std::sync::Mutex<ModelHealth>,
     resume_store: std::sync::Mutex<ResumeStore>,
+    /// Multi-site mode: reply counts for billing, and spend caps.
+    pub meter: usage::Meter,
 }
 
 /// A conversation parked between page loads so the next page can resume it. The system
@@ -219,7 +222,7 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
         .sites
         .clone()
         .map(|settings| Arc::new(SiteStore::new(&config, settings, http.clone())));
-    Ok(Arc::new(Shared {
+    let shared = Arc::new(Shared {
         rate_limiter: RateLimiter::new(
             limits.max_messages_per_window,
             limits.rate_window.as_millis() as u64,
@@ -231,9 +234,76 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
         open_connections: AtomicUsize::new(0),
         model_health: Default::default(),
         resume_store: Default::default(),
+        meter: usage::Meter::new(
+            config
+                .sites
+                .as_ref()
+                .is_some_and(|s| s.usage_url.is_some() && s.usage_token.is_some()),
+        ),
         http,
         config,
-    }))
+    });
+    // Reporting needs a runtime; outside one (some unit tests) counts simply stay local.
+    if shared.sites.is_some() && tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(report_usage(shared.clone()));
+    }
+    Ok(shared)
+}
+
+/// Restores today's counts, then sends usage to the dashboard every `USAGE_FLUSH_SECONDS`.
+async fn report_usage(shared: Arc<Shared>) {
+    let Some((url, token, every)) = shared
+        .config
+        .sites
+        .as_ref()
+        .and_then(|s| Some((s.usage_url.clone()?, s.usage_token.clone()?, s.usage_flush)))
+    else {
+        return;
+    };
+    // Today's totals, so a restart doesn't reset caps. Read before the first report, so turns
+    // counted since boot aren't in the dashboard's totals yet and nothing is counted twice.
+    let mut seeded = false;
+    for attempt in 0..5u32 {
+        if let Some(seed) = usage::fetch_seed(&shared.http, &url, &token).await {
+            shared.meter.seed(&seed, usage::unix_now());
+            seeded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
+    }
+    if !seeded {
+        log::log_event("usage_seed_failed", json!({}));
+    }
+    let mut tick = tokio::time::interval(every);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        flush_usage(&shared, &url, &token).await;
+    }
+}
+
+pub async fn flush_usage(shared: &Shared, url: &str, token: &str) {
+    let batch = shared.meter.next_batch(usage::unix_now());
+    let sent = usage::send(&shared.http, url, token, &batch).await;
+    shared.meter.finish_batch(&batch, sent);
+}
+
+/// Sends whatever usage is still pending (called on shutdown).
+pub async fn flush_usage_now(shared: &Shared) {
+    if let Some((url, token)) = shared
+        .config
+        .sites
+        .as_ref()
+        .and_then(|s| Some((s.usage_url.clone()?, s.usage_token.clone()?)))
+    {
+        // A batch waiting to be resent goes first; then whatever was counted after it.
+        for _ in 0..3 {
+            if !shared.meter.has_unsent() {
+                break;
+            }
+            flush_usage(shared, &url, &token).await;
+        }
+    }
 }
 
 pub fn app(state: Arc<Shared>) -> Router {
@@ -344,6 +414,16 @@ async fn bot_widget_css(State(shared): State<Arc<Shared>>, Path(id): Path<String
 
 async fn bot_availability(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -> Response {
     match load_site(&shared, &id).await {
+        // Out of replies for now: the widget hides its button until the next check.
+        Ok(site) if shared.meter.bot_capped(&site, usage::unix_now()) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            Json(json!({ "ok": false })),
+        )
+            .into_response(),
         Ok(_) => availability(State(shared)).await,
         Err(r) => r.into_response(),
     }

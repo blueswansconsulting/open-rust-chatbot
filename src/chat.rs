@@ -284,8 +284,27 @@ impl ChatSession {
             );
             return;
         }
+        let now = crate::usage::unix_now();
+        if !self.shared.meter.admit(&self.site, &self.client, now) {
+            log_event(
+                "turn_capped",
+                json!({ "session": self.session_id, "bot": self.site.id }),
+            );
+            send(
+                tx,
+                json!({ "type": "error", "code": "budget_exceeded", "message": "Sorry, this chat is busy right now. Please try again later or contact the business directly." }),
+            );
+            return;
+        }
         self.turns += 1;
         let result = self.run_turn(text, tx).await;
+        let reply_chars = match (&result, self.history.last()) {
+            (Ok(()), Some(m)) if m.role == Role::Assistant => m.content.len(),
+            _ => 0,
+        };
+        self.shared
+            .meter
+            .record(&self.site, result.is_ok(), text.len(), reply_chars);
         match &result {
             Ok(()) => self.shared.record_model_result(true, &self.client),
             // Only outages count, so a visitor can't hide the bot by sending rejected input.
@@ -494,7 +513,7 @@ impl ChatSession {
             &self.shared.config.lead_webhook_secret,
         ) {
             (Some(url), Some(secret)) => {
-                let body = crate::webhook::payload(&lead, &self.site.bot_name);
+                let body = crate::webhook::payload(&lead, &self.site.bot_name, &self.site.id);
                 crate::webhook::deliver(&self.shared.http, url, secret, body).await
             }
             // No webhook configured: record that a lead arrived (PII redacted) so local demos work.
