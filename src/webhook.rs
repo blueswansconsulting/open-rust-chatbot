@@ -8,7 +8,7 @@
 //! older than a few minutes to stop replays.
 
 use crate::tools::Lead;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::json;
 use sha2::Sha256;
 use std::time::Duration;
