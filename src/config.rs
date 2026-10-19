@@ -69,6 +69,8 @@ pub struct Limits {
     pub max_session: Duration,
     /// After this many model failures in a row, /health reports the chat as down for this long.
     pub model_failure_cooldown: Duration,
+    /// How long a parked conversation can be resumed on another page.
+    pub resume_ttl: Duration,
 }
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are {bot_name}, a helpful assistant on this business's website. \
@@ -261,6 +263,7 @@ impl Config {
                 .max(1),
             idle_timeout: Duration::from_secs(env.num("IDLE_TIMEOUT_SECONDS", 600, &mut errors)),
             max_session: Duration::from_secs(env.num("MAX_SESSION_SECONDS", 3600, &mut errors)),
+            resume_ttl: Duration::from_secs(env.num("RESUME_TTL_SECONDS", 1800, &mut errors)),
             model_failure_cooldown: Duration::from_secs(env.num(
                 "MODEL_FAILURE_COOLDOWN_SECONDS",
                 60,

@@ -60,20 +60,33 @@ pub struct Shared {
     rate_limiter: RateLimiter,
     open_connections: AtomicUsize,
     model_health: std::sync::Mutex<ModelHealth>,
-    resume_store: std::sync::Mutex<HashMap<String, StoredSession>>,
+    resume_store: std::sync::Mutex<ResumeStore>,
 }
 
-/// A conversation parked between page loads so the next page can resume it.
+/// A conversation parked between page loads so the next page can resume it. The system
+/// prompt is not stored (the current one is used on resume).
+#[derive(Clone, Default)]
+pub struct ParkedChat {
+    pub history: Vec<llm::Message>,
+    pub turns: usize,
+    pub leads: Vec<tools::Lead>,
+}
+
 struct StoredSession {
-    history: Vec<llm::Message>,
-    turns: usize,
+    chat: ParkedChat,
     saved: std::time::Instant,
 }
 
-const RESUME_TTL: Duration = Duration::from_secs(30 * 60);
-const MAX_STORED_SESSIONS: usize = 10_000;
+#[derive(Default)]
+struct ResumeStore {
+    sessions: HashMap<String, StoredSession>,
+    last_sweep: Option<std::time::Instant>,
+}
 
-/// 256 random bits from the OS RNG (two v4 UUIDs) as 64 hex characters.
+const MAX_STORED_SESSIONS: usize = 10_000;
+const RESUME_SWEEP_EVERY: Duration = Duration::from_secs(30);
+
+/// Random token from the OS RNG: two v4 UUIDs, 244 random bits, as 64 hex characters.
 pub fn random_token() -> String {
     format!(
         "{}{}",
@@ -83,34 +96,46 @@ pub fn random_token() -> String {
 }
 
 impl Shared {
-    pub fn save_session(&self, token: &str, history: &[llm::Message], turns: usize) {
+    pub fn save_session(&self, token: &str, chat: ParkedChat) {
+        let ttl = self.config.limits.resume_ttl;
         let mut store = self.resume_store.lock().unwrap();
-        if store.len() >= MAX_STORED_SESSIONS && !store.contains_key(token) {
-            store.retain(|_, s| s.saved.elapsed() < RESUME_TTL);
-            if store.len() >= MAX_STORED_SESSIONS {
-                if let Some(oldest) = store
-                    .iter()
-                    .min_by_key(|(_, s)| s.saved)
-                    .map(|(k, _)| k.clone())
-                {
-                    store.remove(&oldest);
-                }
+        // Expired chats (which can contain contact details) are dropped promptly, not only
+        // when the store fills up.
+        if store
+            .last_sweep
+            .is_none_or(|t| t.elapsed() >= RESUME_SWEEP_EVERY.min(ttl))
+        {
+            store.last_sweep = Some(std::time::Instant::now());
+            store.sessions.retain(|_, s| s.saved.elapsed() < ttl);
+        }
+        if store.sessions.len() >= MAX_STORED_SESSIONS && !store.sessions.contains_key(token) {
+            if let Some(oldest) = store
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| s.saved)
+                .map(|(k, _)| k.clone())
+            {
+                store.sessions.remove(&oldest);
             }
         }
-        store.insert(
+        store.sessions.insert(
             token.to_owned(),
             StoredSession {
-                history: history.to_vec(),
-                turns,
+                chat,
                 saved: std::time::Instant::now(),
             },
         );
     }
 
     /// Single use: a token can resume one conversation once.
-    pub fn take_session(&self, token: &str) -> Option<(Vec<llm::Message>, usize)> {
-        let stored = self.resume_store.lock().unwrap().remove(token)?;
-        (stored.saved.elapsed() < RESUME_TTL).then_some((stored.history, stored.turns))
+    pub fn take_session(&self, token: &str) -> Option<ParkedChat> {
+        let stored = self.resume_store.lock().unwrap().sessions.remove(token)?;
+        (stored.saved.elapsed() < self.config.limits.resume_ttl).then_some(stored.chat)
+    }
+
+    /// Number of parked conversations (for tests and monitoring).
+    pub fn parked_sessions(&self) -> usize {
+        self.resume_store.lock().unwrap().sessions.len()
     }
 }
 

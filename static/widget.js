@@ -340,6 +340,17 @@
         scroll();
       } else if (frame.type === 'session') {
         if (typeof frame.token === 'string') store.set('token', frame.token);
+        // The server couldn't continue the earlier chat (expired or restarted), so don't show
+        // a conversation the assistant no longer remembers.
+        if (frame.resumed === false && restoredFromStorage) {
+          restoredFromStorage = false;
+          messages.textContent = '';
+          store.set('transcript', null);
+          append('notice', 'Your earlier chat has ended, so this is a new conversation.');
+          append('assistant', TEXT.greeting);
+          saveTranscript();
+        }
+        restoredFromStorage = false;
       } else if (frame.type === 'done') {
         if (current) {
           linkify(current);
@@ -389,8 +400,9 @@
     var MSG_BACK = "You're reconnected. Please send your message again.";
     var MSG_BACK_IDLE = "You're reconnected. Carry on whenever you're ready.";
 
+    // System notices (connection status) are styled apart and never saved in the transcript.
     function say(role, text) {
-      append(role, text);
+      append(role === 'assistant' ? 'notice' : role, text);
       announce(text);
     }
 
@@ -551,8 +563,8 @@
             opened = true;
             onConnected();
             // First message: continue this tab's conversation (single-use token) or start one.
+            // The stored token is replaced when the server answers with a new one.
             socket.send(JSON.stringify({ type: 'resume', token: store.get('token') }));
-            store.set('token', null);
             while (queue.length) socket.send(queue.shift());
           });
           socket.addEventListener('message', onFrame);
@@ -596,7 +608,7 @@
       connect();
     }
 
-    function open() {
+    function open(opts) {
       panel.dataset.open = 'true';
       store.set('open', '1');
       bubble.setAttribute('aria-expanded', 'true');
@@ -606,7 +618,7 @@
         append('assistant', TEXT.greeting);
       }
       connect();
-      input.focus();
+      if (!opts || opts.focus !== false) input.focus();
     }
 
     function close() {
@@ -657,14 +669,17 @@
     });
 
     // Continuing from a previous page: show the conversation and reopen if it was open.
-    if (restoreTranscript()) greeted = true;
+    var restoredFromStorage = restoreTranscript();
+    if (restoredFromStorage) greeted = true;
     // Leaving mid-reply keeps what has arrived so far.
     window.addEventListener('pagehide', saveTranscript);
     var reopen = store.get('open') === '1';
 
     checkHealth().then(function (ok) {
       setAvailable(ok);
-      if (ok && reopen) open();
+      // Reopen quietly on larger screens only: on phones the panel would cover the page the
+      // visitor just went to, so they get the button back instead.
+      if (ok && reopen && !window.matchMedia('(max-width: 480px)').matches) open({ focus: false });
       watchHealth();
     });
     inputRow.addEventListener('submit', function (e) {

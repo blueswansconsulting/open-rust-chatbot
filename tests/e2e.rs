@@ -712,3 +712,85 @@ async fn resume_is_only_accepted_as_the_first_message() {
         "ignored mid-conversation: {frames:?}"
     );
 }
+
+#[tokio::test]
+async fn a_pending_lead_survives_a_page_change_and_can_still_be_confirmed() {
+    let addr = serve(&[]).await; // mock model, DEV_MODE: lead capture on
+    let mut page1 = connect(&addr, ORIGIN).await.unwrap();
+    page1.send(resume_frame(None)).await.unwrap();
+    let token = next_frame(&mut page1).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    page1
+        .send(Message::Text("Call me on sam@example.com".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut page1).await;
+    let lead_id = frames.iter().find(|f| f["type"] == "card").unwrap()["card"]["lead"]["leadId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    page1.close(None).await.unwrap();
+
+    let mut page2 = connect(&addr, ORIGIN).await.unwrap();
+    page2.send(resume_frame(Some(&token))).await.unwrap();
+    assert_eq!(next_frame(&mut page2).await["resumed"], json!(true));
+    let card = next_frame(&mut page2).await;
+    assert_eq!(
+        card["card"]["lead"]["leadId"],
+        json!(lead_id),
+        "pending card shown again"
+    );
+    page2
+        .send(Message::Text(
+            json!({"type": "confirm_lead", "leadId": lead_id})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let confirmed = until_done(&mut page2).await;
+    assert_eq!(confirmed[0]["card"]["type"], "lead_submitted");
+}
+
+#[tokio::test]
+async fn expired_conversations_are_swept_from_memory() {
+    let addr = serve(&[("RESUME_TTL_SECONDS", "1")]).await;
+    let mut page1 = connect(&addr, ORIGIN).await.unwrap();
+    page1.send(resume_frame(None)).await.unwrap();
+    let token = next_frame(&mut page1).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    page1.close(None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let mut page2 = connect(&addr, ORIGIN).await.unwrap();
+    page2.send(resume_frame(Some(&token))).await.unwrap();
+    assert_eq!(
+        next_frame(&mut page2).await["resumed"],
+        json!(false),
+        "expired after the TTL"
+    );
+}
+
+#[test]
+fn parked_store_sweeps_expired_entries_on_save() {
+    let config = Config::from_pairs(&[
+        ("DEV_MODE", "true"),
+        ("MOCK_LLM", "true"),
+        ("RESUME_TTL_SECONDS", "1"),
+    ])
+    .unwrap();
+    let shared = build_state(config).unwrap();
+    shared.save_session("abandoned", Default::default());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // Any later save sweeps expired chats, even ones nobody ever comes back for.
+    shared.save_session("active", Default::default());
+    assert_eq!(
+        shared.parked_sessions(),
+        1,
+        "the abandoned chat was removed from memory"
+    );
+    assert!(shared.take_session("active").is_some());
+}
