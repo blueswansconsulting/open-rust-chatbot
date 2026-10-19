@@ -71,3 +71,26 @@ func verify(rawBody []byte, timestamp, signature, secret string) bool {
 	return hmac.Equal([]byte(expected), []byte(signature))
 }
 ```
+
+### Elixir (Phoenix / Plug)
+
+Keep the raw body with a `Plug.Parsers` `:body_reader` (or read it in a plug mounted before the
+parsers), then:
+
+```elixir
+def verify(raw_body, timestamp, signature, secret) do
+  with {ts, ""} <- Integer.parse(timestamp || ""),
+       true <- abs(System.system_time(:second) - ts) <= 300 do
+    mac = :crypto.mac(:hmac, :sha256, secret, timestamp <> "." <> raw_body)
+    Plug.Crypto.secure_compare("sha256=" <> Base.encode16(mac, case: :lower), signature || "")
+  else
+    _ -> false
+  end
+end
+```
+
+## Multi-site mode
+
+Leads from a bot served under `/b/<id>/` go to `LEAD_WEBHOOK_URL` with `?site=<id>`, and the signed body
+also carries `"siteId": "<id>"`. The query string is not covered by the signature, so check that
+`siteId` matches `site` and reject the lead if it doesn't.
