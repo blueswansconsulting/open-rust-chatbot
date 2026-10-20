@@ -98,7 +98,7 @@ pub fn execute(kb: &KnowledgeBase, call: &ToolCall) -> ToolOutcome {
     match call.name.as_str() {
         "search_knowledge_base" => {
             let query = clip(string_arg(&call.arguments, "query"), MAX_FIELD_CHARS);
-            let matches = kb.search(&query, 3);
+            let matches = kb.retrieve(&query);
             if matches.is_empty() {
                 return ToolOutcome::Result(json!({
                     "found": false,
