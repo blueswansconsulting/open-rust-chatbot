@@ -19,15 +19,16 @@ pub const GENERIC_ERROR: &str = "Sorry, something went wrong. Please try again i
 
 /// Follow-ups like "how often do I need one?" only make sense with the previous question, so
 /// knowledge-base search uses the visitor's last question as well as the current one.
-fn retrieval_query(history: &[Message], current: &str) -> String {
-    let previous = history
+/// The visitor's previous message, used as retrieval context so a follow-up such as "how often
+/// do I need one?" still finds its topic.
+fn previous_question<'a>(history: &'a [Message], current: &str) -> &'a str {
+    history
         .iter()
         .rev()
         .filter(|m| m.role == Role::User && m.content != current)
         .map(|m| m.content.as_str())
         .next()
-        .unwrap_or_default();
-    format!("{previous} {current}")
+        .unwrap_or_default()
 }
 
 /// Errors that mean the model is unreachable: network/transport failures, timeouts, 5xx, 429
@@ -383,7 +384,7 @@ impl ChatSession {
         let excerpts: Vec<String> = self
             .site
             .kb
-            .retrieve(&retrieval_query(&self.history, text))
+            .retrieve_for_turn(text, previous_question(&self.history, text))
             .iter()
             .map(|c| format!("[{}] {}", c.header_path.join(" > "), c.text))
             .collect();
@@ -597,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_query_includes_the_previous_question() {
+    fn retrieval_context_is_the_previous_question() {
         let h = vec![
             Message::new(Role::System, "s"),
             Message::new(Role::User, "I need an EICR in Croydon"),
@@ -605,8 +606,8 @@ mod tests {
             Message::new(Role::User, "How often do I need one?"),
         ];
         assert_eq!(
-            retrieval_query(&h, "How often do I need one?"),
-            "I need an EICR in Croydon How often do I need one?"
+            previous_question(&h, "How often do I need one?"),
+            "I need an EICR in Croydon"
         );
     }
 
