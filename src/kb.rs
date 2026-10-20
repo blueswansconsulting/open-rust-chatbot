@@ -49,26 +49,33 @@ impl<'a> Excerpt<'a> {
     }
 }
 
+/// Contractions whose apostrophe-free form is also a real word or place ("Wells", "St Ives",
+/// "Shell"), so they are dropped while the apostrophe is still present.
+const AMBIGUOUS_CONTRACTIONS: &[&str] = &[
+    "i've", "i'll", "i'd", "we'll", "we'd", "let's", "she'll", "he'll", "it'll", "she'd", "he'd",
+    "we're",
+];
+
 fn tokens(text: &str) -> Vec<String> {
     let cleaned: String = text
         .to_lowercase()
         .chars()
-        // Apostrophes join rather than split, so "you're" is one (stop)word, not "you" + "re".
-        .filter(|c| *c != '\'' && *c != '’')
-        .map(|c| {
-            if c.is_alphanumeric() || c.is_whitespace() || c == '-' {
-                c
-            } else {
-                ' '
-            }
+        .map(|c| match c {
+            '’' => '\'',
+            c if c.is_alphanumeric() || c.is_whitespace() || c == '-' || c == '\'' => c,
+            _ => ' ',
         })
         .collect();
     cleaned
         .split_whitespace()
+        .filter(|w| !AMBIGUOUS_CONTRACTIONS.contains(w))
+        // Apostrophes join rather than split, so "you're" is one (stop)word, not "you" + "re".
+        .map(|w| w.replace('\'', ""))
         // Two-character terms such as "ev" or "uk" carry meaning; two-letter function words are
-        // dropped by the stopword list instead.
+        // dropped by the stopword list instead. Stopwords are checked before stemming only, so
+        // "Wells" (stem "well") or "Ives" (stem "ive") are never mistaken for one.
         .filter(|t| t.chars().count() >= 2 && !is_stopword(t))
-        .map(stem)
+        .map(|t| stem(&t))
         .collect()
 }
 
@@ -107,10 +114,15 @@ const STOPWORDS: &[&str] = &[
     "all", "get", "got", "need", "want", "please", "help", "tell", "know", "find", "some", "them",
     "they", "their", "then", "than", "also", "just", "not", "but", "its", "use",
     // Contractions, with the apostrophe removed by the tokeniser.
-    "im", "ive", "ill", "youre", "youve", "youll", "youd", "were", "weve", "well", "wed", "theyre",
-    "theyve", "whats", "thats", "theres", "heres", "lets", "dont", "doesnt", "didnt", "cant",
-    "wont", "isnt", "arent", "wasnt", "havent", "hasnt", "wouldnt", "couldnt", "shouldnt", "re",
-    "ve", "ll", "hi", "ok", "st", "nd", "rd", "th",
+    // Ambiguous ones ("I've" -> "ive", "we'll" -> "well") are dropped earlier; see
+    // AMBIGUOUS_CONTRACTIONS.
+    "im", "youre", "youve", "youll", "youd", "were", "weve", "theyre", "theyve", "whats", "thats",
+    "theres", "heres", "dont", "doesnt", "didnt", "cant", "wont", "isnt", "arent", "wasnt",
+    "havent", "hasnt", "wouldnt", "couldnt", "shouldnt", "re", "ve", "ll", "hi", "ok", "st", "nd",
+    "rd", "th",
+    // Chat acknowledgements: "yes, how much for one?" is about the previous topic, not about
+    // whichever section starts "Yes. Thanks ...".
+    "yes", "yeah", "thanks", "thank", "great", "sure", "cool", "okay", "one",
     // Question filler: on their own these matched unrelated sections ("how long" hit the
     // privacy notice's "How long we keep it").
     "long", "take", "takes", "roughly", "much", "many", "often", "quick", "quickly", "soon", "like",
@@ -390,7 +402,6 @@ fn query_terms(question: &str, context: &str) -> Vec<(String, bool)> {
     for t in tokens(question) {
         terms.insert(t, true);
     }
-    terms.retain(|t, _| !is_stopword(t));
     terms.into_iter().collect()
 }
 
@@ -648,6 +659,40 @@ We keep enquiry details for as long as needed and no longer than six years.\n";
         let kb = KnowledgeBase::from_markdown(md);
         let hits = kb.retrieve("you're doing rewires?");
         assert_eq!(paths(&hits), vec!["Rewires"]);
+    }
+
+    #[test]
+    fn place_names_that_look_like_contractions_still_match() {
+        let kb = KnowledgeBase::from_markdown(
+            "# Home\nFamily electricians.\n# Somerset\nWe work in Wells and Glastonbury.\n\
+             # Cornwall\nWe work in St Ives and Penzance.\n# Kent\nWe work in Lydd.",
+        );
+        assert_eq!(
+            paths(&kb.retrieve("Wells?"))[0],
+            "Somerset",
+            "{:?}",
+            tokens("Wells?")
+        );
+        assert_eq!(paths(&kb.retrieve("Are you near St Ives?"))[0], "Cornwall");
+        // The contractions themselves are still dropped while the apostrophe is present.
+        assert!(
+            tokens("I've we'll I'll we'd let's she'll").is_empty(),
+            "{:?}",
+            tokens("I've we'll I'll we'd let's she'll")
+        );
+    }
+
+    #[test]
+    fn chat_acknowledgements_are_not_query_terms() {
+        assert!(tokens("yes yeah thanks thank you great sure cool okay one").is_empty());
+        let kb = KnowledgeBase::from_markdown(
+            "# Home\nFamily electricians.\n# FAQ\n## Are you insured?\nYes. Thanks for asking, one of our great strengths.\n\
+             # Prices\nA rewire costs from 3000 pounds.",
+        );
+        let hits = kb.retrieve_for_turn("Yes, how much for one?", "Do you do rewires?");
+        let p = paths(&hits);
+        assert_eq!(p[0], "Prices", "{p:?}");
+        assert!(!p.iter().any(|p| p.starts_with("FAQ")), "{p:?}");
     }
 
     #[test]
