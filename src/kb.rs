@@ -19,6 +19,18 @@ pub struct KnowledgeBase {
 const DEFAULT_CHUNK_WORDS: usize = 512;
 const DEFAULT_OVERLAP_WORDS: usize = 75;
 
+/// Most chunks handed to the model per retrieval.
+pub const MAX_CONTEXT_CHUNKS: usize = 6;
+/// Total chunk text (bytes) handed to the model per retrieval. The best match is always kept
+/// even if it alone exceeds this.
+pub const MAX_CONTEXT_CHARS: usize = 6_000;
+/// How much a query term counts once an already-selected chunk covers it. Low, so the next
+/// pick prefers a chunk that answers a different part of the question.
+const COVERED_TERM_WEIGHT: f64 = 0.1;
+/// Penalty for a chunk under the same heading as one already selected that adds no new query
+/// term (e.g. the same section copied on two pages, or overlapping splits of one section).
+const NEAR_DUPLICATE_WEIGHT: f64 = 0.1;
+
 fn tokens(text: &str) -> Vec<String> {
     let cleaned: String = text
         .to_lowercase()
@@ -33,7 +45,9 @@ fn tokens(text: &str) -> Vec<String> {
         .collect();
     cleaned
         .split_whitespace()
-        .filter(|t| t.len() > 2 && !is_stopword(t))
+        // Two-character terms such as "ev" or "uk" carry meaning; two-letter function words are
+        // dropped by the stopword list instead.
+        .filter(|t| t.len() >= 2 && !is_stopword(t))
         .map(stem)
         .collect()
 }
@@ -72,6 +86,11 @@ const STOPWORDS: &[&str] = &[
     "were", "will", "would", "should", "could", "about", "from", "into", "our", "out", "any",
     "all", "get", "got", "need", "want", "please", "help", "tell", "know", "find", "some", "them",
     "they", "their", "then", "than", "also", "just", "not", "but", "its", "it's", "i'm", "use",
+    // Question filler: on their own these matched unrelated sections ("how long" hit the
+    // privacy notice's "How long we keep it").
+    "long", "take", "takes", "roughly", "much", "many", "often", "quick", "quickly", "soon", "like",
+    "do", "in", "on", "to", "of", "is", "it", "me", "my", "we", "us", "an", "or", "if", "at", "by",
+    "be", "so", "no", "up", "as", "am", "i", "a",
 ];
 
 fn is_stopword(token: &str) -> bool {
@@ -167,41 +186,139 @@ impl KnowledgeBase {
         Ok(Self::from_markdown(&std::fs::read_to_string(path)?))
     }
 
-    /// Ranks chunks by the IDF-weighted query words they contain (stopwords ignored), with a
-    /// bonus when the words appear in the chunk's heading.
+    /// Context for one chat turn: up to [`MAX_CONTEXT_CHUNKS`] chunks within
+    /// [`MAX_CONTEXT_CHARS`], chosen so each part of a multi-part question gets a chunk. When
+    /// something matched and room remains, the knowledge base's top-level overview (its first
+    /// chunk) is appended last; it never displaces a matching chunk.
+    pub fn retrieve(&self, query: &str) -> Vec<&KnowledgeChunk> {
+        let mut hits = self.search_within(query, MAX_CONTEXT_CHUNKS, MAX_CONTEXT_CHARS);
+        if let Some(overview) = self.chunks.first().filter(|c| c.header_path.len() <= 1) {
+            let used: usize = hits.iter().map(|c| c.text.len()).sum();
+            if !hits.is_empty()
+                && hits.len() < MAX_CONTEXT_CHUNKS
+                && used + overview.text.len() <= MAX_CONTEXT_CHARS
+                && !hits.iter().any(|c| std::ptr::eq(*c, overview))
+            {
+                hits.push(overview);
+            }
+        }
+        hits
+    }
+
+    /// Up to `limit` chunks, coverage-aware, with no text budget.
     pub fn search(&self, query: &str, limit: usize) -> Vec<&KnowledgeChunk> {
-        let query_tokens: std::collections::HashSet<String> = tokens(query)
+        self.search_within(query, limit, usize::MAX)
+    }
+
+    /// Scores each chunk by the IDF-weighted query words it contains (stopwords ignored, bonus
+    /// for heading matches), then picks greedily: the best chunk first, then whichever chunk adds
+    /// the most weight for query terms not yet covered. Ties go to the higher plain score, then
+    /// to document order, so results are deterministic. A chunk that would take the total text
+    /// past `max_chars` is skipped (the first pick is always kept).
+    fn search_within(&self, query: &str, limit: usize, max_chars: usize) -> Vec<&KnowledgeChunk> {
+        // Sorted and deduplicated so float sums run in a fixed order.
+        let query_tokens: std::collections::BTreeSet<String> = tokens(query)
             .into_iter()
             .filter(|t| !is_stopword(t))
             .collect();
-        let mut scored: Vec<(f64, usize, &KnowledgeChunk)> = self
+        let query_tokens: Vec<String> = query_tokens.into_iter().collect();
+
+        struct Candidate {
+            index: usize,
+            weights: Vec<f64>,
+            score: f64,
+        }
+        let mut candidates: Vec<Candidate> = self
             .chunks
             .iter()
             .enumerate()
-            .map(|(i, c)| {
-                let score: f64 = query_tokens
+            .map(|(index, c)| {
+                let weights: Vec<f64> = query_tokens
                     .iter()
-                    .map(|q| {
-                        let tf = c.tokens.iter().filter(|t| *t == q).count();
-                        if tf == 0 {
-                            return 0.0;
+                    .map(|q| self.term_weight(c, q))
+                    .collect();
+                let score = weights.iter().sum();
+                Candidate {
+                    index,
+                    weights,
+                    score,
+                }
+            })
+            .filter(|c| c.score > 0.0)
+            .collect();
+
+        let mut covered = vec![false; query_tokens.len()];
+        let mut selected: Vec<&KnowledgeChunk> = Vec::new();
+        let mut used_chars = 0usize;
+        while selected.len() < limit && !candidates.is_empty() {
+            let gain = |c: &Candidate| -> f64 {
+                let mut adds_new_term = false;
+                let gain: f64 = c
+                    .weights
+                    .iter()
+                    .zip(&covered)
+                    .map(|(w, done)| {
+                        if *w > 0.0 && !done {
+                            adds_new_term = true;
                         }
-                        let idf = self.idf.get(q).copied().unwrap_or(0.0);
-                        let heading = if c.header_tokens.contains(q) {
-                            2.0
+                        if *done {
+                            w * COVERED_TERM_WEIGHT
                         } else {
-                            1.0
-                        };
-                        idf * (1.0 + (tf as f64).ln()) * heading
+                            *w
+                        }
                     })
                     .sum();
-                (score, i, c)
-            })
-            .filter(|(score, _, _)| *score > 0.0)
-            .collect();
-        // Stable by original order on ties.
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        scored.into_iter().take(limit).map(|(_, _, c)| c).collect()
+                let leaf = self.chunks[c.index].header_path.last();
+                let duplicate_heading = leaf.is_some()
+                    && selected.iter().any(|s| {
+                        s.header_path
+                            .last()
+                            .zip(leaf)
+                            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+                    });
+                if duplicate_heading && !adds_new_term {
+                    gain * NEAR_DUPLICATE_WEIGHT
+                } else {
+                    gain
+                }
+            };
+            let best = candidates
+                .iter()
+                .enumerate()
+                .map(|(pos, c)| (gain(c), c.score, c.index, pos))
+                .max_by(|a, b| {
+                    a.0.total_cmp(&b.0)
+                        .then(a.1.total_cmp(&b.1))
+                        .then(b.2.cmp(&a.2))
+                })
+                .map(|(_, _, _, pos)| pos)
+                .expect("candidates is non-empty");
+            let pick = candidates.remove(best);
+            let chunk = &self.chunks[pick.index];
+            if !selected.is_empty() && used_chars.saturating_add(chunk.text.len()) > max_chars {
+                continue;
+            }
+            used_chars = used_chars.saturating_add(chunk.text.len());
+            for (done, w) in covered.iter_mut().zip(&pick.weights) {
+                *done |= *w > 0.0;
+            }
+            selected.push(chunk);
+        }
+        selected
+    }
+
+    fn term_weight(&self, chunk: &KnowledgeChunk, term: &str) -> f64 {
+        let tf = chunk.tokens.iter().filter(|t| *t == term).count();
+        if tf == 0 {
+            return 0.0;
+        }
+        let idf = self.idf.get(term).copied().unwrap_or(0.0);
+        let heading = if chunk.header_tokens.iter().any(|t| t == term) {
+            2.0
+        } else {
+            1.0
+        };
+        idf * (1.0 + (tf as f64).ln()) * heading
     }
 }
 
@@ -276,5 +393,122 @@ mod tests {
         assert_eq!(hits[0].header_path, vec!["Fees"]);
         assert_eq!(hits.len(), 2);
         assert!(kb.search("zzz", 3).is_empty());
+    }
+
+    /// Modelled on the demo electrician site where "EV chargers in Wakefield ... how long" missed
+    /// Wakefield and pulled in the privacy notice instead.
+    const DEMO_KB: &str = "# Homepage\n\
+Bright Spark Electrical is a family-run electrician covering Leeds, Wakefield, Bradford and the surrounding towns.\n\
+## EV charger installation\n\
+We fit home EV chargers from all major brands, with OZEV-approved installers.\n\
+# Services\n\
+## Rewires\n\
+Full and partial rewires for houses and flats.\n\
+## EV charger installation\n\
+A typical EV charger installation takes half a day. We install tethered and untethered chargers.\n\
+# Areas we cover\n\
+## Towns and areas\n\
+- Leeds\n- Wakefield\n- Bradford\n- Huddersfield\n\
+# Privacy notice\n\
+## How long we keep it\n\
+We keep enquiry details for as long as needed and no longer than six years.\n";
+
+    #[test]
+    fn multi_part_question_covers_every_part_and_skips_filler_matches() {
+        let kb = KnowledgeBase::from_markdown(DEMO_KB);
+        let hits = kb.retrieve(
+            "Do you install EV chargers in Wakefield, and roughly how long does it take?",
+        );
+        let paths: Vec<String> = hits.iter().map(|c| c.header_path.join(" > ")).collect();
+        assert!(
+            hits.iter().any(|c| c.text.contains("Wakefield")),
+            "no Wakefield chunk: {paths:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|c| c.header_path.last().unwrap() == "EV charger installation"),
+            "no EV chunk: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("Privacy")),
+            "filler word 'long' pulled in privacy: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn coverage_beats_near_duplicates_even_with_a_small_limit() {
+        let kb = KnowledgeBase::from_markdown(DEMO_KB);
+        let hits = kb.search("install EV chargers in Wakefield", 2);
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter().any(|c| c.text.contains("Wakefield")),
+            "second slot went to a duplicate EV chunk"
+        );
+    }
+
+    #[test]
+    fn two_letter_terms_are_kept_but_function_words_are_not() {
+        assert_eq!(tokens("EV charger in UK"), vec!["ev", "charger", "uk"]);
+        assert!(tokens("do it on me if so").is_empty());
+        let kb = KnowledgeBase::from_markdown("# Cars\nWe fit EV points.\n# Boilers\nGas boilers.");
+        assert_eq!(kb.search("ev", 3)[0].header_path, vec!["Cars"]);
+        assert!(kb.search("how long does it take", 3).is_empty());
+    }
+
+    #[test]
+    fn retrieve_respects_chunk_limit_and_text_budget() {
+        let section = |i: usize| format!("# Area {i}\nWe cover Leeds. {}\n", "word ".repeat(300));
+        let md: String = (0..12).map(section).collect();
+        let kb = KnowledgeBase::from_markdown(&md);
+        let hits = kb.retrieve("Leeds");
+        assert!(!hits.is_empty());
+        assert!(hits.len() <= MAX_CONTEXT_CHUNKS);
+        let total: usize = hits.iter().map(|c| c.text.len()).sum();
+        assert!(total <= MAX_CONTEXT_CHARS, "{total} chars over budget");
+
+        let small = KnowledgeBase::from_markdown(
+            &(0..12)
+                .map(|i| format!("# Area {i}\nWe cover Leeds.\n"))
+                .collect::<String>(),
+        );
+        assert_eq!(small.retrieve("Leeds").len(), MAX_CONTEXT_CHUNKS);
+    }
+
+    #[test]
+    fn retrieve_always_returns_the_best_chunk_even_if_oversized() {
+        // 400 long words stay in one chunk but exceed the whole text budget on their own.
+        let md = format!(
+            "# Big\nLeeds Leeds {}\n# Small\nLeeds too.",
+            "electrification ".repeat(400)
+        );
+        let kb = KnowledgeBase::from_markdown(&md);
+        let hits = kb.retrieve("Leeds");
+        assert!(hits[0].text.len() > MAX_CONTEXT_CHARS);
+        assert_eq!(hits[0].header_path, vec!["Big"]);
+        assert_eq!(hits.len(), 1, "nothing else fits once the budget is spent");
+    }
+
+    #[test]
+    fn ties_are_broken_by_document_order_deterministically() {
+        let kb = KnowledgeBase::from_markdown("# A\nLeeds.\n# B\nLeeds.\n# C\nLeeds.");
+        for _ in 0..5 {
+            let ids: Vec<&str> = kb
+                .search("Leeds", 3)
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect();
+            assert_eq!(ids, vec!["kb-0-0", "kb-1-0", "kb-2-0"]);
+        }
+    }
+
+    #[test]
+    fn retrieve_adds_the_overview_only_when_room_remains_and_something_matched() {
+        let kb = KnowledgeBase::from_markdown(
+            "# Home\nFamily electricians since 1990.\n# Services\n## Rewires\nFull rewires.",
+        );
+        let hits = kb.retrieve("rewires");
+        assert_eq!(hits[0].header_path, vec!["Services", "Rewires"]);
+        assert_eq!(hits.last().unwrap().header_path, vec!["Home"]);
+        assert!(kb.retrieve("zzz").is_empty());
     }
 }

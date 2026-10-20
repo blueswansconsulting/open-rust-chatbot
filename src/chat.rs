@@ -383,7 +383,7 @@ impl ChatSession {
         let excerpts: Vec<String> = self
             .site
             .kb
-            .search(&retrieval_query(&self.history, text), 3)
+            .retrieve(&retrieval_query(&self.history, text))
             .iter()
             .map(|c| format!("[{}] {}", c.header_path.join(" > "), c.text))
             .collect();
