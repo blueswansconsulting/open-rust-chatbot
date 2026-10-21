@@ -69,9 +69,53 @@ type Sender = UnboundedSender<String>;
 
 static EMAIL_IN_TEXT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap());
-/// A UK-style phone number typed by the visitor ("07700 900123", "+44 7700 900123").
+/// Something that may be a phone number the visitor typed, in any common format ("07700
+/// 900123", "07700-900-123", "(07700) 900123", "+44 (0)7700 900123"); [`phone_digits`] decides.
 static PHONE_IN_TEXT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:\+44\s?\d|\b0\d)[\d ]{7,12}\d\b").unwrap());
+    LazyLock::new(|| Regex::new(r"\+?\(?\d[\d \t().-]{7,60}\d").unwrap());
+/// The visitor introducing themselves ("I'm Sam Test", "my name is Jo", "this is Priya Shah"):
+/// the introduction, then up to three capitalised words. What follows is checked in code.
+static NAME_IN_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i:\b(?:my name is|i['\u{2019}]m|i am|this is)\s+)(\p{Lu}[\p{L}'\u{2019}-]*(?:[ \t]+\p{Lu}[\p{L}'\u{2019}-]*){0,2})").unwrap()
+});
+/// Capitalised words after "I'm" that are not a name ("I'm Looking for…", "I'm Sorry").
+const NOT_A_NAME: &str =
+    "monday tuesday wednesday thursday friday saturday sunday january february \
+march april may june july august september october november december ready very also unsure \
+urgent sorry looking gas safe here interested after just not based in from wondering hoping trying \
+sure the a an available back home away out on at with";
+/// The hidden lead marker: `LEAD:`, any case, `LEAD :`, or bold `**LEAD:**`.
+static LEAD_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:\*{1,2})?\bLEAD(?:\*{1,2})?\s*:(?:\*{1,2})?\s*").unwrap());
+/// An email in the visitor's message, with the "on"/"at" before it, for the card text.
+static EMAIL_IN_MESSAGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i:\b(?:on|at|via|is|to)\s+)?[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+        .unwrap()
+});
+/// The word before a phone number in the card text ("call me on …").
+static BEFORE_PHONE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:on|at|via|is)\s*$").unwrap());
+/// Digit groups shaped like a date (21-10-2026, 2026.10.21), never a phone.
+static DATE_LIKE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:\d{1,2}[-/.]\d{1,2}[-/.]\d{4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})").unwrap()
+});
+/// Words that make the number after them a reference, not a phone ("invoice 0123-456-7890").
+const REFERENCE_WORDS: [&str; 14] = [
+    "invoice",
+    "inv",
+    "ref",
+    "reference",
+    "order",
+    "account",
+    "acc",
+    "policy",
+    "booking",
+    "ticket",
+    "job",
+    "case",
+    "quote",
+    "membership",
+];
 /// The visitor asking to be called back, so a phone number they typed is a lead.
 static CALL_ME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:call|ring|phone|text|contact)\s+(?:me|us)\b|\bcall[- ]?back\b|\bget (?:back )?in touch\b").unwrap()
@@ -89,30 +133,366 @@ const TEXT_ONLY_DIRECTORY_LEADS: &str = " This site is a directory: a call-back 
 /// Contact details a visitor typed: an email, or a phone number when they ask to be called.
 fn fallback_contact(text: &str) -> Option<(Option<String>, Option<String>)> {
     let email = EMAIL_IN_TEXT.find(text).map(|m| m.as_str().to_owned());
-    let phone = PHONE_IN_TEXT
-        .find(text)
+    let phone = typed_phones(text)
+        .into_iter()
+        .next()
         .filter(|_| CALL_ME.is_match(text))
-        .map(|m| m.as_str().trim().to_owned());
+        .map(|(typed, digits)| {
+            // As typed when the card accepts it ("(07700) 900123"), else plain digits.
+            if typed
+                .chars()
+                .all(|c| c.is_ascii_digit() || " ()+-".contains(c))
+            {
+                typed
+            } else {
+                digits
+            }
+        });
     (email.is_some() || phone.is_some()).then_some((email, phone))
 }
 
-/// Splits a text-only reply into what the visitor sees and the optional `LEAD: {…}` arguments.
+/// UK phone numbers in `text`: (as typed, digits with a leading 0).
+///
+/// Each run of digits and separators is cut at its separators: from each start, the longest
+/// part that is a phone number counts ("07700 900123 4pm" gives "07700 900123"), and scanning
+/// goes on after it, so two numbers in one run are both found. Groups shaped like a date are
+/// skipped. A number straight after a reference word ("invoice 0123-456-7890") is not a phone,
+/// unless it is the only number in the message and the visitor asked to be called.
+fn typed_phones(text: &str) -> Vec<(String, String)> {
+    typed_phone_spans(text)
+        .into_iter()
+        .map(|(range, digits)| (text[range].to_owned(), digits))
+        .collect()
+}
+
+/// Like [`typed_phones`], with where each number is in `text`.
+fn typed_phone_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut found: Vec<(std::ops::Range<usize>, String, bool)> = Vec::new();
+    for m in PHONE_IN_TEXT.find_iter(text) {
+        let run = m.as_str();
+        let separator = |c: char| " \t().-".contains(c);
+        // Where a part may start (a digit, '+' or '(' after a separator) and end (after a digit).
+        let starts: Vec<usize> = run
+            .char_indices()
+            .filter(|&(i, c)| {
+                let prev = run[..i].chars().last();
+                (c.is_ascii_digit() || c == '+' || c == '(')
+                    && prev.is_none_or(|p| separator(p) && p != '(' || p == ')')
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let ends: Vec<usize> = run
+            .char_indices()
+            .filter(|&(i, c)| {
+                (c.is_ascii_digit() || c == ')')
+                    && run[i + c.len_utf8()..].chars().next().is_none_or(separator)
+            })
+            .map(|(i, c)| i + c.len_utf8())
+            .collect();
+        let mut from = 0; // byte offset in `run` scanning has reached
+        for &start in &starts {
+            if start < from {
+                continue;
+            }
+            if let Some(date) = DATE_LIKE.find(&run[start..]) {
+                from = start + date.end();
+                continue;
+            }
+            let best = ends
+                .iter()
+                .rev()
+                .filter(|&&end| end > start)
+                .find_map(|&end| {
+                    let part = run[start..end].trim();
+                    phone_digits(part).map(|digits| (end, digits))
+                });
+            if let Some((end, digits)) = best {
+                let at = m.start() + start;
+                let before = text[..at].to_lowercase();
+                let reference = before
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| !w.is_empty())
+                    .rev()
+                    .take(2)
+                    .any(|w| REFERENCE_WORDS.contains(&w));
+                found.push((at..m.start() + end, digits, reference));
+                from = end;
+            }
+        }
+    }
+    let only_one_and_asked = found.len() == 1 && CALL_ME.is_match(text);
+    found
+        .into_iter()
+        .filter(|(_, _, reference)| !reference || only_one_and_asked)
+        .map(|(range, digits, _)| (range, digits))
+        .collect()
+}
+
+/// The visitor's own name and where its introduction is in `text`: "I'm Sam Test (Claude QA),
+/// 07700 900123" gives "Sam Test". The name is one to three capitalised words, followed by a
+/// comma, full stop, "and", a bracket, digits or the end; never a weekday, "Sorry", "Looking"….
+fn introduced_name(text: &str) -> Option<(String, std::ops::Range<usize>)> {
+    let not_a_name: std::collections::HashSet<&str> = NOT_A_NAME.split_whitespace().collect();
+    for c in NAME_IN_TEXT.captures_iter(text) {
+        let (whole, name) = (c.get(0)?, c.get(1)?);
+        // Try the longest run of capitalised words first, then shorter ones.
+        let words: Vec<(usize, usize)> = name
+            .as_str()
+            .split_whitespace()
+            .scan(0, |from, w| {
+                let at = name.as_str()[*from..].find(w)? + *from;
+                *from = at + w.len();
+                Some((name.start() + at, name.start() + at + w.len()))
+            })
+            .collect();
+        for n in (1..=words.len()).rev() {
+            let end = words[n - 1].1;
+            let after = text[end..].trim_start();
+            let follows = after.is_empty()
+                || after.starts_with([',', '.', '(', '!'])
+                || after.starts_with(|c: char| c.is_ascii_digit() || c == '+')
+                || after.to_lowercase().starts_with("and ");
+            let candidate = &text[words[0].0..end];
+            let stop = candidate
+                .split_whitespace()
+                .any(|w| not_a_name.contains(w.to_lowercase().as_str()));
+            if follows && !stop {
+                let name = candidate
+                    .trim_end_matches(['\'', '\u{2019}', '-'])
+                    .to_owned();
+                return Some((name, whole.start()..end));
+            }
+        }
+    }
+    None
+}
+
+fn name_in_text(text: &str) -> Option<String> {
+    introduced_name(text).map(|(name, _)| name)
+}
+
+/// The visitor's message for the card, without the contact details and (when a name was taken
+/// from it) the self-introduction it repeats ("Can someone call me about a rewire in Bolton?").
+fn lead_message(text: &str) -> String {
+    let mut out = text.to_owned();
+    if let Some((_, range)) = introduced_name(&out) {
+        // Drop the introduction and a bracketed aside right after it ("(Claude QA)").
+        let mut end = range.end;
+        let rest = &out[end..];
+        if let Some(stripped) = rest.trim_start().strip_prefix('(') {
+            if let Some(close) = stripped.find(')') {
+                end += rest.len() - stripped.len() + close + 1;
+            }
+        }
+        out.replace_range(range.start..end, " ");
+    }
+    // The numbers found (and the "on" before each), last first so earlier offsets stay valid.
+    for (range, _) in typed_phone_spans(&out).into_iter().rev() {
+        let start = BEFORE_PHONE
+            .find(&out[..range.start])
+            .map_or(range.start, |m| m.start());
+        out.replace_range(start..range.end, " ");
+    }
+    out = EMAIL_IN_MESSAGE.replace_all(&out, " ").into_owned();
+    let joined = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Rejoin, dropping spaces before punctuation and punctuation left dangling after other
+    // punctuation ("Bolton? , ." -> "Bolton?").
+    let mut cleaned = String::new();
+    for c in joined.chars() {
+        let last = cleaned.trim_end().chars().last();
+        if ",;:.".contains(c) && (last.is_none() || last.is_some_and(|l| ".?!,;:".contains(l))) {
+            continue;
+        }
+        if ",;:.?!".contains(c) && cleaned.ends_with(' ') {
+            cleaned.pop();
+        }
+        cleaned.push(c);
+    }
+    // Words left hanging where a number was ("call me on", "my number is").
+    const DANGLING: [&str; 12] = [
+        "on", "at", "via", "is", "number", "mobile", "phone", "email", "tel", "my", "me:", "and",
+    ];
+    let mut message = cleaned
+        .trim_matches(|c: char| ",;:-".contains(c) || c.is_whitespace())
+        .to_owned();
+    loop {
+        let trimmed = message.trim_end_matches(|c: char| ",;:-".contains(c) || c.is_whitespace());
+        let Some((head, last)) = trimmed.rsplit_once(' ').or(Some(("", trimmed))) else {
+            break;
+        };
+        if !DANGLING.contains(&last.to_lowercase().as_str()) || last.is_empty() {
+            message = trimmed.to_owned();
+            break;
+        }
+        message = head.to_owned();
+    }
+    let message: String = message.chars().take(300).collect();
+    if message.trim().is_empty() {
+        "Asked to be called back".into()
+    } else {
+        message
+    }
+}
+
+/// Where a JSON value that may be cut off ends: just after its matching `}`, or the end of
+/// `text`.
+fn json_extent(text: &str) -> usize {
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (i, c) in text.char_indices() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    text.len()
+}
+
+/// Splits a text-only reply into what the visitor sees and the `LEAD: {…}` arguments (the
+/// first one, if several). The marker may be any case, spaced or bold (`**LEAD:**`), on its
+/// own line or mid-line, with a pretty-printed or fenced object. It only counts when a `{`
+/// follows, so "Typical lead: 2 weeks" or "MISLEAD:" is left alone. From the marker to the end
+/// of its JSON (and any objects straight after it) is never shown; JSON that doesn't parse is
+/// hidden up to its closing `}` or the end of the reply.
 pub(crate) fn split_lead_line(raw: &str) -> (String, Option<serde_json::Map<String, Value>>) {
     let mut lead = None;
-    let mut visible = Vec::new();
-    for line in raw.lines() {
-        if let Some(rest) = line.trim().strip_prefix("LEAD:") {
-            if let Some(map) = serde_json::from_str::<Value>(rest.trim())
-                .ok()
-                .and_then(|v| v.as_object().cloned())
-            {
-                lead = Some(map);
+    let mut visible = String::new();
+    let mut rest = raw;
+    loop {
+        // The next marker that is followed by an object.
+        let found = LEAD_MARKER.find_iter(rest).find_map(|m| {
+            let after = &rest[m.end()..];
+            let body = after.trim_start_matches(|c: char| c.is_whitespace() || c == '`');
+            let body = body.strip_prefix("json").map_or(body, str::trim_start);
+            // An object, or nothing at all (a bare marker ending the reply).
+            (body.starts_with('{') || body.trim().is_empty())
+                .then(|| (m.start(), rest.len() - body.len()))
+        });
+        let Some((at, body_at)) = found else {
+            break;
+        };
+        // An opening code fence just before the marker belongs to it.
+        let before = rest[..at].trim_end();
+        let before = before
+            .strip_suffix("```json")
+            .or_else(|| before.strip_suffix("```"))
+            .unwrap_or(before);
+        visible.push_str(before);
+        let mut body = &rest[body_at..];
+        let mut first = true;
+        while body.starts_with('{') {
+            let mut values = serde_json::Deserializer::from_str(body).into_iter::<Value>();
+            match values.next() {
+                Some(Ok(value)) => {
+                    if let (true, Value::Object(map)) = (first && lead.is_none(), value) {
+                        lead = Some(map);
+                    }
+                    body = &body[values.byte_offset()..];
+                }
+                // Cut off or broken: hide it up to its closing brace or the end.
+                _ => body = &body[json_extent(body)..],
             }
-            continue; // never show the line, even if it doesn't parse
+            first = false;
+            // Objects straight after it go with it.
+            body = body.trim_start();
         }
-        visible.push(line);
+        // A closing fence and punctuation after the JSON go with it.
+        rest =
+            body.trim_start_matches(|c: char| c.is_whitespace() || c == '`' || ".,;!".contains(c));
+        if !rest.is_empty() && !visible.is_empty() {
+            visible.push('\n');
+        }
     }
-    (visible.join("\n").trim().to_owned(), lead)
+    visible.push_str(rest);
+    (visible.trim().to_owned(), lead)
+}
+
+/// A phone number in one canonical form, or None if it isn't one:
+/// - UK numbers as digits with a leading 0 ("+44 (0)7700 900123", "0044 7700 900123" and
+///   "07700-900-123" all give "07700900123");
+/// - other international numbers written with + or 00 as E.164 ("+33 1 23 45 67 89" gives
+///   "+33123456789"), 8 to 15 digits.
+fn phone_digits(phone: &str) -> Option<String> {
+    let phone = phone.trim();
+    if DATE_LIKE.is_match(phone) {
+        return None;
+    }
+    let mut digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+    let mut international = phone.starts_with('+');
+    if let Some(rest) = digits.strip_prefix("00") {
+        digits = rest.to_owned();
+        international = true;
+    }
+    if let Some(rest) = digits
+        .strip_prefix("44")
+        .filter(|_| international || digits.len() == 12)
+    {
+        // "+44 (0)7700…" keeps its 0; "+44 7700…" gets one.
+        digits = if rest.starts_with('0') {
+            rest.to_owned()
+        } else {
+            format!("0{rest}")
+        };
+        international = false;
+    }
+    if international {
+        return (!digits.starts_with('0') && (8..=15).contains(&digits.len()))
+            .then(|| format!("+{digits}"));
+    }
+    (digits.starts_with('0') && (10..=11).contains(&digits.len())).then_some(digits)
+}
+
+/// Keeps only the phone and email in a model's lead that the visitor actually wrote in this
+/// conversation, so a listed business's number in the prompt can't become the visitor's.
+/// Returns false if no contact detail is left.
+fn keep_visitors_contacts(
+    lead: &mut serde_json::Map<String, Value>,
+    visitor_texts: &[&str],
+) -> bool {
+    let phones: Vec<String> = visitor_texts
+        .iter()
+        .flat_map(|t| typed_phones(t).into_iter().map(|(_, digits)| digits))
+        .collect();
+    let emails: Vec<String> = visitor_texts
+        .iter()
+        .flat_map(|t| {
+            EMAIL_IN_TEXT
+                .find_iter(t)
+                .map(|m| m.as_str().trim().to_lowercase())
+        })
+        .collect();
+    let phone_ok = lead
+        .get("phone")
+        .and_then(Value::as_str)
+        .and_then(phone_digits)
+        .is_some_and(|d| phones.contains(&d));
+    if !phone_ok {
+        lead.insert("phone".into(), Value::Null);
+    }
+    let email_ok = lead
+        .get("email")
+        .and_then(Value::as_str)
+        .map(|e| e.trim().to_lowercase())
+        .is_some_and(|e| emails.contains(&e));
+    if !email_ok {
+        lead.insert("email".into(), Value::Null);
+    }
+    phone_ok || email_ok
 }
 
 /// `{"type":"resume","token":"…"|null}`: the widget asking to continue (or start) a session.
@@ -426,7 +806,8 @@ impl ChatSession {
                 }
             }
         }
-        // Text-only providers answer in one piece, so buffer it to take out the hidden lead line.
+        // Buffer the whole reply before sending anything, so the hidden lead line can never be
+        // streamed to the widget: it may come anywhere, even mid-line.
         let mut raw = String::new();
         let mut stream = self.shared.llm.stream(&messages, &[]).await?;
         while let Some(event) = stream.next().await {
@@ -441,6 +822,24 @@ impl ChatSession {
         self.history.push(Message::new(Role::Assistant, reply));
         self.history = trim_history(&self.history, max_history);
 
+        let visitor_texts: Vec<&str> = self
+            .history
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.content.as_str())
+            .chain(std::iter::once(text))
+            .collect();
+        let lead_args = lead_args.and_then(|mut lead| {
+            if keep_visitors_contacts(&mut lead, &visitor_texts) {
+                Some(lead)
+            } else {
+                log_event(
+                    "lead_line_dropped",
+                    json!({ "session": self.session_id, "reason": "contact not typed by the visitor" }),
+                );
+                None
+            }
+        });
         if let Some(mut arguments) = lead_args.filter(|_| self.site.lead_capture) {
             // A phone number or email is enough; the name is optional for text-only models.
             let named = arguments
@@ -456,14 +855,16 @@ impl ChatSession {
                 arguments,
             };
             if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, None, &call) {
+                // The model's lead is the card: no second card from the fallback below.
                 self.offer_lead(lead, tx);
+                send(tx, json!({ "type": "done" }));
+                log_event(
+                    "turn_complete",
+                    json!({ "session": self.session_id, "hops": 0 }),
+                );
+                return Ok(());
             }
-            send(tx, json!({ "type": "done" }));
-            log_event(
-                "turn_complete",
-                json!({ "session": self.session_id, "hops": 0 }),
-            );
-            return Ok(());
+            // An invalid lead line (no usable phone or email) falls back to what the visitor typed.
         }
 
         // Fallback when the model didn't add a lead line: offer a card for an email in the text,
@@ -475,10 +876,11 @@ impl ChatSession {
             .flatten()
         {
             let mut arguments = serde_json::Map::new();
-            arguments.insert("name".into(), json!("Website visitor"));
+            let name = name_in_text(text).unwrap_or_else(|| "Website visitor".into());
+            arguments.insert("name".into(), json!(name));
             arguments.insert("email".into(), email.map_or(Value::Null, |e| json!(e)));
             arguments.insert("phone".into(), phone.map_or(Value::Null, |p| json!(p)));
-            arguments.insert("message".into(), json!(text));
+            arguments.insert("message".into(), json!(lead_message(text)));
             let call = ToolCall {
                 id: "server-lead".into(),
                 name: "propose_lead".into(),
@@ -627,14 +1029,345 @@ mod tests {
             split_lead_line("Thanks!\nLEAD: {\"name\":\"Jo\",\"phone\":\"07700 900123\"}");
         assert_eq!(visible, "Thanks!");
         assert_eq!(lead.unwrap()["phone"], "07700 900123");
+        // No object after the marker: ordinary prose, shown as written.
         let (visible, lead) = split_lead_line("Hi there\nLEAD: not json");
         assert_eq!(
             (visible.as_str(), lead.is_none()),
-            ("Hi there", true),
-            "a broken line is hidden, not shown"
+            ("Hi there\nLEAD: not json", true)
         );
         let (visible, lead) = split_lead_line("No lead here.");
         assert_eq!((visible.as_str(), lead.is_none()), ("No lead here.", true));
+    }
+
+    /// The reply seen in production, with the lead on the same line as the sentence.
+    const LIVE_REPLY: &str = "The directory team can follow up about your rewire request in Bolton. LEAD: {\"name\":\"Sam Test (Claude QA)\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire in Bolton\"}";
+
+    #[test]
+    fn a_lead_on_the_same_line_is_parsed_and_hidden() {
+        let (visible, lead) = split_lead_line(LIVE_REPLY);
+        assert_eq!(
+            visible,
+            "The directory team can follow up about your rewire request in Bolton."
+        );
+        let lead = lead.expect("parsed");
+        assert_eq!(lead["name"], "Sam Test (Claude QA)");
+        assert_eq!(lead["phone"], "07700 900123");
+    }
+
+    #[test]
+    fn lead_lines_in_other_shapes_are_parsed_and_hidden() {
+        let json = r#"{"name":"Jo","phone":"07700 900123","email":null}"#;
+        for raw in [
+            format!("Thanks Jo.\nLEAD: {json}"),
+            format!("Thanks Jo. LEAD: {json}."),
+            format!("Thanks Jo.\n\nLEAD:{json}\n"),
+            format!("Thanks Jo.\n```json\nLEAD: {json}\n```"),
+            format!("Thanks Jo.\n```\nLEAD: {json}\n```\n"),
+            format!("Thanks Jo.\nLEAD: ```json\n{json}\n```"),
+            "Thanks Jo.\nLEAD: {\n  \"name\": \"Jo\",\n  \"phone\": \"07700 900123\"\n}".to_owned(),
+        ] {
+            let (visible, lead) = split_lead_line(&raw);
+            assert_eq!(visible, "Thanks Jo.", "{raw:?}");
+            assert_eq!(lead.expect("parsed")["phone"], "07700 900123", "{raw:?}");
+        }
+        // Text after the lead is still shown; a broken lead mid-line hides only that line's rest.
+        let (visible, lead) = split_lead_line(&format!("Thanks. LEAD: {json} Speak soon!"));
+        assert_eq!(
+            (visible.as_str(), lead.is_some()),
+            ("Thanks.\nSpeak soon!", true)
+        );
+        // Broken JSON with no closing brace: hidden to the end of the reply.
+        let (visible, lead) = split_lead_line("Thanks. LEAD: {broken\nAnything else?");
+        assert_eq!((visible.as_str(), lead.is_none()), ("Thanks.", true));
+        assert!(!split_lead_line("ok LEAD:").0.contains("LEAD"));
+    }
+
+    #[test]
+    fn marker_variants_are_hidden_and_prose_is_left_alone() {
+        // QA M1.
+        let json = r#"{"name":"Jo","phone":"07700 900123"}"#;
+        for marker in [
+            "lead:",
+            "Lead:",
+            "LEAD :",
+            "**LEAD:**",
+            "**LEAD**:",
+            "*Lead:*",
+            "LEAD:",
+        ] {
+            for raw in [
+                format!("Thanks Jo. {marker} {json}"),
+                format!("Thanks Jo.\n{marker} {json}"),
+            ] {
+                let (visible, lead) = split_lead_line(&raw);
+                assert_eq!(visible, "Thanks Jo.", "{raw:?}");
+                assert_eq!(lead.expect("parsed")["phone"], "07700 900123", "{raw:?}");
+            }
+        }
+        for prose in [
+            "Typical lead: 2 weeks from survey to install.",
+            "MISLEAD: no.",
+            "Lead time: about a fortnight",
+        ] {
+            let (visible, lead) = split_lead_line(prose);
+            assert_eq!((visible.as_str(), lead.is_none()), (prose, true), "{prose}");
+        }
+    }
+
+    #[test]
+    fn cut_off_json_after_the_marker_is_never_shown() {
+        // QA M2.
+        let (visible, lead) =
+            split_lead_line("Thanks Jo.\nLEAD: {\n  \"name\": \"Jo\",\n  \"phone\": \"07700 9001");
+        assert_eq!((visible.as_str(), lead.is_none()), ("Thanks Jo.", true));
+        // Broken but closed: hidden up to the matching brace, the rest is shown.
+        let (visible, lead) =
+            split_lead_line("Thanks. LEAD: {\"name\": \"Jo\" \"phone\": \"x {}\"} See you soon.");
+        assert_eq!(
+            (visible.as_str(), lead.is_none()),
+            ("Thanks.\nSee you soon.", true)
+        );
+    }
+
+    #[test]
+    fn the_first_lead_is_kept_and_back_to_back_objects_are_hidden() {
+        let (visible, lead) = split_lead_line(
+            r#"Thanks. LEAD: {"name":"First","phone":"07700 900123"} {"name":"Second"} LEAD: {"name":"Third"}"#,
+        );
+        assert_eq!(visible, "Thanks.");
+        assert_eq!(lead.unwrap()["name"], "First");
+    }
+
+    #[test]
+    fn a_lead_keeps_only_contact_details_the_visitor_typed() {
+        // QA M4: a listed business's number from the prompt is not the visitor's.
+        let mut lead = serde_json::Map::new();
+        lead.insert("phone".into(), json!("01204 579975"));
+        lead.insert("email".into(), json!("info@hayvern.example"));
+        assert!(!keep_visitors_contacts(
+            &mut lead,
+            &["Can Hayvern call me? I'm Sam"]
+        ));
+        assert_eq!(
+            (lead["phone"].is_null(), lead["email"].is_null()),
+            (true, true)
+        );
+        // Typed differently is still the visitor's: +44, spaces, upper case.
+        let mut lead = serde_json::Map::new();
+        lead.insert("phone".into(), json!("07700900123"));
+        lead.insert("email".into(), json!("Sam@Example.com"));
+        assert!(keep_visitors_contacts(
+            &mut lead,
+            &["hi", "ring me on +44 7700 900123 or sam@example.com"]
+        ));
+        assert_eq!(lead["phone"], "07700900123");
+        assert_eq!(lead["email"], "Sam@Example.com");
+        // Dashes, brackets and +44 (0) are the same number.
+        for typed in [
+            "07700-900-123",
+            "(07700) 900123",
+            "+44 (0)7700 900123",
+            "0044 7700 900123",
+        ] {
+            let mut lead = serde_json::Map::new();
+            lead.insert("phone".into(), json!("07700 900123"));
+            assert!(
+                keep_visitors_contacts(&mut lead, &[&format!("call me on {typed}")]),
+                "{typed}"
+            );
+        }
+        // An email must be one the visitor typed, not part of one.
+        let mut lead = serde_json::Map::new();
+        lead.insert("email".into(), json!("am@x.co"));
+        assert!(!keep_visitors_contacts(
+            &mut lead,
+            &["email me at sam@x.com"]
+        ));
+        // Part of a longer number doesn't count.
+        let mut lead = serde_json::Map::new();
+        lead.insert("phone".into(), json!("0770090012"));
+        assert!(!keep_visitors_contacts(&mut lead, &["call 07700 900123"]));
+    }
+
+    #[test]
+    fn phones_in_any_common_format_are_read_and_normalised() {
+        for (typed, digits) in [
+            ("07700 900123", "07700900123"),
+            ("07700-900-123", "07700900123"),
+            ("(07700) 900123", "07700900123"),
+            ("+44 (0)7700 900123", "07700900123"),
+            ("+44 7700 900123", "07700900123"),
+            ("0044 7700 900123", "07700900123"),
+            ("01204 579975", "01204579975"),
+        ] {
+            assert_eq!(phone_digits(typed).as_deref(), Some(digits), "{typed}");
+            let found = fallback_contact(&format!("please call me on {typed} thanks"));
+            assert_eq!(
+                found
+                    .and_then(|(_, p)| p)
+                    .and_then(|p| phone_digits(&p))
+                    .as_deref(),
+                Some(digits),
+                "{typed}"
+            );
+        }
+        for not_a_phone in [
+            "2026-10-21",
+            "21-10-2026",
+            "21.10.2026",
+            "12345",
+            "1234567890123456",
+            "+0123",
+        ] {
+            assert_eq!(phone_digits(not_a_phone), None, "{not_a_phone}");
+        }
+        assert_eq!(
+            lead_message("Please call me on (07700) 900-123 about a rewire"),
+            "Please call me about a rewire"
+        );
+    }
+
+    #[test]
+    fn a_number_followed_by_other_digits_is_still_found() {
+        // QA re-review: a digit after the number used to sink the whole match.
+        for text in [
+            "call me 07700 900123 4pm",
+            "07700 900123 - 2pm-4pm, call me",
+            "call me on 07700 900123 2 kids at home",
+            "ring me on 07700-900-123 3 times",
+        ] {
+            let phones: Vec<String> = typed_phones(text).into_iter().map(|(_, d)| d).collect();
+            assert_eq!(phones, ["07700900123"], "{text}");
+            let (_, phone) = fallback_contact(text).expect("a card");
+            assert_eq!(
+                phone.and_then(|p| phone_digits(&p)).as_deref(),
+                Some("07700900123")
+            );
+        }
+        assert_eq!(lead_message("call me 07700 900123 4pm"), "call me 4pm");
+        // Two numbers in one run are both found.
+        let both: Vec<String> = typed_phones("call 07700 900123 01204 579975")
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(both, ["07700900123", "01204579975"]);
+    }
+
+    #[test]
+    fn international_numbers_are_kept() {
+        for (typed, canonical) in [
+            ("+33 1 23 45 67 89", "+33123456789"),
+            ("0033 1 23 45 67 89", "+33123456789"),
+            ("+1 415 555 0100", "+14155550100"),
+            ("+353 87 123 4567", "+353871234567"),
+        ] {
+            assert_eq!(phone_digits(typed).as_deref(), Some(canonical), "{typed}");
+            let text = format!("please call me on {typed}");
+            assert_eq!(typed_phones(&text).len(), 1, "{typed}");
+            let mut lead = serde_json::Map::new();
+            lead.insert("phone".into(), json!(canonical));
+            assert!(keep_visitors_contacts(&mut lead, &[&text]), "{typed}");
+            assert!(
+                fallback_contact(&text).and_then(|(_, p)| p).is_some(),
+                "{typed}"
+            );
+        }
+    }
+
+    #[test]
+    fn dates_and_references_are_not_phones() {
+        for text in [
+            "call me about the visit on 01-11-2026 07:30",
+            "booked for 2026-11-01, please call me",
+            "call me after 21.10.2026",
+            "invoice 0123-456-7890 is wrong",
+        ] {
+            assert!(
+                typed_phones(text).is_empty(),
+                "{text}: {:?}",
+                typed_phones(text)
+            );
+        }
+        // Rule: a number right after a reference word only counts when it's the only number
+        // and the visitor asked to be called.
+        let phones: Vec<String> = typed_phones("invoice 0123-456-7890, call me on 07700 900123")
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(phones, ["07700900123"]);
+        assert_eq!(
+            typed_phones("re invoice 0123-456-7890 please call me").len(),
+            1,
+            "the only number and a call request"
+        );
+    }
+
+    #[test]
+    fn names_are_only_taken_from_a_real_introduction() {
+        // QA M3.
+        for (text, want) in [
+            ("I'm Sam Test (Claude QA), 07700 900123.", Some("Sam Test")),
+            (
+                "my name is Jo Bloggs and I need a rewire",
+                Some("Jo Bloggs"),
+            ),
+            ("This is Priya Shah, ring me", Some("Priya Shah")),
+            ("I am Dave. Call me on 07700 900123", Some("Dave")),
+            ("I'm Sam 07700 900123", Some("Sam")),
+            ("I'm Sam", Some("Sam")),
+            ("It's Sam, call me", None),
+            ("I'm Ready when you are, call me", None),
+            ("I'm Monday free, call me", None),
+            ("I'm Sorry to bother you", None),
+            ("I'm Very keen", None),
+            ("I'm Looking for an electrician", None),
+            ("I'm Gas Safe registered myself", None),
+            ("I'm Urgent", None),
+            ("this is Urgent, call me", None),
+            ("I'm Interested in a rewire", None),
+            ("my name is jo", None),
+            ("I'm Sam Test Smith Jones, call me", None),
+        ] {
+            assert_eq!(name_in_text(text).as_deref(), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_card_message_has_no_dangling_fragments() {
+        for (text, want) in [
+            (
+                "Can someone call me about a rewire in Bolton? I'm Sam Test (Claude QA), 07700 900123.",
+                "Can someone call me about a rewire in Bolton?",
+            ),
+            ("Please call me on 07700 900123", "Please call me"),
+            ("my number is 07700 900123", "Asked to be called back"),
+            (", call me at sam@example.com", "call me"),
+            ("Ring me on 07700 900123 about an EICR", "Ring me about an EICR"),
+            // No name accepted: the introduction stays in the message.
+            ("I'm Sorry, call me on 07700 900123", "I'm Sorry, call me"),
+        ] {
+            assert_eq!(lead_message(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_card_uses_the_visitors_name_and_a_clean_message() {
+        let text =
+            "Can someone call me about a rewire in Bolton? I'm Sam Test (Claude QA), 07700 900123.";
+        assert_eq!(name_in_text(text).as_deref(), Some("Sam Test"));
+        assert_eq!(
+            lead_message(text),
+            "Can someone call me about a rewire in Bolton?"
+        );
+        assert_eq!(name_in_text("my name is jo, call me on 07700 900123"), None);
+        assert_eq!(
+            name_in_text("Hi, this is Priya Shah, ring me").as_deref(),
+            Some("Priya Shah")
+        );
+        assert_eq!(name_in_text("I'm looking for an electrician"), None);
+        assert_eq!(name_in_text("I'm Looking for an electrician"), None);
+        assert_eq!(name_in_text("call me on 07700 900123"), None);
+        assert_eq!(lead_message("07700 900123"), "Asked to be called back");
     }
 
     #[test]

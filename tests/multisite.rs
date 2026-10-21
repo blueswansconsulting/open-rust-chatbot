@@ -1601,3 +1601,185 @@ async fn a_dataset_that_fails_to_parse_keeps_the_previous_one() {
         "previous kept: {p}"
     );
 }
+
+const LIVE_QUESTION: &str =
+    "Can someone call me about a rewire in Bolton? I'm Sam Test (Claude QA), 07700 900123.";
+
+async fn ask_frames(addr: &str, question: &str) -> Vec<Value> {
+    let mut ws = connect(addr, "alpha", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text(question.into())).await.unwrap();
+    until_done(&mut ws).await
+}
+
+fn cards(frames: &[Value]) -> Vec<&Value> {
+    frames.iter().filter(|f| f["type"] == "card").collect()
+}
+
+#[tokio::test]
+async fn the_live_same_line_lead_is_hidden_and_becomes_the_only_card() {
+    let (h, _prompts) = start_text_only(
+        "The directory team can follow up about your rewire request in Bolton. LEAD: {\"name\":\"Sam Test (Claude QA)\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire in Bolton\"}",
+    )
+    .await;
+    let frames = ask_frames(&h.addr, LIVE_QUESTION).await;
+    // No frame sent to the widget carries any of the hidden line.
+    for f in &frames {
+        let s = f.to_string();
+        assert!(!s.contains("LEAD") && !s.contains("best_time"), "{s}");
+    }
+    assert_eq!(
+        text_of(&frames),
+        "The directory team can follow up about your rewire request in Bolton."
+    );
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1, "the parsed lead only, no fallback card");
+    let lead = &cards[0]["card"]["lead"];
+    assert_eq!(lead["name"], "Sam Test (Claude QA)");
+    assert_eq!(lead["phone"], "07700 900123");
+    assert_eq!(lead["message"], "Rewire in Bolton");
+}
+
+#[tokio::test]
+async fn without_a_lead_line_the_fallback_card_has_the_visitors_name_and_a_clean_message() {
+    let (h, _prompts) = start_text_only("The directory team can follow up.").await;
+    let frames = ask_frames(&h.addr, LIVE_QUESTION).await;
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1);
+    let lead = &cards[0]["card"]["lead"];
+    assert_eq!(lead["name"], "Sam Test");
+    assert_eq!(lead["phone"], "07700 900123");
+    assert_eq!(
+        lead["message"],
+        "Can someone call me about a rewire in Bolton?"
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_lead_line_falls_back_to_one_card_from_the_message() {
+    // The model's lead has no phone or email, so it can't be a card; the typed number can.
+    let (h, _prompts) = start_text_only(
+        "Sure. LEAD: {\"name\":\"Sam\",\"phone\":null,\"email\":null,\"best_time\":null,\"message\":null}",
+    )
+    .await;
+    let frames = ask_frames(&h.addr, LIVE_QUESTION).await;
+    assert_eq!(text_of(&frames), "Sure.");
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["card"]["lead"]["phone"], "07700 900123");
+}
+
+#[tokio::test]
+async fn a_lead_with_a_listed_firms_number_from_the_prompt_is_not_used() {
+    // The model copies Hayvern's number (shown in the directory block) into the lead.
+    let (h, prompts) = start_text_only(
+        "The directory team will be in touch. LEAD: {\"name\":\"Sam\",\"phone\":\"+441204579975\",\"email\":null,\"best_time\":null,\"message\":\"Wants Hayvern\"}",
+    )
+    .await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    let mut ws = connect(&h.addr, "dir", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text("Can Hayvern call me? I'm Sam".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut ws).await;
+    assert!(
+        last_prompt(&prompts).contains("+441204579975"),
+        "the number was in the prompt"
+    );
+    assert!(!text_of(&frames).contains("LEAD"));
+    assert!(
+        cards(&frames).is_empty(),
+        "the visitor never gave a number: {frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bold_lowercase_marker_is_hidden_end_to_end() {
+    let (h, _prompts) = start_text_only(
+        "We'll pass that on.\n**lead:** {\"name\":\"Sam Test\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire\"}",
+    )
+    .await;
+    let frames = ask_frames(&h.addr, LIVE_QUESTION).await;
+    assert_eq!(text_of(&frames), "We'll pass that on.");
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["card"]["lead"]["name"], "Sam Test");
+}
+
+const PHONE_FORMATS: [&str; 3] = ["07700-900-123", "(07700) 900123", "+44 (0)7700 900123"];
+
+fn card_digits(card: &Value) -> String {
+    card["card"]["lead"]["phone"]
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_model_lead_is_used_when_the_visitor_typed_the_number_with_dashes_or_brackets() {
+    let (h, _prompts) = start_text_only(
+        "We'll pass that on. LEAD: {\"name\":\"Sam\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire\"}",
+    )
+    .await;
+    for typed in PHONE_FORMATS {
+        let frames = ask_frames(&h.addr, &format!("I'm Sam, please call me on {typed}")).await;
+        let cards = cards(&frames);
+        assert_eq!(cards.len(), 1, "{typed}");
+        assert_eq!(
+            cards[0]["card"]["lead"]["message"], "Rewire",
+            "{typed}: the model's lead"
+        );
+        assert_eq!(card_digits(cards[0]), "07700900123", "{typed}");
+    }
+}
+
+#[tokio::test]
+async fn the_fallback_card_reads_numbers_with_dashes_or_brackets() {
+    let (h, _prompts) = start_text_only("We'll pass that on.").await;
+    for typed in PHONE_FORMATS {
+        let frames = ask_frames(&h.addr, &format!("I'm Sam, please call me on {typed}")).await;
+        let cards = cards(&frames);
+        assert_eq!(cards.len(), 1, "{typed}");
+        assert_eq!(cards[0]["card"]["lead"]["name"], "Sam", "{typed}");
+        let digits = card_digits(cards[0]);
+        assert!(
+            digits == "07700900123" || digits == "4407700900123",
+            "{typed}: {digits}"
+        );
+    }
+}
+
+const DIGITS_AFTER: [&str; 3] = [
+    "I'm Sam, call me 07700 900123 4pm",
+    "I'm Sam, 07700 900123 - 2pm-4pm, please call me",
+    "I'm Sam, call me on 07700 900123 2 kids at home so evenings",
+];
+
+#[tokio::test]
+async fn a_model_lead_survives_digits_typed_after_the_number() {
+    let (h, _prompts) = start_text_only(
+        "We'll pass that on. LEAD: {\"name\":\"Sam\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire\"}",
+    )
+    .await;
+    for question in DIGITS_AFTER {
+        let frames = ask_frames(&h.addr, question).await;
+        let cards = cards(&frames);
+        assert_eq!(cards.len(), 1, "{question}");
+        assert_eq!(cards[0]["card"]["lead"]["message"], "Rewire", "{question}");
+        assert_eq!(card_digits(cards[0]), "07700900123", "{question}");
+    }
+}
+
+#[tokio::test]
+async fn the_fallback_card_survives_digits_typed_after_the_number() {
+    let (h, _prompts) = start_text_only("We'll pass that on.").await;
+    for question in DIGITS_AFTER {
+        let frames = ask_frames(&h.addr, question).await;
+        let cards = cards(&frames);
+        assert_eq!(cards.len(), 1, "{question}");
+        assert_eq!(card_digits(cards[0]), "07700900123", "{question}");
+        assert_eq!(cards[0]["card"]["lead"]["name"], "Sam", "{question}");
+    }
+}

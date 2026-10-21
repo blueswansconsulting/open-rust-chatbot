@@ -19,6 +19,10 @@ All notable changes are documented here. This project follows [Semantic Versioni
   for tool-calling models.
 
 ### Fixed
+- Text-only replies: a `LEAD: {…}` written on the same line as the reply (or pretty-printed, or
+  in a code fence) is now parsed and never shown to the visitor. A parsed lead is the only card
+  offered; the typed-number fallback card now takes the visitor's name ("I'm …", "my name is …",
+  "this is …") and a message without their contact details.
 - Text-only prompts no longer carry the tool-era lead wording ("call propose_lead … name and
   email"): a phone number or an email is enough, a typed phone number with a call-back request
   offers the card, and directory bots say the directory team follows up.
