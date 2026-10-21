@@ -72,7 +72,7 @@ static EMAIL_IN_TEXT: LazyLock<Regex> =
 /// Something that may be a phone number the visitor typed, in any common format ("07700
 /// 900123", "07700-900-123", "(07700) 900123", "+44 (0)7700 900123"); [`phone_digits`] decides.
 static PHONE_IN_TEXT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\+?\(?\d[\d \t().-]{7,22}\d").unwrap());
+    LazyLock::new(|| Regex::new(r"\+?\(?\d[\d \t().-]{7,60}\d").unwrap());
 /// The visitor introducing themselves ("I'm Sam Test", "my name is Jo", "this is Priya Shah"):
 /// the introduction, then up to three capitalised words. What follows is checked in code.
 static NAME_IN_TEXT: LazyLock<Regex> = LazyLock::new(|| {
@@ -87,10 +87,35 @@ sure the a an available back home away out on at with";
 /// The hidden lead marker: `LEAD:`, any case, `LEAD :`, or bold `**LEAD:**`.
 static LEAD_MARKER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(?:\*{1,2})?\bLEAD(?:\*{1,2})?\s*:(?:\*{1,2})?\s*").unwrap());
-/// A phone or email in the visitor's message, with the "on"/"at" before it, for the card text.
-static CONTACT_IN_MESSAGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i:\b(?:on|at|via|is)\s+)?(?:\+?\(?\d[\d \t().-]{7,22}\d|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})").unwrap()
+/// An email in the visitor's message, with the "on"/"at" before it, for the card text.
+static EMAIL_IN_MESSAGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i:\b(?:on|at|via|is|to)\s+)?[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+        .unwrap()
 });
+/// The word before a phone number in the card text ("call me on …").
+static BEFORE_PHONE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:on|at|via|is)\s*$").unwrap());
+/// Digit groups shaped like a date (21-10-2026, 2026.10.21), never a phone.
+static DATE_LIKE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:\d{1,2}[-/.]\d{1,2}[-/.]\d{4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})").unwrap()
+});
+/// Words that make the number after them a reference, not a phone ("invoice 0123-456-7890").
+const REFERENCE_WORDS: [&str; 14] = [
+    "invoice",
+    "inv",
+    "ref",
+    "reference",
+    "order",
+    "account",
+    "acc",
+    "policy",
+    "booking",
+    "ticket",
+    "job",
+    "case",
+    "quote",
+    "membership",
+];
 /// The visitor asking to be called back, so a phone number they typed is a lead.
 static CALL_ME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:call|ring|phone|text|contact)\s+(?:me|us)\b|\bcall[- ]?back\b|\bget (?:back )?in touch\b").unwrap()
@@ -127,13 +152,79 @@ fn fallback_contact(text: &str) -> Option<(Option<String>, Option<String>)> {
 }
 
 /// UK phone numbers in `text`: (as typed, digits with a leading 0).
+///
+/// Each run of digits and separators is cut at its separators: from each start, the longest
+/// part that is a phone number counts ("07700 900123 4pm" gives "07700 900123"), and scanning
+/// goes on after it, so two numbers in one run are both found. Groups shaped like a date are
+/// skipped. A number straight after a reference word ("invoice 0123-456-7890") is not a phone,
+/// unless it is the only number in the message and the visitor asked to be called.
 fn typed_phones(text: &str) -> Vec<(String, String)> {
-    PHONE_IN_TEXT
-        .find_iter(text)
-        .filter_map(|m| {
-            let typed = m.as_str().trim().to_owned();
-            phone_digits(&typed).map(|digits| (typed, digits))
-        })
+    typed_phone_spans(text)
+        .into_iter()
+        .map(|(range, digits)| (text[range].to_owned(), digits))
+        .collect()
+}
+
+/// Like [`typed_phones`], with where each number is in `text`.
+fn typed_phone_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut found: Vec<(std::ops::Range<usize>, String, bool)> = Vec::new();
+    for m in PHONE_IN_TEXT.find_iter(text) {
+        let run = m.as_str();
+        let separator = |c: char| " \t().-".contains(c);
+        // Where a part may start (a digit, '+' or '(' after a separator) and end (after a digit).
+        let starts: Vec<usize> = run
+            .char_indices()
+            .filter(|&(i, c)| {
+                let prev = run[..i].chars().last();
+                (c.is_ascii_digit() || c == '+' || c == '(')
+                    && prev.is_none_or(|p| separator(p) && p != '(' || p == ')')
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let ends: Vec<usize> = run
+            .char_indices()
+            .filter(|&(i, c)| {
+                (c.is_ascii_digit() || c == ')')
+                    && run[i + c.len_utf8()..].chars().next().is_none_or(separator)
+            })
+            .map(|(i, c)| i + c.len_utf8())
+            .collect();
+        let mut from = 0; // byte offset in `run` scanning has reached
+        for &start in &starts {
+            if start < from {
+                continue;
+            }
+            if let Some(date) = DATE_LIKE.find(&run[start..]) {
+                from = start + date.end();
+                continue;
+            }
+            let best = ends
+                .iter()
+                .rev()
+                .filter(|&&end| end > start)
+                .find_map(|&end| {
+                    let part = run[start..end].trim();
+                    phone_digits(part).map(|digits| (end, digits))
+                });
+            if let Some((end, digits)) = best {
+                let at = m.start() + start;
+                let before = text[..at].to_lowercase();
+                let reference = before
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| !w.is_empty())
+                    .rev()
+                    .take(2)
+                    .any(|w| REFERENCE_WORDS.contains(&w));
+                found.push((at..m.start() + end, digits, reference));
+                from = end;
+            }
+        }
+    }
+    let only_one_and_asked = found.len() == 1 && CALL_ME.is_match(text);
+    found
+        .into_iter()
+        .filter(|(_, _, reference)| !reference || only_one_and_asked)
+        .map(|(range, digits, _)| (range, digits))
         .collect()
 }
 
@@ -195,7 +286,14 @@ fn lead_message(text: &str) -> String {
         }
         out.replace_range(range.start..end, " ");
     }
-    out = CONTACT_IN_MESSAGE.replace_all(&out, " ").into_owned();
+    // The numbers found (and the "on" before each), last first so earlier offsets stay valid.
+    for (range, _) in typed_phone_spans(&out).into_iter().rev() {
+        let start = BEFORE_PHONE
+            .find(&out[..range.start])
+            .map_or(range.start, |m| m.start());
+        out.replace_range(start..range.end, " ");
+    }
+    out = EMAIL_IN_MESSAGE.replace_all(&out, " ").into_owned();
     let joined = out.split_whitespace().collect::<Vec<_>>().join(" ");
     // Rejoin, dropping spaces before punctuation and punctuation left dangling after other
     // punctuation ("Bolton? , ." -> "Bolton?").
@@ -324,20 +422,37 @@ pub(crate) fn split_lead_line(raw: &str) -> (String, Option<serde_json::Map<Stri
     (visible.trim().to_owned(), lead)
 }
 
-/// The digits of a UK phone number with a leading 0 ("+44 (0)7700 900123", "0044 7700
-/// 900123" and "07700-900-123" all give "07700900123"), or None if it isn't one.
+/// A phone number in one canonical form, or None if it isn't one:
+/// - UK numbers as digits with a leading 0 ("+44 (0)7700 900123", "0044 7700 900123" and
+///   "07700-900-123" all give "07700900123");
+/// - other international numbers written with + or 00 as E.164 ("+33 1 23 45 67 89" gives
+///   "+33123456789"), 8 to 15 digits.
 fn phone_digits(phone: &str) -> Option<String> {
+    let phone = phone.trim();
+    if DATE_LIKE.is_match(phone) {
+        return None;
+    }
     let mut digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+    let mut international = phone.starts_with('+');
     if let Some(rest) = digits.strip_prefix("00") {
         digits = rest.to_owned();
+        international = true;
     }
-    if let Some(rest) = digits.strip_prefix("44") {
+    if let Some(rest) = digits
+        .strip_prefix("44")
+        .filter(|_| international || digits.len() == 12)
+    {
         // "+44 (0)7700…" keeps its 0; "+44 7700…" gets one.
         digits = if rest.starts_with('0') {
             rest.to_owned()
         } else {
             format!("0{rest}")
         };
+        international = false;
+    }
+    if international {
+        return (!digits.starts_with('0') && (8..=15).contains(&digits.len()))
+            .then(|| format!("+{digits}"));
     }
     (digits.starts_with('0') && (10..=11).contains(&digits.len())).then_some(digits)
 }
@@ -1096,12 +1211,94 @@ mod tests {
                 "{typed}"
             );
         }
-        for not_a_phone in ["2026-10-21", "12345", "1234567890123456"] {
+        for not_a_phone in [
+            "2026-10-21",
+            "21-10-2026",
+            "21.10.2026",
+            "12345",
+            "1234567890123456",
+            "+0123",
+        ] {
             assert_eq!(phone_digits(not_a_phone), None, "{not_a_phone}");
         }
         assert_eq!(
             lead_message("Please call me on (07700) 900-123 about a rewire"),
             "Please call me about a rewire"
+        );
+    }
+
+    #[test]
+    fn a_number_followed_by_other_digits_is_still_found() {
+        // QA re-review: a digit after the number used to sink the whole match.
+        for text in [
+            "call me 07700 900123 4pm",
+            "07700 900123 - 2pm-4pm, call me",
+            "call me on 07700 900123 2 kids at home",
+            "ring me on 07700-900-123 3 times",
+        ] {
+            let phones: Vec<String> = typed_phones(text).into_iter().map(|(_, d)| d).collect();
+            assert_eq!(phones, ["07700900123"], "{text}");
+            let (_, phone) = fallback_contact(text).expect("a card");
+            assert_eq!(
+                phone.and_then(|p| phone_digits(&p)).as_deref(),
+                Some("07700900123")
+            );
+        }
+        assert_eq!(lead_message("call me 07700 900123 4pm"), "call me 4pm");
+        // Two numbers in one run are both found.
+        let both: Vec<String> = typed_phones("call 07700 900123 01204 579975")
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(both, ["07700900123", "01204579975"]);
+    }
+
+    #[test]
+    fn international_numbers_are_kept() {
+        for (typed, canonical) in [
+            ("+33 1 23 45 67 89", "+33123456789"),
+            ("0033 1 23 45 67 89", "+33123456789"),
+            ("+1 415 555 0100", "+14155550100"),
+            ("+353 87 123 4567", "+353871234567"),
+        ] {
+            assert_eq!(phone_digits(typed).as_deref(), Some(canonical), "{typed}");
+            let text = format!("please call me on {typed}");
+            assert_eq!(typed_phones(&text).len(), 1, "{typed}");
+            let mut lead = serde_json::Map::new();
+            lead.insert("phone".into(), json!(canonical));
+            assert!(keep_visitors_contacts(&mut lead, &[&text]), "{typed}");
+            assert!(
+                fallback_contact(&text).and_then(|(_, p)| p).is_some(),
+                "{typed}"
+            );
+        }
+    }
+
+    #[test]
+    fn dates_and_references_are_not_phones() {
+        for text in [
+            "call me about the visit on 01-11-2026 07:30",
+            "booked for 2026-11-01, please call me",
+            "call me after 21.10.2026",
+            "invoice 0123-456-7890 is wrong",
+        ] {
+            assert!(
+                typed_phones(text).is_empty(),
+                "{text}: {:?}",
+                typed_phones(text)
+            );
+        }
+        // Rule: a number right after a reference word only counts when it's the only number
+        // and the visitor asked to be called.
+        let phones: Vec<String> = typed_phones("invoice 0123-456-7890, call me on 07700 900123")
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(phones, ["07700900123"]);
+        assert_eq!(
+            typed_phones("re invoice 0123-456-7890 please call me").len(),
+            1,
+            "the only number and a call request"
         );
     }
 

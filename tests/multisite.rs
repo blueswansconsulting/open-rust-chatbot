@@ -1750,3 +1750,36 @@ async fn the_fallback_card_reads_numbers_with_dashes_or_brackets() {
         );
     }
 }
+
+const DIGITS_AFTER: [&str; 3] = [
+    "I'm Sam, call me 07700 900123 4pm",
+    "I'm Sam, 07700 900123 - 2pm-4pm, please call me",
+    "I'm Sam, call me on 07700 900123 2 kids at home so evenings",
+];
+
+#[tokio::test]
+async fn a_model_lead_survives_digits_typed_after_the_number() {
+    let (h, _prompts) = start_text_only(
+        "We'll pass that on. LEAD: {\"name\":\"Sam\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire\"}",
+    )
+    .await;
+    for question in DIGITS_AFTER {
+        let frames = ask_frames(&h.addr, question).await;
+        let cards = cards(&frames);
+        assert_eq!(cards.len(), 1, "{question}");
+        assert_eq!(cards[0]["card"]["lead"]["message"], "Rewire", "{question}");
+        assert_eq!(card_digits(cards[0]), "07700900123", "{question}");
+    }
+}
+
+#[tokio::test]
+async fn the_fallback_card_survives_digits_typed_after_the_number() {
+    let (h, _prompts) = start_text_only("We'll pass that on.").await;
+    for question in DIGITS_AFTER {
+        let frames = ask_frames(&h.addr, question).await;
+        let cards = cards(&frames);
+        assert_eq!(cards.len(), 1, "{question}");
+        assert_eq!(card_digits(cards[0]), "07700900123", "{question}");
+        assert_eq!(cards[0]["card"]["lead"]["name"], "Sam", "{question}");
+    }
+}
