@@ -76,14 +76,16 @@ static PHONE_IN_TEXT: LazyLock<Regex> =
 /// The visitor introducing themselves ("I'm Sam Test", "my name is Jo", "this is Priya Shah"):
 /// the introduction, then up to three capitalised words. What follows is checked in code.
 static NAME_IN_TEXT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i:\b(?:my name is|i['\u{2019}]m|i am|this is)\s+)(\p{Lu}[\p{L}'\u{2019}-]*(?:[ \t]+\p{Lu}[\p{L}'\u{2019}-]*){0,2})").unwrap()
+    Regex::new(r"(?i:\b((?:my )?name is|(?:my )?name['\u{2019}]s|i['\u{2019}]m|i am|this is)\s+)(\p{Lu}[\p{L}'\u{2019}-]*(?:[ \t]+\p{Lu}[\p{L}'\u{2019}-]*){0,2})").unwrap()
 });
 /// Capitalised words after "I'm" that are not a name ("I'm Looking for…", "I'm Sorry").
 const NOT_A_NAME: &str =
     "monday tuesday wednesday thursday friday saturday sunday january february \
 march april may june july august september october november december ready very also unsure \
 urgent sorry looking gas safe here interested after just not based in from wondering hoping trying \
-sure the a an available back home away out on at with";
+sure the a an available back home away out on at with retired desperate worried stuck disabled \
+elderly pregnant confused moving renting new local keen glad happy stressed struggling frustrated \
+exhausted freezing important";
 /// The hidden lead marker: `LEAD:`, any case, `LEAD :`, or bold `**LEAD:**`.
 static LEAD_MARKER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(?:\*{1,2})?\bLEAD(?:\*{1,2})?\s*:(?:\*{1,2})?\s*").unwrap());
@@ -99,7 +101,8 @@ static BEFORE_PHONE: LazyLock<Regex> =
 static DATE_LIKE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:\d{1,2}[-/.]\d{1,2}[-/.]\d{4}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})").unwrap()
 });
-/// Words that make the number after them a reference, not a phone ("invoice 0123-456-7890").
+/// Words that make the number straight after them a reference, not a phone ("invoice
+/// 0123-456-7890"), unless the number is phone-shaped (a UK mobile, or written with +/00).
 const REFERENCE_WORDS: [&str; 14] = [
     "invoice",
     "inv",
@@ -116,10 +119,77 @@ const REFERENCE_WORDS: [&str; 14] = [
     "quote",
     "membership",
 ];
-/// The visitor asking to be called back, so a phone number they typed is a lead.
+/// Words that may sit between a reference word and its number ("job no. 1234").
+const REFERENCE_FILLERS: [&str; 5] = ["no", "number", "num", "nr", "id"];
+/// The visitor asking to be called back, anywhere in the message, so a phone number they typed
+/// is a lead: "call me", "call back", "give me a ring", "can you call?", "please ring 0…",
+/// "ask them to ring …".
 static CALL_ME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:call|ring|phone|text|contact)\s+(?:me|us)\b|\bcall[- ]?back\b|\bget (?:back )?in touch\b").unwrap()
+    Regex::new(r"(?i)\b(?:call|ring|phone|text|contact|bell)\s+(?:me|us)\b|\bcall[- ]?back\b|\bget (?:back )?in touch\b|\bgive (?:me|us) a (?:ring|bell|call|buzz)\b|\bask\s+(?:them|him|her|someone|somebody|[\w']+)\s+to\s+(?:call|ring|phone|text)\b|\b(?:please|pls|plz|(?:can|could|would|will)\s+(?:you|someone|somebody|anyone)(?:\s+please)?)\s+(?:call|ring|phone|text)(?:\s+(?:on|at))?\s*(?:$|[\d+(?.!,])").unwrap()
 });
+/// A bare "call"/"ring" straight before a number ("call 07700 900123", "please ring on …"), at
+/// the start of a sentence or after "please" or a greeting; never "I'll just call", "tried to
+/// call", "the call".
+static CALL_BEFORE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[.,!?;:\n]\s*|\b(?:please|pls|plz|hi|hello|hey|kindly)\s+)(?:call|ring|phone|text)(?:\s+(?:me|us))?(?:\s+(?:back|on|at))*\s*[:-]?\s*$").unwrap()
+});
+/// "call"/"ring" straight after a number ("07700 900123, please call"): the verb and the word
+/// after it.
+static CALL_AFTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^\s*[,.;:\-\u{2013}\u{2014}]?\s*(?:(?:please|pls|plz)\s+)?(call|ring|phone|text)\b\s*([A-Za-z']+)?",
+    )
+    .unwrap()
+});
+/// Words after "call"/"ring" + number that make it about the number, not a request.
+const NOT_AFTER_CALL: [&str; 16] = [
+    "them", "him", "her", "it", "they", "the", "that", "this", "a", "number", "line", "is", "was",
+    "went", "dropped", "log",
+];
+/// The visitor pointing at their own number: "call me on …", "my mobile is …", "number: …".
+static OWN_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:\b(?:me|us)\s+(?:on|at)|\bmy\s+(?:mobile|number|phone|tel|landline|no)(?:\s+(?:number|no))?(?:\s+is|'s|\u{2019}s)?|\b(?:mobile|number|tel|phone)\s*[:-])\s*[:-]?\s*$").unwrap()
+});
+/// A number that belongs to someone else: "call them on …", "their number is …".
+static THIRD_PARTY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:\b(?:call|ring|phone|rang|called|phoned|try|tried|contact|contacted)\s+(?:them|him|her)\s+(?:on|at)|\b(?:their|his|her)\s+(?:number|phone|mobile|landline|tel|no|office)(?:\s+(?:number|no))?(?:\s+(?:is|was)|'s|\u{2019}s)?|\b[\w-]+['\u{2019}]s\s+(?:office|number|phone|mobile|landline|tel)(?:\s+(?:number|no))?\s+(?:is|was))\s*[:-]?\s*$").unwrap()
+});
+/// A number the visitor already tried: "tried to call 0161…", "I rang 0161…".
+static PAST_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:(?:tried|trying|try)\s+(?:to\s+)?(?:call|ring|phone|calling|ringing|phoning|get\s+through\s+to)|keep\s+(?:calling|ringing|phoning)|called|rang|phoned|dialled|dialed)(?:\s+(?:on|at))?\s*$").unwrap()
+});
+/// When the visitor wants the call: "4pm", "after 4pm", "between 2pm and 4pm", "12-2pm",
+/// "10:30", "tomorrow morning", "Monday to Friday", "weekday evenings", "anytime". Only times
+/// next to the call request or the number count (see [`call_times`]).
+static TIME_IN_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:(?:after|before|from|at|around|about|by|until|till|between)\s+)?(?:[0-9]{1,2}(?:[:.][0-9]{2})?\s*(?:am|pm)?\s*(?:-|\u{2013}|to|and)\s*[0-9]{1,2}(?:[:.][0-9]{2})?\s*(?:am|pm)\b|[0-9]{1,2}(?:[:.][0-9]{2})?\s*(?:am|pm)\b|[0-9]{1,2}:[0-9]{2}\b|noon\b|midday\b|lunchtime\b)|\b(?:on\s+)?(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?\s*(?:-|\u{2013}|to)\s*(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*|(?:this|any)\s+(?:morning|afternoon|evening)|tonight|tomorrow(?:\s+(?:morning|afternoon|evening))?|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?(?:\s+(?:mornings?|afternoons?|evenings?))?|(?:weekdays?|weekends?)(?:\s+(?:mornings?|afternoons?|evenings?))?|mornings|afternoons|evenings|any\s?time)\b").unwrap()
+});
+/// "after 5", "before 9": an hour without am/pm, checked in code so "after 5 years" isn't one.
+static BARE_HOUR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:after|before|from|around|by|until|till)\s+([0-9]{1,2})\b").unwrap()
+});
+/// Words that may follow a bare hour ("after 5 please").
+const AFTER_BARE_HOUR: [&str; 10] = [
+    "please", "pls", "thanks", "thank", "ish", "o'clock", "if", "today", "tomorrow", "tonight",
+];
+/// The call request a call-back time sits next to ("call me back after 4pm").
+static CALL_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:call|ring|phone|text|contact)(?:\s+(?:me|us))?(?:\s+back)?\b|\bcall[- ]?back\b|\bgive (?:me|us) a (?:ring|bell|call|buzz)\b|\bget (?:back )?in touch\b").unwrap()
+});
+/// Words that may sit between a call request (or number) and its time ("call me on … after 4").
+const TIME_GAP_WORDS: [&str; 11] = [
+    "on", "at", "me", "us", "back", "please", "pls", "any", "or", "and", "from",
+];
+/// A greeting or connector left at the start of the card text ("Hi", "and", "So,").
+static LEADING_FILLER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:(?:hi|hello|hey|hiya|good\s+(?:morning|afternoon|evening))(?:\s+there)?\b[\s,;:.!?\-\u{2013}\u{2014}]*|(?:and|but)\b[\s,]*|(?:morning|so|also|then|ok|okay|yes|yeah|well)\s*[,!.]+\s*)").unwrap()
+});
+/// Common first names that are also English words ("I'm Dawn", "I'm Grant").
+const WORD_FIRST_NAMES: &str = "dawn faith hope joy penny ray drew lance guy grant ivy brook \
+rose heath cliff rich gene wade chase sunny summer autumn violet daisy poppy lily iris pearl ruby \
+amber jade crystal hazel heather ginger robin jay dean mark bill frank miles rob pat sue sky reed \
+glen grace will max mo carol rod sandy bob joe kim jack hunter mason carter cole dale gale \
+skye dan al ed basil don ted roy sid art nat val viv bea";
 
 fn send(tx: &Sender, frame: Value) {
     let _ = tx.send(frame.to_string());
@@ -131,23 +201,90 @@ const TEXT_ONLY_LEAD_INSTRUCTIONS: &str = "\n\nCall-back requests: when, and onl
 const TEXT_ONLY_DIRECTORY_LEADS: &str = " This site is a directory: a call-back request goes to the directory team, who follow up themselves. Say so, and never say a listed business has been told, will call, or has been booked.";
 
 /// Contact details a visitor typed: an email, or a phone number when they ask to be called.
+#[cfg(test)]
 fn fallback_contact(text: &str) -> Option<(Option<String>, Option<String>)> {
-    let email = EMAIL_IN_TEXT.find(text).map(|m| m.as_str().to_owned());
-    let phone = typed_phones(text)
-        .into_iter()
-        .next()
-        .filter(|_| CALL_ME.is_match(text))
-        .map(|(typed, digits)| {
-            // As typed when the card accepts it ("(07700) 900123"), else plain digits.
-            if typed
-                .chars()
-                .all(|c| c.is_ascii_digit() || " ()+-".contains(c))
-            {
-                typed
-            } else {
-                digits
+    fallback_contact_checked(text, &|_| false)
+}
+
+/// True if "call"/"ring" sits right before or after the number at `range`.
+fn call_next_to(text: &str, range: &std::ops::Range<usize>) -> bool {
+    CALL_BEFORE.is_match(&text[..range.start]) || call_after(text, range)
+}
+
+/// True if "call"/"ring" sits right after the number at `range` ("07700 900123, call me"), and
+/// is not the start of another number's "call me on …".
+fn call_after(text: &str, range: &std::ops::Range<usize>) -> bool {
+    let after = &text[range.end..];
+    CALL_AFTER.captures(after).is_some_and(|c| {
+        let rest = after[c.get(0).map_or(0, |m| m.end())..].trim_start();
+        let lead_in = rest.to_lowercase();
+        if c.get(2)
+            .is_some_and(|w| ["me", "us"].contains(&w.as_str().to_lowercase().as_str()))
+            && (lead_in.starts_with("on ")
+                || lead_in.starts_with("at ")
+                || lead_in.starts_with(':'))
+        {
+            return false;
+        }
+        let verb = c[1].to_lowercase();
+        let next = c.get(2).map(|w| w.as_str().to_lowercase());
+        match next.as_deref() {
+            None => true,
+            // "phone"/"text" + a word is usually a noun ("phone number", "text message").
+            Some(w) if verb == "phone" || verb == "text" => {
+                ["me", "us", "back", "please", "pls"].contains(&w)
             }
-        });
+            Some(w) => !NOT_AFTER_CALL.contains(&w),
+        }
+    })
+}
+
+/// Like [`fallback_contact`]. A phone number counts when the visitor asks to be called (anywhere
+/// in the message, or with "call"/"ring" right next to it), it isn't someone else's ("call them
+/// on …", "their number is …") or one they already tried ("tried to call …"), and
+/// `is_business` (a listed business's, the knowledge base's or the assistant's number) is false.
+/// A number next to the request ("call me on …", "my mobile is …") is preferred to one that is
+/// merely in the same message.
+fn fallback_contact_checked(
+    text: &str,
+    is_business: &dyn Fn(&str) -> bool,
+) -> Option<(Option<String>, Option<String>)> {
+    let email = EMAIL_IN_TEXT.find(text).map(|m| m.as_str().to_owned());
+    let asked = CALL_ME.is_match(text);
+    let mut best: Option<(u8, std::ops::Range<usize>, String)> = None;
+    for (range, digits) in typed_phone_spans(text) {
+        let before = &text[..range.start];
+        if THIRD_PARTY.is_match(before) || PAST_CALL.is_match(before) {
+            continue;
+        }
+        let next_to = call_next_to(text, &range);
+        if !(asked || next_to) {
+            continue;
+        }
+        let rank = if CALL_BEFORE.is_match(before) || OWN_NUMBER.is_match(before) {
+            0
+        } else if next_to {
+            1
+        } else {
+            2
+        };
+        if best.as_ref().is_some_and(|b| b.0 <= rank) || is_business(&digits) {
+            continue;
+        }
+        best = Some((rank, range, digits));
+    }
+    let phone = best.map(|(_, range, digits)| {
+        let typed = &text[range];
+        // As typed when the card accepts it ("(07700) 900123"), else plain digits.
+        if typed
+            .chars()
+            .all(|c| c.is_ascii_digit() || " ()+-".contains(c))
+        {
+            typed.to_owned()
+        } else {
+            digits
+        }
+    });
     (email.is_some() || phone.is_some()).then_some((email, phone))
 }
 
@@ -156,8 +293,9 @@ fn fallback_contact(text: &str) -> Option<(Option<String>, Option<String>)> {
 /// Each run of digits and separators is cut at its separators: from each start, the longest
 /// part that is a phone number counts ("07700 900123 4pm" gives "07700 900123"), and scanning
 /// goes on after it, so two numbers in one run are both found. Groups shaped like a date are
-/// skipped. A number straight after a reference word ("invoice 0123-456-7890") is not a phone,
-/// unless it is the only number in the message and the visitor asked to be called.
+/// skipped. A number straight after a reference word ("invoice 0123-456-7890", "job no. 1234…")
+/// is not a phone, unless it is phone-shaped (a UK mobile, or written with + or 00) or it is the
+/// only number in the message and the visitor asked to be called.
 fn typed_phones(text: &str) -> Vec<(String, String)> {
     typed_phone_spans(text)
         .into_iter()
@@ -167,6 +305,17 @@ fn typed_phones(text: &str) -> Vec<(String, String)> {
 
 /// Like [`typed_phones`], with where each number is in `text`.
 fn typed_phone_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    phone_spans(text, false)
+}
+
+/// Every phone number in `text`, references included (for business numbers in the KB).
+fn all_phone_digits(text: &str) -> impl Iterator<Item = String> {
+    phone_spans(text, true)
+        .into_iter()
+        .map(|(_, digits)| digits)
+}
+
+fn phone_spans(text: &str, keep_references: bool) -> Vec<(std::ops::Range<usize>, String)> {
     let mut found: Vec<(std::ops::Range<usize>, String, bool)> = Vec::new();
     for m in PHONE_IN_TEXT.find_iter(text) {
         let run = m.as_str();
@@ -209,21 +358,31 @@ fn typed_phone_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
             if let Some((end, digits)) = best {
                 let at = m.start() + start;
                 let before = text[..at].to_lowercase();
-                let reference = before
+                let words: Vec<&str> = before
                     .split(|c: char| !c.is_alphanumeric())
                     .filter(|w| !w.is_empty())
                     .rev()
                     .take(2)
-                    .any(|w| REFERENCE_WORDS.contains(&w));
+                    .collect();
+                let after_reference = match words.as_slice() {
+                    [w, ..] if REFERENCE_WORDS.contains(w) => true,
+                    [f, w] => REFERENCE_FILLERS.contains(f) && REFERENCE_WORDS.contains(w),
+                    _ => false,
+                };
+                let part = run[start..end].trim_start_matches('(');
+                let phone_shaped = (digits.starts_with("07") && digits.len() == 11)
+                    || part.starts_with('+')
+                    || part.starts_with("00");
+                let reference = after_reference && !phone_shaped;
                 found.push((at..m.start() + end, digits, reference));
                 from = end;
             }
         }
     }
-    let only_one_and_asked = found.len() == 1 && CALL_ME.is_match(text);
+    let keep_references = keep_references || found.len() == 1 && CALL_ME.is_match(text);
     found
         .into_iter()
-        .filter(|(_, _, reference)| !reference || only_one_and_asked)
+        .filter(|(_, _, reference)| !reference || keep_references)
         .map(|(range, digits, _)| (range, digits))
         .collect()
 }
@@ -234,7 +393,18 @@ fn typed_phone_spans(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
 fn introduced_name(text: &str) -> Option<(String, std::ops::Range<usize>)> {
     let not_a_name: std::collections::HashSet<&str> = NOT_A_NAME.split_whitespace().collect();
     for c in NAME_IN_TEXT.captures_iter(text) {
-        let (whole, name) = (c.get(0)?, c.get(1)?);
+        let (whole, intro, name) = (c.get(0)?, c.get(1)?, c.get(2)?);
+        // After "my name is" any capitalised word is a name; after "I'm" an everyday word
+        // ("Retired", "Desperate") is not, unless it is also a first name ("Grace", "Will").
+        let intro_lower = intro.as_str().to_lowercase();
+        let named = intro_lower.contains("name");
+        // A bare "name is" ("the company name is …") only counts at the start of a sentence.
+        if named && !intro_lower.starts_with("my") {
+            let before = text[..intro.start()].trim_end();
+            if !(before.is_empty() || before.ends_with(['.', '!', '?', ','])) {
+                continue;
+            }
+        }
         // Try the longest run of capitalised words first, then shorter ones.
         let words: Vec<(usize, usize)> = name
             .as_str()
@@ -256,7 +426,30 @@ fn introduced_name(text: &str) -> Option<(String, std::ops::Range<usize>)> {
             let stop = candidate
                 .split_whitespace()
                 .any(|w| not_a_name.contains(w.to_lowercase().as_str()));
-            if follows && !stop {
+            // Everyday words ("Retired", "Hard Of Hearing"), unless one is a first name ("Grant
+            // Ward", "Rose Smith").
+            let first = |w: &str| {
+                crate::listings::first_name(w)
+                    || WORD_FIRST_NAMES.split_whitespace().any(|n| n == w)
+            };
+            let words: Vec<String> = candidate
+                .split_whitespace()
+                .map(|w| {
+                    w.to_lowercase()
+                        .trim_end_matches(['\'', '\u{2019}', '-'])
+                        .to_owned()
+                })
+                .collect();
+            let everyday = !named
+                && !words.iter().any(|w| first(w))
+                && if n == 1 {
+                    crate::listings::english_word(&words[0])
+                } else {
+                    words
+                        .iter()
+                        .all(|w| w.chars().count() < 3 || crate::listings::english_word(w))
+                };
+            if follows && !stop && !everyday {
                 let name = candidate
                     .trim_end_matches(['\'', '\u{2019}', '-'])
                     .to_owned();
@@ -271,27 +464,154 @@ fn name_in_text(text: &str) -> Option<String> {
     introduced_name(text).map(|(name, _)| name)
 }
 
-/// The visitor's message for the card, without the contact details and (when a name was taken
-/// from it) the self-introduction it repeats ("Can someone call me about a rewire in Bolton?").
-fn lead_message(text: &str) -> String {
+/// `text` with each phone number in it replaced by '#'s (same length, so offsets still hold):
+/// their digits are not read as times, and "on" before a number never joins a time after it.
+fn blank_phones(text: &str) -> (String, Vec<std::ops::Range<usize>>) {
+    let spans: Vec<std::ops::Range<usize>> = typed_phone_spans(text)
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect();
     let mut out = text.to_owned();
-    if let Some((_, range)) = introduced_name(&out) {
-        // Drop the introduction and a bracketed aside right after it ("(Claude QA)").
+    for range in spans.iter().rev() {
+        out.replace_range(range.clone(), &"#".repeat(range.len()));
+    }
+    (out, spans)
+}
+
+/// Where the times in `text` are ("after 4pm", "tomorrow morning", "after 5").
+fn time_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans: Vec<std::ops::Range<usize>> =
+        TIME_IN_TEXT.find_iter(text).map(|m| m.range()).collect();
+    for c in BARE_HOUR.captures_iter(text) {
+        let (Some(whole), Some(hour)) = (c.get(0), c.get(1)) else {
+            continue;
+        };
+        if hour
+            .as_str()
+            .parse::<u8>()
+            .map_or(true, |h| !(1..=12).contains(&h))
+            || spans
+                .iter()
+                .any(|s| s.start < whole.end() && whole.start() < s.end)
+        {
+            continue;
+        }
+        let rest = text[whole.end()..].trim_start();
+        let next: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '\'')
+            .collect::<String>()
+            .to_lowercase();
+        let ends = !rest.starts_with(|c: char| c.is_alphanumeric());
+        if ends || AFTER_BARE_HOUR.contains(&next.as_str()) {
+            spans.push(whole.range());
+        }
+    }
+    spans.sort_by_key(|s| s.start);
+    spans
+}
+
+/// True if only a word or two like "on", "back" or "please" (and no full stop) sits between
+/// `a` and `b`.
+fn next_to(text: &str, a: &std::ops::Range<usize>, b: &std::ops::Range<usize>) -> bool {
+    let gap = if a.end <= b.start {
+        &text[a.end..b.start]
+    } else if b.end <= a.start {
+        // A time before the request needs no comma between ("since Monday, call me" isn't one).
+        let gap = &text[b.end..a.start];
+        if gap.contains(',') {
+            return false;
+        }
+        gap
+    } else {
+        return true;
+    };
+    !gap.contains(['.', ';', '!', '?', '\n'])
+        && gap
+            .split_whitespace()
+            .filter(|w| w.chars().any(char::is_alphanumeric))
+            .count()
+            <= 2
+        && gap
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|w| w.chars().any(char::is_alphanumeric))
+            .all(|w| TIME_GAP_WORDS.contains(&w.to_lowercase().as_str()))
+}
+
+/// The call-back times in `text`: times next to the call request or the number ("call me back
+/// after 4pm", "07700 900123 tomorrow morning"), or next to such a time. "My boiler broke on
+/// Monday, call me" keeps its Monday.
+fn call_times(text: &str) -> Vec<std::ops::Range<usize>> {
+    let (blanked, phones) = blank_phones(text);
+    let mut anchors: Vec<std::ops::Range<usize>> = phones;
+    anchors.extend(CALL_ANCHOR.find_iter(&blanked).map(|m| m.range()));
+    let candidates = time_spans(&blanked);
+    let mut taken = vec![false; candidates.len()];
+    loop {
+        let mut changed = false;
+        for (i, t) in candidates.iter().enumerate() {
+            if !taken[i] && anchors.iter().any(|a| next_to(&blanked, a, t)) {
+                taken[i] = true;
+                anchors.push(t.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    candidates
+        .into_iter()
+        .zip(taken)
+        .filter_map(|(t, taken)| taken.then_some(t))
+        .collect()
+}
+
+/// When the visitor asked to be called, for the card's best time ("after 4pm").
+fn best_time(text: &str) -> Option<String> {
+    let times: Vec<String> = call_times(text)
+        .into_iter()
+        .map(|r| text[r].split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    (!times.is_empty()).then(|| times.join(", ").chars().take(100).collect())
+}
+
+/// The visitor's message for the card, without the contact details, the call-back time and
+/// (when a name was taken from it) the self-introduction it repeats ("Can someone call me about
+/// a rewire in Bolton?").
+fn lead_message(text: &str) -> String {
+    let mut cut: Vec<std::ops::Range<usize>> = Vec::new();
+    if let Some((_, range)) = introduced_name(text) {
+        // The introduction and a bracketed aside right after it ("(Claude QA)").
         let mut end = range.end;
-        let rest = &out[end..];
+        let rest = &text[end..];
         if let Some(stripped) = rest.trim_start().strip_prefix('(') {
             if let Some(close) = stripped.find(')') {
                 end += rest.len() - stripped.len() + close + 1;
             }
         }
-        out.replace_range(range.start..end, " ");
+        cut.push(range.start..end);
     }
-    // The numbers found (and the "on" before each), last first so earlier offsets stay valid.
-    for (range, _) in typed_phone_spans(&out).into_iter().rev() {
+    // The numbers found (and the "on" before each).
+    for (range, _) in typed_phone_spans(text) {
         let start = BEFORE_PHONE
-            .find(&out[..range.start])
+            .find(&text[..range.start])
             .map_or(range.start, |m| m.start());
-        out.replace_range(start..range.end, " ");
+        cut.push(start..range.end);
+    }
+    // Call-back times go in the card's best time, not the message.
+    cut.extend(call_times(text));
+    cut.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for r in cut {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    let mut out = text.to_owned();
+    for r in merged.into_iter().rev() {
+        out.replace_range(r, " ");
     }
     out = EMAIL_IN_MESSAGE.replace_all(&out, " ").into_owned();
     let joined = out.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -306,17 +626,38 @@ fn lead_message(text: &str) -> String {
         if ",;:.?!".contains(c) && cleaned.ends_with(' ') {
             cleaned.pop();
         }
+        // A run of dashes left where a number was ("call me – – after").
+        if "-\u{2013}\u{2014}".contains(c) && last.is_some_and(|l| "-\u{2013}\u{2014}".contains(l))
+        {
+            continue;
+        }
         cleaned.push(c);
     }
     // Words left hanging where a number was ("call me on", "my number is").
-    const DANGLING: [&str; 12] = [
+    const DANGLING: [&str; 13] = [
         "on", "at", "via", "is", "number", "mobile", "phone", "email", "tel", "my", "me:", "and",
+        "or",
     ];
+    const DASHES: &str = ",;:-\u{2013}\u{2014}";
     let mut message = cleaned
-        .trim_matches(|c: char| ",;:-".contains(c) || c.is_whitespace())
+        .trim_matches(|c: char| DASHES.contains(c) || c.is_whitespace())
         .to_owned();
+    // A greeting, connector or punctuation left at the start ("Hi", "and", "!").
     loop {
-        let trimmed = message.trim_end_matches(|c: char| ",;:-".contains(c) || c.is_whitespace());
+        let trimmed = message.trim_start_matches(|c: char| {
+            DASHES.contains(c) || ".!?".contains(c) || c.is_whitespace()
+        });
+        let stripped = LEADING_FILLER
+            .find(trimmed)
+            .filter(|m| m.end() < trimmed.len())
+            .map_or(trimmed, |m| &trimmed[m.end()..]);
+        if stripped.len() == message.len() {
+            break;
+        }
+        message = stripped.to_owned();
+    }
+    loop {
+        let trimmed = message.trim_end_matches(|c: char| DASHES.contains(c) || c.is_whitespace());
         let Some((head, last)) = trimmed.rsplit_once(' ').or(Some(("", trimmed))) else {
             break;
         };
@@ -327,10 +668,24 @@ fn lead_message(text: &str) -> String {
         message = head.to_owned();
     }
     let message: String = message.chars().take(300).collect();
-    if message.trim().is_empty() {
-        "Asked to be called back".into()
-    } else {
-        message
+    let bare = message.to_lowercase();
+    let bare: Vec<&str> = bare
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    const BARE: [&str; 9] = [
+        "call", "ring", "phone", "text", "please", "pls", "thanks", "thank", "cheers",
+    ];
+    if bare.iter().all(|w| BARE.contains(w)) {
+        return "Asked to be called back".into();
+    }
+    let mut chars = message.trim().chars();
+    match chars.next() {
+        // Only a one-letter capital ("ß" stays as it is).
+        Some(first) if first.to_uppercase().count() == 1 => {
+            first.to_uppercase().chain(chars).collect()
+        }
+        _ => message.trim().to_owned(),
     }
 }
 
@@ -455,6 +810,33 @@ fn phone_digits(phone: &str) -> Option<String> {
             .then(|| format!("+{digits}"));
     }
     (digits.starts_with('0') && (10..=11).contains(&digits.len())).then_some(digits)
+}
+
+/// Numbers (from [`phone_digits`]) that are not the visitor's: every listed business's, every
+/// one in the knowledge base, and every one the assistant gave in `earlier` turns before the
+/// visitor typed it. A visitor typing one is asking about it, not giving their own.
+fn business_phones(site: &Site, earlier: &[Message]) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = site
+        .listings
+        .iter()
+        .flat_map(|l| l.phones().filter_map(phone_digits))
+        .collect();
+    out.extend(site.kb.texts().flat_map(all_phone_digits));
+    let mut visitors = std::collections::HashSet::new();
+    for m in earlier {
+        for digits in all_phone_digits(&m.content) {
+            match m.role {
+                Role::User => {
+                    visitors.insert(digits);
+                }
+                Role::Assistant if !visitors.contains(&digits) => {
+                    out.insert(digits);
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// Keeps only the phone and email in a model's lead that the visitor actually wrote in this
@@ -829,7 +1211,28 @@ impl ChatSession {
             .map(|m| m.content.as_str())
             .chain(std::iter::once(text))
             .collect();
+        // Built at most once a turn, and only when a candidate number needs checking.
+        let current = self
+            .history
+            .iter()
+            .rposition(|m| m.role == Role::User)
+            .unwrap_or(0);
+        let known = std::cell::OnceCell::new();
+        let is_business = |digits: &str| {
+            known
+                .get_or_init(|| business_phones(&self.site, &self.history[..current]))
+                .contains(digits)
+        };
         let lead_args = lead_args.and_then(|mut lead| {
+            // A listed business's number the visitor typed ("can you call 01204 …") isn't theirs.
+            if lead
+                .get("phone")
+                .and_then(Value::as_str)
+                .and_then(phone_digits)
+                .is_some_and(|d| is_business(&d))
+            {
+                lead.insert("phone".into(), Value::Null);
+            }
             if keep_visitors_contacts(&mut lead, &visitor_texts) {
                 Some(lead)
             } else {
@@ -869,17 +1272,21 @@ impl ChatSession {
 
         // Fallback when the model didn't add a lead line: offer a card for an email in the text,
         // or for a phone number when the visitor asks to be called.
-        if let Some((email, phone)) = self
+        let fallback = self
             .site
             .lead_capture
-            .then(|| fallback_contact(text))
-            .flatten()
-        {
+            .then(|| fallback_contact_checked(text, &is_business))
+            .flatten();
+        if let Some((email, phone)) = fallback {
             let mut arguments = serde_json::Map::new();
             let name = name_in_text(text).unwrap_or_else(|| "Website visitor".into());
             arguments.insert("name".into(), json!(name));
             arguments.insert("email".into(), email.map_or(Value::Null, |e| json!(e)));
             arguments.insert("phone".into(), phone.map_or(Value::Null, |p| json!(p)));
+            arguments.insert(
+                "best_time".into(),
+                best_time(text).map_or(Value::Null, |t| json!(t)),
+            );
             arguments.insert("message".into(), json!(lead_message(text)));
             let call = ToolCall {
                 id: "server-lead".into(),
@@ -1244,7 +1651,8 @@ mod tests {
                 Some("07700900123")
             );
         }
-        assert_eq!(lead_message("call me 07700 900123 4pm"), "call me 4pm");
+        // The time goes to best_time (QA of #22, low 3).
+        assert_eq!(lead_message("call me 07700 900123 4pm"), "Call me");
         // Two numbers in one run are both found.
         let both: Vec<String> = typed_phones("call 07700 900123 01204 579975")
             .into_iter()
@@ -1341,7 +1749,7 @@ mod tests {
             ),
             ("Please call me on 07700 900123", "Please call me"),
             ("my number is 07700 900123", "Asked to be called back"),
-            (", call me at sam@example.com", "call me"),
+            (", call me at sam@example.com", "Call me"),
             ("Ring me on 07700 900123 about an EICR", "Ring me about an EICR"),
             // No name accepted: the introduction stays in the message.
             ("I'm Sorry, call me on 07700 900123", "I'm Sorry, call me"),
@@ -1439,5 +1847,434 @@ mod tests {
             None
         );
         assert_eq!(parse_confirmation("confirm_lead abc"), None);
+    }
+
+    fn phone_of(text: &str) -> Option<String> {
+        fallback_contact(text)
+            .and_then(|(_, p)| p)
+            .and_then(|p| phone_digits(&p))
+    }
+
+    #[test]
+    fn a_bare_call_back_intent_next_to_a_number_is_a_lead() {
+        // QA of #22, low 1: the fallback card needed "call me".
+        for text in [
+            "call 07700 900123",
+            "Call 07700 900123 please",
+            "ring me 07700 900123",
+            "give me a ring on 07700 900123",
+            "give us a bell 07700 900123",
+            "phone me on 07700 900123",
+            "can you call 07700 900123",
+            "Could someone ring 07700 900123?",
+            "please call 07700 900123",
+            "please ring on 07700 900123",
+            "07700 900123 call me",
+            "07700 900123, please call",
+            "07700 900123 - ring after 5",
+        ] {
+            assert_eq!(phone_of(text).as_deref(), Some("07700900123"), "{text}");
+        }
+    }
+
+    #[test]
+    fn numbers_about_someone_else_are_not_a_lead() {
+        for text in [
+            "I tried to call them on 0161 496 0000 but no answer",
+            "I tried to call 0161 496 0000 yesterday",
+            "Is 01204 579975 the right number?",
+            "their number is 0161 496 0000, can you check it?",
+            "please call them on 0161 496 0000",
+            "I will call 0161 496 0000 myself",
+            "the call 0161 496 0000 dropped",
+        ] {
+            assert_eq!(phone_of(text), None, "{text}");
+        }
+        // A listed business's (or the KB's) number never becomes the visitor's.
+        let business = |d: &str| d == "01204579975";
+        assert_eq!(
+            fallback_contact_checked("can you call 01204 579975 for me?", &business),
+            None
+        );
+        assert_eq!(
+            fallback_contact_checked(
+                "Can Hayvern call me? Their number is 01204 579975",
+                &business
+            ),
+            None
+        );
+        // ...but the visitor's own number next to it still counts.
+        assert_eq!(
+            fallback_contact_checked(
+                "Hayvern is 01204 579975, please call me on 07700 900123",
+                &business
+            )
+            .and_then(|(_, p)| p)
+            .and_then(|p| phone_digits(&p))
+            .as_deref(),
+            Some("07700900123")
+        );
+    }
+
+    #[test]
+    fn a_reference_word_only_hides_a_number_that_is_not_phone_shaped() {
+        // QA of #22, low 2.
+        let phones =
+            |t: &str| -> Vec<String> { typed_phones(t).into_iter().map(|(_, d)| d).collect() };
+        assert_eq!(
+            phones("quote for a job 07700 900123 or 07700 900456"),
+            ["07700900123", "07700900456"]
+        );
+        assert_eq!(phones("job 07700 900123, call me"), ["07700900123"]);
+        assert_eq!(phones("order +44 7700 900123 call me"), ["07700900123"]);
+        // Two words back is not "immediately before": the number counts.
+        assert_eq!(
+            phones("my quote is 01204 579975 and 07700 900123"),
+            ["01204579975", "07700900123"]
+        );
+        // A landline-shaped number straight after a reference word is still a reference.
+        assert!(phones("invoice 0123-456-7890 is wrong").is_empty());
+        assert!(phones("job no. 0161 496 0000 and ref 01204 579975").is_empty());
+        assert_eq!(
+            phones("invoice 0123-456-7890, call me on 07700 900123"),
+            ["07700900123"]
+        );
+    }
+
+    #[test]
+    fn the_card_message_is_tidy_and_times_go_to_best_time() {
+        // QA of #22, low 3.
+        for (text, message, time) in [
+            (
+                "Please call me back 07700 900123 4pm.",
+                "Please call me back.",
+                Some("4pm"),
+            ),
+            (
+                "Please call me back on 07700 900123 after 4pm",
+                "Please call me back",
+                Some("after 4pm"),
+            ),
+            ("call me 07700 900123 4pm", "Call me", Some("4pm")),
+            (
+                "ring me on 07700 900123 between 2pm and 4pm about an EICR",
+                "Ring me about an EICR",
+                Some("between 2pm and 4pm"),
+            ),
+            (
+                "call me 07700 900123 tomorrow morning",
+                "Call me",
+                Some("tomorrow morning"),
+            ),
+            ("Hi I'm Mo, call me on 07700 900123", "Call me", None),
+            ("Hi, I'm Mo. Call me on 07700 900123", "Call me", None),
+            ("I'm Mo and call me on 07700 900123", "Call me", None),
+            ("I'm Mo! call me on 07700 900123", "Call me", None),
+            (
+                "Hello there, can someone call me about a rewire? 07700 900123",
+                "Can someone call me about a rewire?",
+                None,
+            ),
+            ("Morning, call me on 07700 900123", "Call me", None),
+            (
+                "ring me on +44 7700 900123 after 5",
+                "Ring me",
+                Some("after 5"),
+            ),
+            (
+                "call me on 07700 900123 after 5 years of waiting",
+                "Call me after 5 years of waiting",
+                None,
+            ),
+        ] {
+            assert_eq!(lead_message(text), message, "{text}");
+            assert_eq!(best_time(text).as_deref(), time, "{text}");
+        }
+    }
+
+    #[test]
+    fn adjectives_after_im_are_not_names() {
+        // QA of #22, low 4.
+        for text in [
+            "I'm Retired, call me on 07700 900123",
+            "I'm Desperate! ring me 07700 900123",
+            "I'm Worried, call me",
+            "I am Stuck. call me",
+            "this is Important, call me",
+            "I'm Disabled and need help",
+        ] {
+            assert_eq!(name_in_text(text), None, "{text}");
+        }
+        for (text, want) in [
+            ("I'm Sam, call me", "Sam"),
+            ("I'm Mo, call me", "Mo"),
+            ("I'm Grace, call me", "Grace"),
+            ("I'm Will. call me", "Will"),
+            ("I'm Priya, call me", "Priya"),
+            ("I'm Sam Baker, call me", "Sam Baker"),
+            // After "my name is", an everyday word written as a name is a name.
+            ("my name is Hunter, call me", "Hunter"),
+            ("My name is Rose Hill, call me", "Rose Hill"),
+        ] {
+            assert_eq!(name_in_text(text).as_deref(), Some(want), "{text}");
+        }
+        // The rejected introduction stays in the message.
+        assert_eq!(
+            lead_message("I'm Retired, call me on 07700 900123"),
+            "I'm Retired, call me"
+        );
+    }
+
+    #[test]
+    fn qa_lead_lows_pronouns_and_its_do_not_hide_the_visitors_number() {
+        // QA re-review H1, H2.
+        for text in [
+            "Can they ring me 07700 900123",
+            "Can they call me 07700 900123?",
+            "Could they phone me 07700 900123",
+            "Please ask them to ring 07700 900123",
+            "Pass my details to them: 07700 900123, call me",
+            "its 07700 900123, call me",
+            "Hi its Mo, its 07700 900123 call me back",
+        ] {
+            assert_eq!(phone_of(text).as_deref(), Some("07700900123"), "{text}");
+        }
+    }
+
+    #[test]
+    fn qa_lead_lows_the_number_next_to_the_request_wins() {
+        // QA re-review M1.
+        assert_eq!(
+            phone_of("tried to call 0161 496 0000. Call me on 07700 900123").as_deref(),
+            Some("07700900123")
+        );
+        assert_eq!(
+            phone_of("my order 07700 900123 hasn't arrived, call me on 01204 555123").as_deref(),
+            Some("01204555123")
+        );
+        assert_eq!(
+            phone_of("I rang 0161 496 0000, can you call me?"),
+            None,
+            "a number already tried is not theirs"
+        );
+    }
+
+    #[test]
+    fn qa_lead_lows_questions_about_a_number_are_not_requests() {
+        // QA re-review M2.
+        for text in [
+            "Should I just call 0800 111 999?",
+            "Should I just ring 0161 496 0000 instead?",
+            "Can I just ring 0161 496 0000?",
+            "0161 496 0000 phone number for Hayvern?",
+            "0161 496 0000 phone line is dead",
+            "I want to call 0161 496 0000",
+        ] {
+            assert_eq!(phone_of(text), None, "{text}");
+        }
+        assert_eq!(
+            phone_of("can you text 07700 900123").as_deref(),
+            Some("07700900123")
+        );
+    }
+
+    #[test]
+    fn qa_lead_lows_names_that_are_words_and_my_names() {
+        // QA re-review M3.
+        for (text, want) in [
+            ("I'm Dawn, call me", "Dawn"),
+            ("I'm Ray, call me", "Ray"),
+            ("I'm Grant, call me", "Grant"),
+            ("I'm Rose, call me", "Rose"),
+            ("I'm Grant Ward, call me", "Grant Ward"),
+            ("I'm Rose Smith, call me", "Rose Smith"),
+            ("my name's Hunter, call me", "Hunter"),
+            ("name is Brook, call me", "Brook"),
+        ] {
+            assert_eq!(name_in_text(text).as_deref(), Some(want), "{text}");
+        }
+        assert_eq!(name_in_text("I'm Busy, call me"), None);
+    }
+
+    #[test]
+    fn qa_lead_lows_only_call_back_times_leave_the_message() {
+        // QA re-review M4, M5, L1.
+        for (text, message, time) in [
+            (
+                "call me 07700 900123, my boiler broke on Monday",
+                "Call me, my boiler broke on Monday",
+                None,
+            ),
+            (
+                "My boiler has been broken since Monday, call me on 07700 900123",
+                "My boiler has been broken since Monday, call me",
+                None,
+            ),
+            (
+                "call me on 07700 900123, it broke this morning",
+                "Call me, it broke this morning",
+                None,
+            ),
+            (
+                "call me on 07700 900123 about the 3pm slot you mentioned",
+                "Call me about the 3pm slot you mentioned",
+                None,
+            ),
+            (
+                "I got quotes from 3 or 4 installers, call me 07700 900123",
+                "I got quotes from 3 or 4 installers, call me",
+                None,
+            ),
+            (
+                "I need 2 sockets by 5 please, call me 07700 900123",
+                "I need 2 sockets by 5 please, call me",
+                None,
+            ),
+            (
+                "call me on 07700 900123 Monday to Friday",
+                "Call me",
+                Some("Monday to Friday"),
+            ),
+            (
+                "call me on 07700 900123 Monday to Friday after 5pm",
+                "Call me",
+                Some("Monday to Friday, after 5pm"),
+            ),
+            (
+                "call me 07700 900123 12\u{2013}2pm",
+                "Call me",
+                Some("12\u{2013}2pm"),
+            ),
+            (
+                "call me tomorrow after 4pm on 07700 900123",
+                "Call me",
+                Some("tomorrow, after 4pm"),
+            ),
+        ] {
+            assert_eq!(lead_message(text), message, "{text}");
+            assert_eq!(best_time(text).as_deref(), time, "{text}");
+        }
+    }
+
+    #[test]
+    fn qa_lead_lows_leading_words_and_bare_verbs() {
+        // QA re-review L2, L3, L4, L7.
+        for (text, want) in [
+            (
+                "So far nobody replied, call me 07700 900123",
+                "So far nobody replied, call me",
+            ),
+            (
+                "Well water pump failed, call me 07700 900123",
+                "Well water pump failed, call me",
+            ),
+            ("So, call me on 07700 900123", "Call me"),
+            ("Text 07700 900123", "Asked to be called back"),
+            ("hi call 07700 900123", "Asked to be called back"),
+            ("07700 900123 ring", "Asked to be called back"),
+            ("07700 900123 \u{2013} call me", "Call me"),
+            (
+                "\u{df}omething, call me 07700 900123",
+                "\u{df}omething, call me",
+            ),
+        ] {
+            assert_eq!(lead_message(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn business_numbers_include_the_kb_with_references_and_the_assistants_earlier_numbers() {
+        // QA re-review M2/L8: built once per turn.
+        let config =
+            crate::config::Config::from_pairs(&[("DEV_MODE", "true"), ("MOCK_LLM", "true")])
+                .unwrap();
+        let site = Site::from_config(
+            &config,
+            crate::kb::KnowledgeBase::from_markdown("# Contact\nQuote line: quote 0161 496 0000."),
+        );
+        let earlier = [
+            Message::new(Role::User, "my number is 07700 900123"),
+            Message::new(
+                Role::Assistant,
+                "Thanks, we'll use 07700 900123. Or ring 0800 111 999.",
+            ),
+        ];
+        let known = business_phones(&site, &earlier);
+        assert!(known.contains("01614960000"), "{known:?}");
+        assert!(known.contains("0800111999"), "{known:?}");
+        assert!(
+            !known.contains("07700900123"),
+            "the visitor's own number: {known:?}"
+        );
+    }
+
+    #[test]
+    fn qa_lead_lows_someone_elses_number_never_beats_call_me_on() {
+        // QA re-review 2, R-M1 and R-M2.
+        for (text, want) in [
+            (
+                "My wife's number is 07700 900456, call me on 07700 900123",
+                Some("07700900123"),
+            ),
+            (
+                "Their office is 0161 496 0000, call me on 07700 900123",
+                Some("07700900123"),
+            ),
+            ("Hayvern's number is 0161 496 0000, please call me", None),
+            ("The installer's number is 0161 496 0000. Call me", None),
+            (
+                "I've been trying to ring 0161 496 0000 all day, can you call me?",
+                None,
+            ),
+            ("I keep calling 0161 496 0000, call me back", None),
+            ("my number is 07700 900123, call me", Some("07700900123")),
+        ] {
+            assert_eq!(phone_of(text).as_deref(), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn qa_lead_lows_business_names_and_phrases_are_not_the_visitors_name() {
+        // QA re-review 2, R-M3.
+        for text in [
+            "The company name is Bright Spark Electrical, call me on 07700 900123",
+            "Their name is Hayvern, call me on 07700 900123",
+            "The business name's Acme, please call me on 07700 900123",
+            "I'm Hard Of Hearing, call me",
+            "I'm Free Tomorrow, call me",
+        ] {
+            assert_eq!(name_in_text(text), None, "{text}");
+        }
+        for (text, want) in [
+            ("Name is Brook, call me", "Brook"),
+            ("Hi, name's Jo Bloggs, call me", "Jo Bloggs"),
+            ("I'm Grant Ward, call me", "Grant Ward"),
+            ("I'm Mo Farah, call me", "Mo Farah"),
+            ("I'm Dan Hill, call me", "Dan Hill"),
+            ("I'm Ed Wood, call me", "Ed Wood"),
+        ] {
+            assert_eq!(name_in_text(text).as_deref(), Some(want), "{text}");
+        }
+    }
+
+    #[test]
+    fn qa_lead_lows_dashes_digits_and_bare_verbs() {
+        // QA re-review 2, lows.
+        assert_eq!(
+            best_time("call me \u{2013} 07700 900123 \u{2013} after 4pm").as_deref(),
+            Some("after 4pm")
+        );
+        assert_eq!(
+            lead_message("call me \u{2014} 07700 900123 \u{2014} tomorrow"),
+            "Call me"
+        );
+        assert_eq!(
+            lead_message("call me on 07700 900123 after 6pm or weekends"),
+            "Call me"
+        );
+        assert_eq!(best_time("call me 07700 900123 \u{663}pm"), None);
+        for text in ["call 07700 900123 please", "call 07700 900123 thanks"] {
+            assert_eq!(lead_message(text), "Asked to be called back", "{text}");
+        }
     }
 }
