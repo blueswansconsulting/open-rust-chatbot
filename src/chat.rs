@@ -69,9 +69,10 @@ type Sender = UnboundedSender<String>;
 
 static EMAIL_IN_TEXT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap());
-/// A UK-style phone number typed by the visitor ("07700 900123", "+44 7700 900123").
+/// Something that may be a phone number the visitor typed, in any common format ("07700
+/// 900123", "07700-900-123", "(07700) 900123", "+44 (0)7700 900123"); [`phone_digits`] decides.
 static PHONE_IN_TEXT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:\+44\s?\d|\b0\d)[\d ]{7,12}\d\b").unwrap());
+    LazyLock::new(|| Regex::new(r"\+?\(?\d[\d \t().-]{7,22}\d").unwrap());
 /// The visitor introducing themselves ("I'm Sam Test", "my name is Jo", "this is Priya Shah"):
 /// the introduction, then up to three capitalised words. What follows is checked in code.
 static NAME_IN_TEXT: LazyLock<Regex> = LazyLock::new(|| {
@@ -88,7 +89,7 @@ static LEAD_MARKER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(?:\*{1,2})?\bLEAD(?:\*{1,2})?\s*:(?:\*{1,2})?\s*").unwrap());
 /// A phone or email in the visitor's message, with the "on"/"at" before it, for the card text.
 static CONTACT_IN_MESSAGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i:\b(?:on|at|via|is)\s+)?(?:(?:\+44\s?\d|\b0\d)[\d ]{7,12}\d\b|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})").unwrap()
+    Regex::new(r"(?i:\b(?:on|at|via|is)\s+)?(?:\+?\(?\d[\d \t().-]{7,22}\d|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})").unwrap()
 });
 /// The visitor asking to be called back, so a phone number they typed is a lead.
 static CALL_ME: LazyLock<Regex> = LazyLock::new(|| {
@@ -107,11 +108,33 @@ const TEXT_ONLY_DIRECTORY_LEADS: &str = " This site is a directory: a call-back 
 /// Contact details a visitor typed: an email, or a phone number when they ask to be called.
 fn fallback_contact(text: &str) -> Option<(Option<String>, Option<String>)> {
     let email = EMAIL_IN_TEXT.find(text).map(|m| m.as_str().to_owned());
-    let phone = PHONE_IN_TEXT
-        .find(text)
+    let phone = typed_phones(text)
+        .into_iter()
+        .next()
         .filter(|_| CALL_ME.is_match(text))
-        .map(|m| m.as_str().trim().to_owned());
+        .map(|(typed, digits)| {
+            // As typed when the card accepts it ("(07700) 900123"), else plain digits.
+            if typed
+                .chars()
+                .all(|c| c.is_ascii_digit() || " ()+-".contains(c))
+            {
+                typed
+            } else {
+                digits
+            }
+        });
     (email.is_some() || phone.is_some()).then_some((email, phone))
+}
+
+/// UK phone numbers in `text`: (as typed, digits with a leading 0).
+fn typed_phones(text: &str) -> Vec<(String, String)> {
+    PHONE_IN_TEXT
+        .find_iter(text)
+        .filter_map(|m| {
+            let typed = m.as_str().trim().to_owned();
+            phone_digits(&typed).map(|digits| (typed, digits))
+        })
+        .collect()
 }
 
 /// The visitor's own name and where its introduction is in `text`: "I'm Sam Test (Claude QA),
@@ -301,15 +324,22 @@ pub(crate) fn split_lead_line(raw: &str) -> (String, Option<serde_json::Map<Stri
     (visible.trim().to_owned(), lead)
 }
 
-/// Digits of a phone number, with +44 written as a leading 0.
-fn phone_digits(phone: &str) -> String {
-    let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
-    match digits.strip_prefix("44") {
-        Some(rest) if phone.trim_start().starts_with('+') || digits.len() == 12 => {
-            format!("0{rest}")
-        }
-        _ => digits,
+/// The digits of a UK phone number with a leading 0 ("+44 (0)7700 900123", "0044 7700
+/// 900123" and "07700-900-123" all give "07700900123"), or None if it isn't one.
+fn phone_digits(phone: &str) -> Option<String> {
+    let mut digits: String = phone.chars().filter(char::is_ascii_digit).collect();
+    if let Some(rest) = digits.strip_prefix("00") {
+        digits = rest.to_owned();
     }
+    if let Some(rest) = digits.strip_prefix("44") {
+        // "+44 (0)7700…" keeps its 0; "+44 7700…" gets one.
+        digits = if rest.starts_with('0') {
+            rest.to_owned()
+        } else {
+            format!("0{rest}")
+        };
+    }
+    (digits.starts_with('0') && (10..=11).contains(&digits.len())).then_some(digits)
 }
 
 /// Keeps only the phone and email in a model's lead that the visitor actually wrote in this
@@ -319,16 +349,23 @@ fn keep_visitors_contacts(
     lead: &mut serde_json::Map<String, Value>,
     visitor_texts: &[&str],
 ) -> bool {
-    let typed_phones: Vec<String> = visitor_texts
+    let phones: Vec<String> = visitor_texts
         .iter()
-        .flat_map(|t| PHONE_IN_TEXT.find_iter(t).map(|m| phone_digits(m.as_str())))
+        .flat_map(|t| typed_phones(t).into_iter().map(|(_, digits)| digits))
         .collect();
-    let typed = visitor_texts.join("\n").to_lowercase();
+    let emails: Vec<String> = visitor_texts
+        .iter()
+        .flat_map(|t| {
+            EMAIL_IN_TEXT
+                .find_iter(t)
+                .map(|m| m.as_str().trim().to_lowercase())
+        })
+        .collect();
     let phone_ok = lead
         .get("phone")
         .and_then(Value::as_str)
-        .map(phone_digits)
-        .is_some_and(|d| d.len() >= 10 && typed_phones.contains(&d));
+        .and_then(phone_digits)
+        .is_some_and(|d| phones.contains(&d));
     if !phone_ok {
         lead.insert("phone".into(), Value::Null);
     }
@@ -336,7 +373,7 @@ fn keep_visitors_contacts(
         .get("email")
         .and_then(Value::as_str)
         .map(|e| e.trim().to_lowercase())
-        .is_some_and(|e| !e.is_empty() && typed.contains(&e));
+        .is_some_and(|e| emails.contains(&e));
     if !email_ok {
         lead.insert("email".into(), Value::Null);
     }
@@ -1010,10 +1047,62 @@ mod tests {
         ));
         assert_eq!(lead["phone"], "07700900123");
         assert_eq!(lead["email"], "Sam@Example.com");
+        // Dashes, brackets and +44 (0) are the same number.
+        for typed in [
+            "07700-900-123",
+            "(07700) 900123",
+            "+44 (0)7700 900123",
+            "0044 7700 900123",
+        ] {
+            let mut lead = serde_json::Map::new();
+            lead.insert("phone".into(), json!("07700 900123"));
+            assert!(
+                keep_visitors_contacts(&mut lead, &[&format!("call me on {typed}")]),
+                "{typed}"
+            );
+        }
+        // An email must be one the visitor typed, not part of one.
+        let mut lead = serde_json::Map::new();
+        lead.insert("email".into(), json!("am@x.co"));
+        assert!(!keep_visitors_contacts(
+            &mut lead,
+            &["email me at sam@x.com"]
+        ));
         // Part of a longer number doesn't count.
         let mut lead = serde_json::Map::new();
         lead.insert("phone".into(), json!("0770090012"));
         assert!(!keep_visitors_contacts(&mut lead, &["call 07700 900123"]));
+    }
+
+    #[test]
+    fn phones_in_any_common_format_are_read_and_normalised() {
+        for (typed, digits) in [
+            ("07700 900123", "07700900123"),
+            ("07700-900-123", "07700900123"),
+            ("(07700) 900123", "07700900123"),
+            ("+44 (0)7700 900123", "07700900123"),
+            ("+44 7700 900123", "07700900123"),
+            ("0044 7700 900123", "07700900123"),
+            ("01204 579975", "01204579975"),
+        ] {
+            assert_eq!(phone_digits(typed).as_deref(), Some(digits), "{typed}");
+            let found = fallback_contact(&format!("please call me on {typed} thanks"));
+            assert_eq!(
+                found
+                    .and_then(|(_, p)| p)
+                    .and_then(|p| phone_digits(&p))
+                    .as_deref(),
+                Some(digits),
+                "{typed}"
+            );
+        }
+        for not_a_phone in ["2026-10-21", "12345", "1234567890123456"] {
+            assert_eq!(phone_digits(not_a_phone), None, "{not_a_phone}");
+        }
+        assert_eq!(
+            lead_message("Please call me on (07700) 900-123 about a rewire"),
+            "Please call me about a rewire"
+        );
     }
 
     #[test]

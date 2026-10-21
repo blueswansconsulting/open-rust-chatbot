@@ -1705,3 +1705,48 @@ async fn a_bold_lowercase_marker_is_hidden_end_to_end() {
     assert_eq!(cards.len(), 1);
     assert_eq!(cards[0]["card"]["lead"]["name"], "Sam Test");
 }
+
+const PHONE_FORMATS: [&str; 3] = ["07700-900-123", "(07700) 900123", "+44 (0)7700 900123"];
+
+fn card_digits(card: &Value) -> String {
+    card["card"]["lead"]["phone"]
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_model_lead_is_used_when_the_visitor_typed_the_number_with_dashes_or_brackets() {
+    let (h, _prompts) = start_text_only(
+        "We'll pass that on. LEAD: {\"name\":\"Sam\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire\"}",
+    )
+    .await;
+    for typed in PHONE_FORMATS {
+        let frames = ask_frames(&h.addr, &format!("I'm Sam, please call me on {typed}")).await;
+        let cards = cards(&frames);
+        assert_eq!(cards.len(), 1, "{typed}");
+        assert_eq!(
+            cards[0]["card"]["lead"]["message"], "Rewire",
+            "{typed}: the model's lead"
+        );
+        assert_eq!(card_digits(cards[0]), "07700900123", "{typed}");
+    }
+}
+
+#[tokio::test]
+async fn the_fallback_card_reads_numbers_with_dashes_or_brackets() {
+    let (h, _prompts) = start_text_only("We'll pass that on.").await;
+    for typed in PHONE_FORMATS {
+        let frames = ask_frames(&h.addr, &format!("I'm Sam, please call me on {typed}")).await;
+        let cards = cards(&frames);
+        assert_eq!(cards.len(), 1, "{typed}");
+        assert_eq!(cards[0]["card"]["lead"]["name"], "Sam", "{typed}");
+        let digits = card_digits(cards[0]);
+        assert!(
+            digits == "07700900123" || digits == "4407700900123",
+            "{typed}: {digits}"
+        );
+    }
+}
