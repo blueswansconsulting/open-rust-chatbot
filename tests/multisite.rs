@@ -1667,3 +1667,41 @@ async fn an_unusable_lead_line_falls_back_to_one_card_from_the_message() {
     assert_eq!(cards.len(), 1);
     assert_eq!(cards[0]["card"]["lead"]["phone"], "07700 900123");
 }
+
+#[tokio::test]
+async fn a_lead_with_a_listed_firms_number_from_the_prompt_is_not_used() {
+    // The model copies Hayvern's number (shown in the directory block) into the lead.
+    let (h, prompts) = start_text_only(
+        "The directory team will be in touch. LEAD: {\"name\":\"Sam\",\"phone\":\"+441204579975\",\"email\":null,\"best_time\":null,\"message\":\"Wants Hayvern\"}",
+    )
+    .await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    let mut ws = connect(&h.addr, "dir", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text("Can Hayvern call me? I'm Sam".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut ws).await;
+    assert!(
+        last_prompt(&prompts).contains("+441204579975"),
+        "the number was in the prompt"
+    );
+    assert!(!text_of(&frames).contains("LEAD"));
+    assert!(
+        cards(&frames).is_empty(),
+        "the visitor never gave a number: {frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bold_lowercase_marker_is_hidden_end_to_end() {
+    let (h, _prompts) = start_text_only(
+        "We'll pass that on.\n**lead:** {\"name\":\"Sam Test\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire\"}",
+    )
+    .await;
+    let frames = ask_frames(&h.addr, LIVE_QUESTION).await;
+    assert_eq!(text_of(&frames), "We'll pass that on.");
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["card"]["lead"]["name"], "Sam Test");
+}
