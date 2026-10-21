@@ -191,43 +191,98 @@ const NAME_CUES: [&str; 12] = [
     "try",
 ];
 
-/// English words (Webster's Second International, 1934, public domain; via BSD's
-/// /usr/share/dict/web2), lower-case, 3 to 12 letters, sorted bytewise. A business name made of
-/// one of these ("Voltage", "Complete") only counts when written as a name.
-static ENGLISH_WORDS: &str = include_str!("data/english-words.txt");
-/// First names (FreeBSD's share/dict/propernames, distributed with BSD; see src/data/NOTICE),
-/// lower-case, sorted. A lone first name is usually the visitor's own ("Simon here").
-static FIRST_NAMES: &str = include_str!("data/first-names.txt");
+/// English words (Webster's Second International, 1934, public domain; via FreeBSD's
+/// share/dict/web2; see src/data/NOTICE): lower-case, 3 to 10 letters, sorted, front-coded by
+/// src/data/build-english-words.py. Each line is one digit (letters shared with the previous
+/// word) and the rest of the word; every [`RESTART`]th line is a whole word. A business name
+/// made of one of these ("Voltage", "Complete") only counts when written as a name.
+static ENGLISH_WORDS: &str = include_str!("data/english-words.fc");
+const RESTART: usize = 64;
 
-/// Binary search in a sorted, newline-separated word list, without allocating.
-fn in_word_list(list: &str, word: &str) -> bool {
-    let bytes = list.as_bytes();
-    let (mut lo, mut hi) = (0usize, bytes.len());
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let start = bytes[..mid]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
-        let end = bytes[start..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(bytes.len(), |i| start + i);
-        match list[start..end].cmp(word) {
-            std::cmp::Ordering::Equal => return true,
-            std::cmp::Ordering::Less => lo = end + 1,
-            std::cmp::Ordering::Greater => hi = start,
+/// Byte offset of every whole-word line in [`ENGLISH_WORDS`], built once (about 8 KB).
+static RESTARTS: LazyLock<Vec<u32>> = LazyLock::new(|| {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    for (i, line) in ENGLISH_WORDS.split_inclusive('\n').enumerate() {
+        if i % RESTART == 0 {
+            out.push(offset as u32);
         }
+        offset += line.len();
     }
-    false
+    out
+});
+
+/// Every word in the front-coded list from a restart point, in order.
+fn english_words_from(restart: usize) -> impl Iterator<Item = String> {
+    let from = RESTARTS
+        .get(restart)
+        .map_or(ENGLISH_WORDS.len(), |&o| o as usize);
+    let mut word = String::new();
+    ENGLISH_WORDS[from..].lines().map(move |line| {
+        let shared = line.as_bytes()[0].wrapping_sub(b'0') as usize;
+        word.truncate(shared);
+        word.push_str(&line[1..]);
+        word.clone()
+    })
 }
 
+/// True if `word` is in the English word list. Binary search over the restart lines, then a
+/// short scan.
+fn english_word(word: &str) -> bool {
+    if !(3..=10).contains(&word.len()) || !word.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    let whole = |r: usize| {
+        let at = RESTARTS[r] as usize;
+        let line = ENGLISH_WORDS[at..].lines().next().unwrap_or("0");
+        &line[1..]
+    };
+    // The last restart whose word is <= `word`.
+    let (mut lo, mut hi) = (0, RESTARTS.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if whole(mid) <= word {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return false;
+    }
+    english_words_from(lo - 1)
+        .take(RESTART)
+        .take_while(|w| w.as_str() <= word)
+        .any(|w| w == word)
+}
+
+/// Common first names in the UK (our own list): a lone first name is usually the visitor's own
+/// ("Simon here", "Is Simon available?"), not a firm.
+const FIRST_NAME_LIST: &str = "aaron adam aidan alan albert alex alexander alfie alice alison amanda \
+amber amelia amy andrew andy angela ann anna anne anthony archie arthur ashley barbara barry ben \
+benjamin beth bethany bill billy bob brian callum carl carol caroline catherine charles charlie \
+charlotte chloe chris christine christopher claire colin connor craig daniel danny darren dave \
+david dean debbie deborah denise derek diane donna dylan edward eleanor elizabeth ella ellie emily \
+emma eric ethan evie faye finley frank freddie freya gail gareth gary gavin geoff george georgia \
+gemma gordon grace graham hannah harry harvey hayley heather helen henry holly ian isabella isla \
+isaac jack jackie jacob jade jake james jamie jane janet jason jay jayne jean jeff jennifer jenny \
+jessica jill jim jimmy jo joan joanne joe john jon jonathan joseph josh joshua julie justin karen \
+kate katie kayleigh keith kelly kevin kieran kim kirsty laura lauren leah lee leo lewis liam lily \
+linda lisa logan louise lucy luke lynn mandy margaret maria mark martin mary matt matthew megan \
+melanie mia michael michelle mike millie mohammed muhammad nathan neil nicola nicholas nick nigel \
+noah oliver olivia oscar owen pam pat patricia paul paula pauline pete peter phil philip poppy \
+rachel rebecca richard rob robert robin ron rosie ross ruby ruth ryan sally sam samantha samuel \
+sandra sarah scott sean sharon shaun simon sophia sophie stacey stephen steph steve steven stuart \
+sue susan teresa theo thomas tim toby tom tommy tony tracey tracy vicky victoria wayne will william \
+zara zoe";
+static FIRST_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| word_set(FIRST_NAME_LIST));
+
 fn everyday_word(word: &str) -> bool {
-    COMMON_NAMES.contains(word) || in_word_list(ENGLISH_WORDS, word)
+    COMMON_NAMES.contains(word) || english_word(word)
 }
 
 fn first_name(word: &str) -> bool {
-    in_word_list(FIRST_NAMES, word)
+    FIRST_NAMES.contains(word)
 }
 
 /// Most capitalised words a single lookup examines for typos, so a long message stays cheap.
@@ -2137,17 +2192,41 @@ mod tests {
 
     #[test]
     fn the_word_lists_are_sorted_and_searchable() {
-        for list in [ENGLISH_WORDS, FIRST_NAMES] {
-            let words: Vec<&str> = list.lines().collect();
-            assert!(words.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
-            for w in words.iter().step_by(997) {
-                assert!(in_word_list(list, w), "{w}");
+        let words: Vec<String> = english_words_from(0).collect();
+        assert!(words.len() > 100_000, "{}", words.len());
+        assert!(words.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+        assert!(words
+            .iter()
+            .all(|w| (3..=10).contains(&w.len()) && w.bytes().all(|b| b.is_ascii_lowercase())));
+        // Every word is found, including the first and last of each restart block.
+        for (i, w) in words.iter().enumerate() {
+            if i % 61 == 0 || i % RESTART == 0 || i % RESTART == RESTART - 1 {
+                assert!(english_word(w), "{w}");
             }
         }
+        assert!(english_word(&words[0]) && english_word(words.last().unwrap()));
         assert!(everyday_word("voltage") && everyday_word("complete"));
         assert!(!everyday_word("hayvern") && !everyday_word("jax"));
-        assert!(first_name("simon") && !first_name("hayvern"));
-        assert!(!in_word_list(ENGLISH_WORDS, "") && !in_word_list(ENGLISH_WORDS, "zzzzzzzz"));
+        for absent in ["", "aa", "zzzzzzzz", "Voltage", "hayvernx", "electricalxx"] {
+            assert!(!english_word(absent), "{absent}");
+        }
+        assert!(first_name("simon") && first_name("james") && !first_name("hayvern"));
+    }
+
+    #[test]
+    fn a_lone_first_name_is_the_visitor_not_a_firm() {
+        for q in [
+            "Is Simon available?",
+            "can I speak to Simon",
+            "Simon",
+            "James said to message you",
+        ] {
+            assert!(DEMO.lookup(q, "").names.is_empty(), "{q}");
+        }
+        assert_eq!(
+            DEMO.lookup("number for Simon Dean", "").names,
+            ["Simon Dean Electrical Ltd"]
+        );
     }
 
     #[test]

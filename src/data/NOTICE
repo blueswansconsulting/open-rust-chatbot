@@ -1,14 +1,14 @@
-Word lists used by src/listings.rs to tell business names from everyday words.
+Word list used by src/listings.rs to tell business names from everyday words.
 
-english-words.txt
+english-words.fc
   Source: FreeBSD share/dict/web2 (Webster's Second International Dictionary, 1934).
-  The FreeBSD README for share/dict states: "The 1934 copyright has lapsed, according to the
-  supplier."
-  Changes: lower-case entries of 3 to 12 letters only, sorted bytewise, duplicates removed.
+  Licence: public domain. The FreeBSD README for share/dict states: "The 1934 copyright has
+  lapsed, according to the supplier."
+  Changes: lower-case a-z entries of 3 to 10 letters only, sorted, duplicates removed, and
+  front-coded. Rebuild with:
+    python3 src/data/build-english-words.py /usr/share/dict/web2 src/data/english-words.fc
 
-first-names.txt
-  Source: FreeBSD share/dict/propernames, distributed as part of FreeBSD (no separate licence
-  is stated for this file; see https://www.freebsd.org/copyright/).
-  Changes: lower-cased, entries of 3 or more letters only, sorted bytewise, duplicates removed.
+The list is used only for membership checks and is never shown to visitors.
 
-Both lists are used only for membership checks and are never shown to visitors.
+The short list of common UK first names in src/listings.rs (FIRST_NAME_LIST) was written for
+this project and is covered by the project's MIT licence.

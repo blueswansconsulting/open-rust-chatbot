@@ -226,8 +226,8 @@ synonyms such as "fuse box" or "landlord certificate"), place (whole words; "Ash
 Boltn"; everyday-word places like Reading only after "in/near/…" or next to a trade word) and
 business name (two words of the name, or one distinctive word written like a name; everyday words
 and the visitor's own name never match on their own; the English word list is Webster's Second
-International (1934, from FreeBSD's `share/dict/web2`) and the first names are FreeBSD's
-`propernames`, both in `src/data/` with their provenance in `src/data/NOTICE`). Name matches are offered as possibilities,
+International, 1934, public domain, from FreeBSD's `share/dict/web2`, front-coded in `src/data/`
+with its provenance in `src/data/NOTICE`; the first names are a short list in the source). Name matches are offered as possibilities,
 not as a list to read out. Text-only models get up to 10 matching rows, honest counts ("5 of 5", "10 of 154"),
 hub page links and explicit "no listings" notes appended after the knowledge-base excerpts, at most
 3,000 characters; tool-calling models get the same text from a `search_directory_listings` tool.
