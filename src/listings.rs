@@ -111,8 +111,89 @@ certified accredited approved independent family community city county national 
 star sun bolt volt volts watt watts amp amps ohm ohms current circuit circuits connect connected \
 connection switched live neutral spark bright ace best one active alpha omega apex peak summit";
 
-/// Words that start a self-introduction ("I'm James", "I am Simon", "this is Sam").
-const SELF_INTRO: [&str; 3] = ["i", "am", "called"];
+/// Words before the visitor's own name ("I'm James", "I am Simon", "thanks Sam").
+const SELF_INTRO: [&str; 9] = [
+    "i", "am", "called", "thanks", "cheers", "hi", "hello", "hey", "dear",
+];
+/// Words after the visitor's own name ("James here", "Dave again").
+const SELF_INTRO_AFTER: [&str; 3] = ["here", "again", "speaking"];
+
+/// Words that end a business name, so the word before them is probably the name ("Hayvern
+/// Electrical", "jax group"). Service words like "rewire" don't count: "complete rewire".
+const NAME_SUFFIX: [&str; 17] = [
+    "electrical",
+    "electricals",
+    "electrics",
+    "electric",
+    "electrician",
+    "electricians",
+    "ltd",
+    "limited",
+    "services",
+    "group",
+    "contractors",
+    "contracting",
+    "solutions",
+    "co",
+    "uk",
+    "sons",
+    "llp",
+];
+
+/// Words before a business name written in lowercase ("do you list curious electrics").
+const NAME_CUES: [&str; 12] = [
+    "for",
+    "about",
+    "list",
+    "listed",
+    "contact",
+    "called",
+    "is",
+    "are",
+    "use",
+    "of",
+    "recommend",
+    "try",
+];
+
+/// English words (Webster's Second International, 1934, public domain; via BSD's
+/// /usr/share/dict/web2), lower-case, 3 to 12 letters, sorted bytewise. A business name made of
+/// one of these ("Voltage", "Complete") only counts when written as a name.
+static ENGLISH_WORDS: &str = include_str!("data/english-words.txt");
+/// First names (BSD's /usr/share/dict/propernames, public domain), lower-case, sorted. A lone
+/// first name is usually the visitor's own ("Simon here").
+static FIRST_NAMES: &str = include_str!("data/first-names.txt");
+
+/// Binary search in a sorted, newline-separated word list, without allocating.
+fn in_word_list(list: &str, word: &str) -> bool {
+    let bytes = list.as_bytes();
+    let (mut lo, mut hi) = (0usize, bytes.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let start = bytes[..mid]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |i| start + i);
+        match list[start..end].cmp(word) {
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Less => lo = end + 1,
+            std::cmp::Ordering::Greater => hi = start,
+        }
+    }
+    false
+}
+
+fn everyday_word(word: &str) -> bool {
+    COMMON_NAMES.contains(word) || in_word_list(ENGLISH_WORDS, word)
+}
+
+fn first_name(word: &str) -> bool {
+    in_word_list(FIRST_NAMES, word)
+}
 
 /// Most capitalised words a single lookup examines for typos, so a long message stays cheap.
 const MAX_TYPO_WORDS: usize = 24;
@@ -1015,8 +1096,8 @@ impl Listings {
     ) -> Vec<u32> {
         let has_other_match = has_service || !places.is_empty();
         // (word, could stand alone as a business name)
-        // (word, could stand alone as a business name, capitalised)
-        let mut query: Vec<(&str, bool, bool)> = Vec::new();
+        // (word, could stand alone as a business name, capitalised, not an everyday word or name)
+        let mut query: Vec<(&str, bool, bool, bool)> = Vec::new();
         for (i, t) in toks.iter().enumerate() {
             let w = t.text.as_str();
             if used[i]
@@ -1029,67 +1110,104 @@ impl Listings {
                 continue;
             }
             let prev = |k: usize| i.checked_sub(k).map(|j| toks[j].text.as_str());
-            let introduces_self = prev(1).is_some_and(|p| SELF_INTRO.contains(&p))
-                || (prev(1) == Some("is") && matches!(prev(2), Some("name" | "this")));
+            let next = toks.get(i + 1);
+            let introduces_self = (!t.initial && prev(1).is_some_and(|p| SELF_INTRO.contains(&p)))
+                || (prev(1) == Some("is") && matches!(prev(2), Some("name" | "this")))
+                || next.is_some_and(|n| SELF_INTRO_AFTER.contains(&n.text.as_str()));
             let after_place_word = prev(1).is_some_and(|p| ["in", "near", "around"].contains(&p));
-            // One word alone names a business when it is written like one, and isn't an everyday
-            // word, the visitor's own name or where they are:
             let len = w.chars().count();
             let code = w.chars().any(|c| c.is_ascii_digit()) && w.chars().any(char::is_alphabetic);
-            // - followed by a trade word: "Hayvern Electrical", "jax group", "MK Electrics";
-            let with_trade_word = toks
-                .get(i + 1)
-                .is_some_and(|n| GENERIC.contains(n.text.as_str()));
-            // - capitalised mid-sentence ("is Hayvern any good"), or the message's subject
-            //   ("Hayvern phone number?");
-            let written_as_name = (t.name_like() && len >= 3) || (t.initial && len >= 4);
-            // - right after a word that introduces a name ("the number for hayvern").
-            let named = len >= 4
-                && prev(1)
-                    .is_some_and(|p| ["for", "about", "list", "contact", "called"].contains(&p));
-            let alone = (with_trade_word || written_as_name || named || code)
-                && (!COMMON_NAMES.contains(w) || with_trade_word)
-                && !introduces_self
-                && !after_place_word;
-            query.push((w, alone, t.capital));
+            let suffix_next = next.is_some_and(|n| NAME_SUFFIX.contains(&n.text.as_str()));
+            // "Curious Electrics", "Simon Electrical": capitalised name and suffix.
+            let capitalised_name = suffix_next && t.capital && next.is_some_and(|n| n.capital);
+            let common = everyday_word(w);
+            let person = first_name(w);
+            // Whether this one word, on its own, names a business:
+            let alone = !introduces_self
+                && !after_place_word
+                && if person {
+                    // a first name only as part of a capitalised name ("Simon Electrical");
+                    capitalised_name
+                } else if common {
+                    // an English word only when written as a name ("is Voltage any good?");
+                    capitalised_name || (t.name_like() && len >= 3)
+                } else {
+                    // anything else ("Hayvern", "jax group", "2K") when it looks like a subject.
+                    suffix_next
+                        || code
+                        || (t.name_like() && len >= 3)
+                        || (t.initial && len >= 4)
+                        || (len >= 4 && prev(1).is_some_and(|p| NAME_CUES.contains(&p)))
+                };
+            query.push((w, alone, t.capital, !common && !person));
         }
         // Name words the question contains: exactly, or misspelt when written like a name.
-        // (index word, matched exactly, could stand alone)
-        let mut matched: Vec<(&str, &[u32], bool, bool)> = Vec::new();
+        // (index word, matched exactly, could stand alone, capitalised, uncommon)
+        type Matched<'a> = (&'a str, &'a [u32], bool, bool, bool, bool);
+        let mut matched: Vec<Matched> = Vec::new();
         let mut fuzzy_left = MAX_TYPO_WORDS;
-        for &(q, alone, capital) in &query {
+        for &(q, alone, capital, uncommon) in &query {
             if let Some((word, ids)) = self.name_index.get_key_value(q) {
-                matched.push((word, ids, true, alone));
+                matched.push((word, ids, true, alone, capital, uncommon));
             } else if alone && capital && q.chars().count() >= 6 && fuzzy_left > 0 {
                 fuzzy_left -= 1;
                 for (word, ids) in &self.name_index {
                     if word.chars().count() >= 6 && plausible_typo(q, word) {
-                        matched.push((word, ids, false, alone));
+                        matched.push((word, ids, false, alone, capital, uncommon));
                     }
                 }
             }
         }
-        // listing -> (matched words, matched exactly, any matched word of 4+ chars, any alone)
-        let mut scores: HashMap<u32, (Vec<&str>, usize, bool, bool)> = HashMap::new();
-        for (word, ids, exact, alone) in matched {
+        #[derive(Default)]
+        struct Score<'a> {
+            words: Vec<&'a str>,
+            exact: usize,
+            long: bool,
+            alone: bool,
+            all_capital: bool,
+            uncommon: bool,
+        }
+        let mut scores: HashMap<u32, Score> = HashMap::new();
+        for (word, ids, exact, alone, capital, uncommon) in matched {
             for &id in ids {
-                let e = scores.entry(id).or_default();
-                if !e.0.contains(&word) {
-                    e.0.push(word);
-                    e.1 += usize::from(exact);
-                    e.2 |= word.chars().count() >= 4;
-                    e.3 |= alone;
+                let e = scores.entry(id).or_insert_with(|| Score {
+                    all_capital: true,
+                    ..Score::default()
+                });
+                if !e.words.contains(&word) {
+                    e.words.push(word);
+                    e.exact += usize::from(exact);
+                    e.long |= word.chars().count() >= 4;
+                    e.alone |= alone;
+                    e.all_capital &= capital;
+                    e.uncommon |= uncommon;
                 }
             }
         }
+        let mut phrase_checks = 50;
         let mut hits: Vec<(u32, u32, u32)> = scores
             .into_iter()
-            .filter_map(|(id, (words, exact, long, alone))| {
+            .filter_map(|(id, sc)| {
+                let Score {
+                    words,
+                    exact,
+                    long,
+                    alone,
+                    all_capital,
+                    uncommon,
+                } = sc;
                 let listing = &self.listings[id as usize];
                 let n = listing.name_words as usize;
                 let m = words.len();
-                // Two distinctive words of the name, or one written like a name.
-                let strong = m >= 2 || alone;
+                // One word written like a name; two words of the name, at least one of them not
+                // an everyday word or written as a name ("Simon Dean"); or the whole name after a
+                // word that introduces one ("do you list curious electrics").
+                let strong = alone
+                    || (m >= 2 && (uncommon || all_capital))
+                    || (phrase_checks > 0 && {
+                        phrase_checks -= 1;
+                        self.whole_name_after_cue(toks, &listing.name)
+                    });
                 // With a town in the question, a one-word match must be in that town.
                 let in_place = places.is_empty()
                     || places
@@ -1121,6 +1239,23 @@ impl Listings {
             .map(|(_, _, id)| id)
             .take(MAX_ROWS)
             .collect()
+    }
+
+    /// True if the whole business name ("Curious Electrics", ignoring "Ltd") is in the message,
+    /// right after a word like "list" or "about". Service words in it count ("revive rewire").
+    fn whole_name_after_cue(&self, toks: &[Tok], name: &str) -> bool {
+        let words: Vec<String> = words_of(name)
+            .into_iter()
+            .filter(|w| !["ltd", "limited", "llp", "plc"].contains(&w.as_str()))
+            .collect();
+        if words.len() < 2 {
+            return false;
+        }
+        (1..toks.len()).any(|i| {
+            toks.len() - i >= words.len()
+                && NAME_CUES.contains(&toks[i - 1].text.as_str())
+                && words.iter().zip(&toks[i..]).all(|(w, t)| *w == t.text)
+        })
     }
 
     /// A capitalised multi-word phrase that is not a place or service: probably a business name
@@ -1616,6 +1751,70 @@ mod tests {
             let b = DEMO.block(q, "");
             assert!(!b.contains("No listing matches"), "{q}: {b}");
         }
+    }
+
+    #[test]
+    fn service_phrases_first_names_and_dictionary_words_never_name_a_firm() {
+        // QA re-review repros (R4 and R5).
+        for q in [
+            "Complete rewire please",
+            "complete rewire please",
+            "Total rewire cost?",
+            "switch repair cost?",
+            "plug installation cost",
+            "safe electrical work?",
+            "smart energy meters",
+            "Bright security lights fitted",
+            "heritage property rewire",
+            "Quick response electrician needed",
+            "I want the ideal electrician",
+            "Handy electrician near me",
+            "Kinetic energy",
+            "James here, can you call me tomorrow?",
+            "Simon here",
+            "Thanks Simon",
+            "Mark here, about my fuse box",
+            "Peter from up the road said to ask",
+            "Dave again",
+            "Voltage keeps dropping",
+            "worried about voltage drop",
+            "Response time?",
+            "Route the cable under the floor",
+            "Workshop needs three phase",
+            "power for workshop",
+            "Mayday! my power is out",
+            "Plus VAT?",
+            "Brown wire or blue wire?",
+            "Blue light flashing on my consumer unit",
+            "Dream kitchen lighting ideas",
+            "Lime plaster walls need new sockets",
+            "King size bed lighting",
+            "Precision lighting design",
+            "Down to earth advice please",
+            "Cook electric hob installation",
+            "Hill top house rewire",
+            "Smart meters?",
+            "Total cost?",
+            "Bright idea",
+        ] {
+            let m = DEMO.lookup(q, "");
+            assert!(m.names.is_empty(), "{q}: {:?}", m.names);
+        }
+    }
+
+    #[test]
+    fn the_word_lists_are_sorted_and_searchable() {
+        for list in [ENGLISH_WORDS, FIRST_NAMES] {
+            let words: Vec<&str> = list.lines().collect();
+            assert!(words.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+            for w in words.iter().step_by(997) {
+                assert!(in_word_list(list, w), "{w}");
+            }
+        }
+        assert!(everyday_word("voltage") && everyday_word("complete"));
+        assert!(!everyday_word("hayvern") && !everyday_word("jax"));
+        assert!(first_name("simon") && !first_name("hayvern"));
+        assert!(!in_word_list(ENGLISH_WORDS, "") && !in_word_list(ENGLISH_WORDS, "zzzzzzzz"));
     }
 
     #[test]
