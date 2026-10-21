@@ -909,6 +909,8 @@ pub struct ChatSession {
     session_id: String,
     history: Vec<Message>,
     pending_leads: HashMap<String, Lead>,
+    /// The last postcode district the visitor gave, for later directory turns.
+    last_outcode: Option<String>,
     turns: usize,
     /// Rate-limit key of the visitor (IP or /64), used by the availability breaker.
     client: String,
@@ -927,6 +929,7 @@ impl ChatSession {
             session_id,
             history: vec![system],
             pending_leads: HashMap::new(),
+            last_outcode: None,
             turns: 0,
             client: String::new(),
             resume_token: None,
@@ -1179,7 +1182,10 @@ impl ChatSession {
             system.content.push_str(&excerpts.join("\n"));
             // Directory bots: the matching listings, looked up in code (no tools here).
             if let Some(listings) = &self.site.listings {
-                system.content.push_str(&listings.block(text, previous));
+                let (block, keep) =
+                    listings.block_for(text, previous, self.last_outcode.as_deref());
+                system.content.push_str(&block);
+                self.last_outcode = keep;
             }
             if self.site.lead_capture {
                 system.content.push_str(TEXT_ONLY_LEAD_INSTRUCTIONS);

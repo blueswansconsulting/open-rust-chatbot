@@ -7,6 +7,7 @@ pub mod kb;
 pub mod listings;
 pub mod llm;
 pub mod log;
+pub mod postcodes;
 pub mod rate_limit;
 pub mod sites;
 pub mod tools;
