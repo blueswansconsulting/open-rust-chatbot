@@ -58,7 +58,7 @@ Then add this to your website, just before `</body>`:
 | Ollama (local) | `http://localhost:11434/v1` | `llama3.1` | not needed |
 | OpenClaw bridge | set `LLM_PROVIDER=openclaw` | — | `OPENCLAW_BRIDGE_TOKEN` |
 
-Models must support tool calling for knowledge-base search and lead cards. With the OpenClaw bridge (text only), the server retrieves knowledge-base excerpts itself and offers the lead card when a visitor types an email address. **The bridge agent must have no tools**, because every visitor is untrusted.
+Models must support tool calling for knowledge-base search and lead cards. With the OpenClaw bridge (text only), the server retrieves knowledge-base excerpts (and, for directory bots, matching listings) itself and offers the lead card when a visitor types an email address, or a phone number while asking to be called. **The bridge agent must have no tools**, because every visitor is untrusted.
 
 ### Deploying
 
@@ -175,7 +175,7 @@ single-site mode `/config` answers with nulls. If you proxy legacy paths to a bo
 }
 ```
 
-`version`, `partnerId` and `caps` are optional. `partnerId` and `caps` are never sent to browsers.
+`version`, `partnerId`, `caps` and `datasets` are optional. `partnerId` and `caps` are never sent to browsers.
 
 or `404` for an unknown or paused bot (a `status` other than `active` is also treated as not found).
 `instructions` may use `{bot_name}` and `{lead_instructions}`; when empty the default prompt is used.
@@ -190,6 +190,39 @@ slot, then gets `503`. `allowedOrigins` entries must be exact origins
 anything else is ignored.
 Unknown ids are remembered for 10 seconds. A conversation's resume token only works on the bot it
 started on, and edits (or pausing the bot) apply to open chats from their next message.
+
+**Listings datasets (directory bots).** A bot record may carry
+`"datasets": {"listings": {"version": 3, "sha256": "<64 hex>", "bytes": 182345}}` (or `null`).
+The server then fetches `GET SITES_API_URL/<id>/datasets/listings?sha=<sha256>` with the same
+bearer token (at most 3 MB, 10 s), checks the body's sha256 (over the body as sent, or over its
+canonical JSON: keys sorted, no whitespace) and parses it once. The parsed dataset is kept per bot
+and only replaced when the sha changes, so settings-only edits and invalidations never refetch it.
+If a new dataset can't be fetched or fails the check, the previous one keeps being served (and the
+same sha is retried after 30 seconds, or straight after an invalidation). `datasets: null` drops it.
+Bots without `datasets` behave exactly as before. The dataset (schema v1) is public directory data:
+
+```json
+{
+  "schema_version": 1,
+  "services": [{"slug": "commercial-electricians", "name": "Commercial electricians", "aliases": ["commercial"]}],
+  "places": [{"slug": "bolton", "name": "Bolton", "aliases": ["bolton"],
+              "hub_urls": {"commercial-electricians": "https://host/commercial-electricians/bolton", "": "https://host/electricians/bolton"}}],
+  "listings": [{"id": "…", "name": "Hayvern Electrical Ltd", "profile_url": "https://host/electricians/hayvern-…",
+                "phone": "01204 579975", "website": null, "town": "Bolton", "outcode": "BL1",
+                "places": ["bolton"], "services": ["commercial-electricians"], "rating": 4.8, "review_count": 26,
+                "rating_source": "Google", "evidence_checked_on": "2026-09-13",
+                "verified": false, "featured": false, "sponsored": false, "position": 12}]
+}
+```
+
+At most 5,000 listings. Every turn the server looks up the visitor's message (and their previous
+message, for follow-ups like "and in Oldham?") by service (dataset names and aliases plus built-in
+synonyms such as "fuse box" or "landlord certificate"), place (whole words, one-letter typos of
+place names, everyday-word places like Reading only after "in/near/…" or next to a trade word) and
+business name. Text-only models get up to 10 matching rows, honest counts ("5 of 5", "10 of 154"),
+hub page links and explicit "no listings" notes appended after the knowledge-base excerpts, at most
+3,000 characters; tool-calling models get the same text from a `search_directory_listings` tool.
+Listing text is treated as untrusted data: cleaned, length-capped and quoted.
 
 **Reply caps.** With `caps`, a bot answers at most `repliesPerHour` and `repliesPerDay` turns, and all
 bots with the same `partnerId` together at most `partnerRepliesPerDay` a day (UTC). One visitor can

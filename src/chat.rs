@@ -69,13 +69,32 @@ type Sender = UnboundedSender<String>;
 
 static EMAIL_IN_TEXT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap());
+/// A UK-style phone number typed by the visitor ("07700 900123", "+44 7700 900123").
+static PHONE_IN_TEXT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:\+44\s?\d|\b0\d)[\d ]{7,12}\d\b").unwrap());
+/// The visitor asking to be called back, so a phone number they typed is a lead.
+static CALL_ME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:call|ring|phone|text|contact)\s+(?:me|us)\b|\bcall[- ]?back\b|\bget (?:back )?in touch\b").unwrap()
+});
 
 fn send(tx: &Sender, frame: Value) {
     let _ = tx.send(frame.to_string());
 }
 
 /// Text-only models can't call tools, so they signal a call-back request with one hidden line.
-const TEXT_ONLY_LEAD_INSTRUCTIONS: &str = "\n\nCall-back requests: when, and only when, the visitor has asked to be called or contacted and has given their name and a phone number or email, end your reply with one extra final line in exactly this form: LEAD: {\"name\":\"...\",\"phone\":\"...\",\"email\":\"...\",\"best_time\":\"...\",\"message\":\"...\"} using null for anything they did not give and only details the visitor actually wrote. The visitor will be shown their details to confirm. Never mention or explain this line.";
+const TEXT_ONLY_LEAD_INSTRUCTIONS: &str = "\n\nCall-back requests: when, and only when, the visitor has asked to be called or contacted and has given a phone number or email (a name too if they gave one), end your reply with one extra final line in exactly this form: LEAD: {\"name\":\"...\",\"phone\":\"...\",\"email\":\"...\",\"best_time\":\"...\",\"message\":\"...\"} using null for anything they did not give and only details the visitor actually wrote. A phone number alone is enough: do not ask for an email as well. The visitor will be shown their details to confirm. Never mention or explain this line.";
+/// Directory bots: leads go to the directory's own team, not to the listed businesses.
+const TEXT_ONLY_DIRECTORY_LEADS: &str = " This site is a directory: a call-back request goes to the directory team, who follow up themselves. Say so, and never say a listed business has been told, will call, or has been booked.";
+
+/// Contact details a visitor typed: an email, or a phone number when they ask to be called.
+fn fallback_contact(text: &str) -> Option<(Option<String>, Option<String>)> {
+    let email = EMAIL_IN_TEXT.find(text).map(|m| m.as_str().to_owned());
+    let phone = PHONE_IN_TEXT
+        .find(text)
+        .filter(|_| CALL_ME.is_match(text))
+        .map(|m| m.as_str().trim().to_owned());
+    (email.is_some() || phone.is_some()).then_some((email, phone))
+}
 
 /// Splits a text-only reply into what the visitor sees and the optional `LEAD: {…}` arguments.
 pub(crate) fn split_lead_line(raw: &str) -> (String, Option<serde_json::Map<String, Value>>) {
@@ -381,10 +400,11 @@ impl ChatSession {
     async fn run_text_only_turn(&mut self, text: &str, tx: &Sender) -> Result<(), String> {
         let max_history = self.shared.config.limits.max_history_messages;
         let mut messages = trim_history(&self.history, max_history);
+        let previous = previous_question(&self.history, text);
         let excerpts: Vec<String> = self
             .site
             .kb
-            .retrieve_for_turn(text, previous_question(&self.history, text))
+            .retrieve_for_turn(text, previous)
             .iter()
             .map(|c| format!("[{}] {}", c.header_path.join(" > "), c.text))
             .collect();
@@ -395,8 +415,15 @@ impl ChatSession {
                 "\n\nKnowledge-base excerpts (the only facts you may state about the business):\n"
             });
             system.content.push_str(&excerpts.join("\n"));
+            // Directory bots: the matching listings, looked up in code (no tools here).
+            if let Some(listings) = &self.site.listings {
+                system.content.push_str(&listings.block(text, previous));
+            }
             if self.site.lead_capture {
                 system.content.push_str(TEXT_ONLY_LEAD_INSTRUCTIONS);
+                if self.site.listings.is_some() {
+                    system.content.push_str(TEXT_ONLY_DIRECTORY_LEADS);
+                }
             }
         }
         // Text-only providers answer in one piece, so buffer it to take out the hidden lead line.
@@ -414,13 +441,21 @@ impl ChatSession {
         self.history.push(Message::new(Role::Assistant, reply));
         self.history = trim_history(&self.history, max_history);
 
-        if let Some(arguments) = lead_args.filter(|_| self.site.lead_capture) {
+        if let Some(mut arguments) = lead_args.filter(|_| self.site.lead_capture) {
+            // A phone number or email is enough; the name is optional for text-only models.
+            let named = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.trim().is_empty());
+            if !named {
+                arguments.insert("name".into(), json!("Website visitor"));
+            }
             let call = ToolCall {
                 id: "text-lead".into(),
                 name: "propose_lead".into(),
                 arguments,
             };
-            if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, &call) {
+            if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, None, &call) {
                 self.offer_lead(lead, tx);
             }
             send(tx, json!({ "type": "done" }));
@@ -431,20 +466,25 @@ impl ChatSession {
             return Ok(());
         }
 
-        // Fallback when the model didn't add a lead line: offer a card for an email in the text.
-        let email = EMAIL_IN_TEXT.find(text).filter(|_| self.site.lead_capture);
-        if let Some(email) = email {
+        // Fallback when the model didn't add a lead line: offer a card for an email in the text,
+        // or for a phone number when the visitor asks to be called.
+        if let Some((email, phone)) = self
+            .site
+            .lead_capture
+            .then(|| fallback_contact(text))
+            .flatten()
+        {
             let mut arguments = serde_json::Map::new();
             arguments.insert("name".into(), json!("Website visitor"));
-            arguments.insert("email".into(), json!(email.as_str()));
-            arguments.insert("phone".into(), Value::Null);
+            arguments.insert("email".into(), email.map_or(Value::Null, |e| json!(e)));
+            arguments.insert("phone".into(), phone.map_or(Value::Null, |p| json!(p)));
             arguments.insert("message".into(), json!(text));
             let call = ToolCall {
                 id: "server-lead".into(),
                 name: "propose_lead".into(),
                 arguments,
             };
-            if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, &call) {
+            if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, None, &call) {
                 self.offer_lead(lead, tx);
             }
         }
@@ -481,7 +521,7 @@ impl ChatSession {
             .iter()
             .any(|t| t.name == call.name);
         let outcome = if offered {
-            tools::execute(&self.site.kb, call)
+            tools::execute(&self.site.kb, self.site.listings.as_deref(), call)
         } else {
             ToolOutcome::Result(json!({ "error": format!("unknown tool {}", call.name) }))
         };
@@ -595,6 +635,35 @@ mod tests {
         );
         let (visible, lead) = split_lead_line("No lead here.");
         assert_eq!((visible.as_str(), lead.is_none()), ("No lead here.", true));
+    }
+
+    #[test]
+    fn a_typed_phone_number_is_a_lead_only_when_asking_for_a_call() {
+        assert_eq!(
+            fallback_contact("Please call me back on 07700 900123"),
+            Some((None, Some("07700 900123".into())))
+        );
+        assert_eq!(
+            fallback_contact("ring me on +44 7700 900123 after 5"),
+            Some((None, Some("+44 7700 900123".into())))
+        );
+        assert_eq!(
+            fallback_contact("Is 01204 579975 the right number for Hayvern?"),
+            None
+        );
+        assert_eq!(
+            fallback_contact("sam@example.com"),
+            Some((Some("sam@example.com".into()), None))
+        );
+        assert_eq!(fallback_contact("call me maybe"), None);
+    }
+
+    #[test]
+    fn text_only_lead_instructions_accept_a_phone_alone_and_name_no_tool() {
+        assert!(TEXT_ONLY_LEAD_INSTRUCTIONS.contains("phone number or email"));
+        assert!(TEXT_ONLY_LEAD_INSTRUCTIONS.contains("A phone number alone is enough"));
+        assert!(!TEXT_ONLY_LEAD_INSTRUCTIONS.contains("propose_lead"));
+        assert!(TEXT_ONLY_DIRECTORY_LEADS.contains("directory team"));
     }
 
     #[test]

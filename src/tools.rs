@@ -1,7 +1,9 @@
 //! Tools the model may call. They are deliberately narrow: read-only knowledge-base search,
-//! and a lead *proposal* that only the visitor (not the model) can confirm.
+//! read-only directory listings lookup (only for bots with a listings dataset), and a lead
+//! *proposal* that only the visitor (not the model) can confirm.
 
 use crate::kb::KnowledgeBase;
+use crate::listings::Listings;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -80,6 +82,20 @@ pub fn definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Offered only to bots that carry a listings dataset.
+pub const LISTINGS_TOOL: &str = "search_directory_listings";
+
+pub fn listings_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: LISTINGS_TOOL,
+        description: "Look up the businesses listed in this directory by service, town or business name. Returns the matching listings (up to 10 rows) with the total count. Use it before naming any business, and name only businesses it returns.",
+        parameters: object(
+            &["query"],
+            json!({ "query": { "type": "string", "description": "The visitor's request, including the service and town or the business name" } }),
+        ),
+    }
+}
+
 fn string_arg(args: &Map<String, Value>, key: &str) -> String {
     args.get(key)
         .and_then(Value::as_str)
@@ -94,8 +110,13 @@ fn clip(s: String, max: usize) -> String {
         .collect()
 }
 
-pub fn execute(kb: &KnowledgeBase, call: &ToolCall) -> ToolOutcome {
+pub fn execute(kb: &KnowledgeBase, listings: Option<&Listings>, call: &ToolCall) -> ToolOutcome {
     match call.name.as_str() {
+        LISTINGS_TOOL if listings.is_some() => {
+            let query = clip(string_arg(&call.arguments, "query"), MAX_FIELD_CHARS);
+            let block = listings.map(|l| l.block(&query, "")).unwrap_or_default();
+            ToolOutcome::Result(json!({ "listings": block.trim() }))
+        }
         "search_knowledge_base" => {
             let query = clip(string_arg(&call.arguments, "query"), MAX_FIELD_CHARS);
             let matches = kb.retrieve(&query);
@@ -174,7 +195,7 @@ mod tests {
 
     #[test]
     fn schemas_are_strict() {
-        for def in definitions() {
+        for def in definitions().into_iter().chain([listings_definition()]) {
             assert_eq!(def.parameters["additionalProperties"], false);
             let required = def.parameters["required"].as_array().unwrap();
             for key in def.parameters["properties"].as_object().unwrap().keys() {
@@ -187,6 +208,7 @@ mod tests {
     fn search_returns_sections_or_a_no_guess_instruction() {
         let ToolOutcome::Result(hit) = execute(
             &kb(),
+            None,
             &call("search_knowledge_base", json!({"query": "opening hours"})),
         ) else {
             panic!()
@@ -194,6 +216,7 @@ mod tests {
         assert_eq!(hit["results"][0]["section"], "Opening hours");
         let ToolOutcome::Result(miss) = execute(
             &kb(),
+            None,
             &call("search_knowledge_base", json!({"query": "zzz"})),
         ) else {
             panic!()
@@ -205,6 +228,7 @@ mod tests {
     fn propose_lead_validates_and_normalises() {
         let ok = execute(
             &kb(),
+            None,
             &call(
                 "propose_lead",
                 json!({"name": " Sam ", "email": "Sam@Example.com", "phone": null, "message": "call me"}),
@@ -224,6 +248,7 @@ mod tests {
 
         let bad = execute(
             &kb(),
+            None,
             &call(
                 "propose_lead",
                 json!({"name": "", "email": "nope", "phone": "<script>", "message": null}),
@@ -240,6 +265,7 @@ mod tests {
         let long = "a".repeat(5000);
         let out = execute(
             &kb(),
+            None,
             &call(
                 "propose_lead",
                 json!({"name": format!("Sam\u{0007}{long}"), "email": "s@x.io", "phone": null, "message": long}),
@@ -260,6 +286,7 @@ mod tests {
     fn call_back_request_needs_a_phone_or_email_and_keeps_best_time() {
         let phone_only = execute(
             &kb(),
+            None,
             &call(
                 "propose_lead",
                 json!({"name": "Jo", "email": null, "phone": "07700 900123", "best_time": "after 5pm", "message": "wants a demo"}),
@@ -273,6 +300,7 @@ mod tests {
 
         let neither = execute(
             &kb(),
+            None,
             &call(
                 "propose_lead",
                 json!({"name": "Jo", "email": null, "phone": null, "best_time": null, "message": null}),
@@ -285,8 +313,37 @@ mod tests {
     }
 
     #[test]
+    fn listings_tool_returns_the_same_block_and_only_with_a_dataset() {
+        let listings = Listings::parse(
+            include_str!("../tests/fixtures/listings-demo.json").as_bytes(),
+            "demo",
+        )
+        .unwrap();
+        let c = call(
+            LISTINGS_TOOL,
+            json!({"query": "Who are the commercial electricians in Bolton?"}),
+        );
+        let ToolOutcome::Result(v) = execute(&kb(), Some(&listings), &c) else {
+            panic!()
+        };
+        let text = v["listings"].as_str().unwrap();
+        assert!(
+            text.contains("5 of 5") && text.contains("Hayvern Electrical Ltd"),
+            "{text}"
+        );
+        let ToolOutcome::Result(v) = execute(&kb(), None, &c) else {
+            panic!()
+        };
+        assert!(v["error"].as_str().unwrap().contains("unknown tool"));
+        // The existing tool names are unchanged.
+        let names: Vec<&str> = definitions().iter().map(|d| d.name).collect();
+        assert_eq!(names, ["search_knowledge_base", "propose_lead"]);
+    }
+
+    #[test]
     fn unknown_tool_is_reported_not_executed() {
-        let ToolOutcome::Result(v) = execute(&kb(), &call("delete_everything", json!({}))) else {
+        let ToolOutcome::Result(v) = execute(&kb(), None, &call("delete_everything", json!({})))
+        else {
             panic!()
         };
         assert!(v["error"].as_str().unwrap().contains("unknown tool"));

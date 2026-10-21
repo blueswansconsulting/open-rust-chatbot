@@ -4,9 +4,15 @@
 //! (see README "Multi-site mode"). `404` (or `status` other than `active`) means the bot does not
 //! exist. Each bot is cached for `SITES_CACHE_SECONDS`; while the API is unreachable the last good
 //! copy is served for up to `SITES_STALE_SECONDS`, after which requests get `503`.
+//!
+//! A bot record may name a listings dataset (`datasets.listings.sha256`). It is fetched from
+//! `GET {SITES_API_URL}/{id}/datasets/listings?sha=…`, checked against that sha256, parsed once
+//! and kept per bot until the sha changes, so settings-only edits never refetch it. If a new
+//! dataset can't be fetched, the previous one keeps being served.
 
-use crate::config::{render_system_prompt, valid_origin, Config, SitesConfig};
+use crate::config::{render_system_prompt, valid_origin, Config, SitesConfig, SAFETY_RULES};
 use crate::kb::KnowledgeBase;
+use crate::listings::Listings;
 use crate::tools::{self, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -27,6 +33,16 @@ const MAX_CACHED_IDS: usize = 10_000;
 const MAX_CONCURRENT_FETCHES: usize = 16;
 /// How long a request for a bot with no usable copy waits for a fetch slot before a 503.
 const SLOT_WAIT: Duration = Duration::from_secs(2);
+/// Largest listings dataset body accepted.
+pub const MAX_DATASET_BYTES: usize = 3 * 1024 * 1024;
+const DATASET_TIMEOUT: Duration = Duration::from_secs(10);
+/// After a dataset fetch fails, the same sha is not retried for this long (unless invalidated).
+const DATASET_RETRY: Duration = Duration::from_secs(30);
+/// The sites API's answer when the requested sha is no longer the bot's current dataset.
+const NOT_CURRENT: &str = "sha not current (HTTP 404)";
+
+/// Tool-calling directory bots are told to use the listings tool (before the safety rules).
+const DIRECTORY_TOOL_HINT: &str = "\n\nThis site is a directory of businesses. To say which businesses are listed (by service, town or business name), call search_directory_listings and name only businesses it returns, with the counts it gives; links in its results may be shared. A call-back request goes to the directory team, who follow up themselves, not to a listed business.";
 
 /// Everything one bot needs to chat. In single-site mode there is one, built from the env.
 pub struct Site {
@@ -35,6 +51,8 @@ pub struct Site {
     pub bot_name: String,
     pub system_prompt: String,
     pub kb: Arc<KnowledgeBase>,
+    /// The directory listings dataset, for bots that have one.
+    pub listings: Option<Arc<Listings>>,
     pub lead_capture: bool,
     pub tool_definitions: Vec<ToolDefinition>,
     /// Where confirmed leads go (already carrying `site=<id>` in multi-site mode).
@@ -63,11 +81,15 @@ pub struct SpendCaps {
     pub partner_replies_per_day: Option<u32>,
 }
 
-fn tool_definitions(lead_capture: bool) -> Vec<ToolDefinition> {
-    tools::definitions()
+fn tool_definitions(lead_capture: bool, listings: bool) -> Vec<ToolDefinition> {
+    let mut defs: Vec<ToolDefinition> = tools::definitions()
         .into_iter()
         .filter(|t| lead_capture || t.name != "propose_lead")
-        .collect()
+        .collect();
+    if listings {
+        defs.push(tools::listings_definition());
+    }
+    defs
 }
 
 impl Site {
@@ -78,8 +100,9 @@ impl Site {
             bot_name: config.bot_name.clone(),
             system_prompt: config.system_prompt.clone(),
             kb: Arc::new(kb),
+            listings: None,
             lead_capture: config.lead_capture,
-            tool_definitions: tool_definitions(config.lead_capture),
+            tool_definitions: tool_definitions(config.lead_capture, false),
             lead_webhook_url: config.lead_webhook_url.clone(),
             allowed_origins: config.allowed_origins.clone(),
             public_config: json!({
@@ -99,6 +122,7 @@ impl Site {
             bot_name: "b".into(),
             system_prompt: String::new(),
             kb: Arc::new(KnowledgeBase::from_markdown("")),
+            listings: None,
             lead_capture: false,
             tool_definitions: Vec::new(),
             lead_webhook_url: None,
@@ -174,6 +198,17 @@ struct BotRecord {
     partner_id: Option<String>,
     #[serde(default)]
     caps: SpendCaps,
+    /// `{"listings": {"version", "sha256", "bytes"}}` or null. Read leniently: an unexpected
+    /// shape means "no dataset", never a broken bot.
+    #[serde(default)]
+    datasets: Option<Value>,
+}
+
+/// The listings dataset a bot record points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatasetRef {
+    sha256: String,
+    bytes: Option<u64>,
 }
 
 impl BotRecord {
@@ -181,6 +216,44 @@ impl BotRecord {
         match self.version {
             Some(v) => format!("v{v}"),
             None => self.updated_at.clone(),
+        }
+    }
+
+    fn listings_ref(&self) -> Option<DatasetRef> {
+        let r = self.datasets.as_ref()?.get("listings")?;
+        let sha = r.get("sha256")?.as_str()?.trim().to_ascii_lowercase();
+        (sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then(|| DatasetRef {
+            sha256: sha,
+            bytes: r.get("bytes").and_then(Value::as_u64),
+        })
+    }
+}
+
+/// True if `body` hashes to `sha`, either as sent or as canonical JSON (keys sorted, compact).
+fn sha_matches(body: &[u8], sha: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    if hex::encode(Sha256::digest(body)) == sha {
+        return true;
+    }
+    // serde_json's map is ordered by key (no preserve_order feature), so this is canonical.
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| serde_json::to_vec(&v).ok())
+        .is_some_and(|canonical| hex::encode(Sha256::digest(&canonical)) == sha)
+}
+
+/// Reads at most `max` bytes of a response body, whatever it claims.
+async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, String> {
+    if response.content_length().is_some_and(|n| n > max as u64) {
+        return Err("response too large".into());
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if body.len() + chunk.len() <= max => body.extend_from_slice(&chunk),
+            Ok(None) => return Ok(body),
+            Ok(Some(_)) => return Err("response too large".into()),
+            Err(_) => return Err("response unreadable".into()),
         }
     }
 }
@@ -319,6 +392,14 @@ pub struct SiteStore {
     invalidations: AtomicU64,
     /// Bots with a background refresh in flight.
     refreshing: Mutex<std::collections::HashSet<String>>,
+    /// True for text-only providers (no tool calling).
+    text_only: bool,
+    /// The parsed listings dataset per bot. Kept apart from the bot cache so an invalidation
+    /// (a settings edit) doesn't throw it away: it is replaced only when its sha changes.
+    datasets: Mutex<HashMap<String, Arc<Listings>>>,
+    /// Last failed dataset fetch per bot: (sha, when), so a broken dataset isn't refetched on
+    /// every request.
+    dataset_failures: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl SiteStore {
@@ -336,6 +417,9 @@ impl SiteStore {
             fetch_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_FETCHES),
             invalidations: AtomicU64::new(0),
             refreshing: Mutex::default(),
+            text_only: !config.llm.supports_tools(),
+            datasets: Mutex::default(),
+            dataset_failures: Mutex::default(),
         }
     }
 
@@ -343,6 +427,111 @@ impl SiteStore {
         let mut entries = self.entries.lock().unwrap();
         entries.remove(id);
         self.invalidations.fetch_add(1, Ordering::SeqCst);
+        // Something changed: a dataset that failed before may be fetchable now.
+        self.dataset_failures.lock().unwrap().remove(id);
+    }
+
+    /// Drops a bot's dataset (it was removed, or the bot is gone).
+    fn forget_dataset(&self, id: &str) {
+        self.datasets.lock().unwrap().remove(id);
+        self.dataset_failures.lock().unwrap().remove(id);
+    }
+
+    /// The dataset `wanted` names: the cached one if its sha matches, else a fresh fetch. On any
+    /// failure the previous dataset (if any) is kept. The flag is true when the sites API says
+    /// that sha is no longer current (404), so the caller should re-read the bot.
+    async fn listings_for(
+        &self,
+        id: &str,
+        wanted: Option<DatasetRef>,
+    ) -> (Option<Arc<Listings>>, bool) {
+        let Some(wanted) = wanted else {
+            self.forget_dataset(id);
+            return (None, false);
+        };
+        let current = self.datasets.lock().unwrap().get(id).cloned();
+        if current
+            .as_ref()
+            .is_some_and(|l| l.sha256() == wanted.sha256)
+        {
+            return (current, false);
+        }
+        let failed_recently = self
+            .dataset_failures
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|(sha, at)| *sha == wanted.sha256 && at.elapsed() < DATASET_RETRY);
+        if failed_recently {
+            return (current, false);
+        }
+        match self.fetch_listings(id, &wanted).await {
+            Ok(listings) => {
+                crate::log::log_event(
+                    "listings_loaded",
+                    json!({ "bot": id, "sha256": wanted.sha256, "listings": listings.len(), "bytes": listings.approx_bytes() }),
+                );
+                let listings = Arc::new(listings);
+                self.datasets
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_owned(), listings.clone());
+                self.dataset_failures.lock().unwrap().remove(id);
+                (Some(listings), false)
+            }
+            Err(detail) if detail == NOT_CURRENT => {
+                crate::log::log_event(
+                    "listings_sha_rotated",
+                    json!({ "bot": id, "sha256": wanted.sha256, "kept_previous": current.is_some() }),
+                );
+                (current, true)
+            }
+            Err(detail) => {
+                crate::log::log_event(
+                    "listings_fetch_failed",
+                    json!({ "bot": id, "sha256": wanted.sha256, "detail": detail, "kept_previous": current.is_some() }),
+                );
+                self.dataset_failures
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_owned(), (wanted.sha256.clone(), Instant::now()));
+                (current, false)
+            }
+        }
+    }
+
+    async fn fetch_listings(&self, id: &str, wanted: &DatasetRef) -> Result<Listings, String> {
+        if wanted.bytes.is_some_and(|b| b > MAX_DATASET_BYTES as u64) {
+            return Err("dataset too large".into());
+        }
+        let url = format!("{}/{id}/datasets/listings", self.settings.api_url);
+        let response = self
+            .http
+            .get(url)
+            .query(&[("sha", wanted.sha256.as_str())])
+            .timeout(DATASET_TIMEOUT)
+            .bearer_auth(&self.settings.token)
+            .send()
+            .await
+            .map_err(|e| e.without_url().to_string())?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(NOT_CURRENT.into());
+        }
+        if !status.is_success() {
+            return Err(format!("HTTP {}", status.as_u16()));
+        }
+        let body = read_capped(response, MAX_DATASET_BYTES).await?;
+        let sha = wanted.sha256.clone();
+        // Hashing and parsing up to 3 MB is CPU work: keep it off the (single) async thread.
+        tokio::task::spawn_blocking(move || {
+            if !sha_matches(&body, &sha) {
+                return Err("sha256 mismatch".to_owned());
+            }
+            Listings::parse(&body, &sha)
+        })
+        .await
+        .map_err(|_| "dataset parse panicked".to_owned())?
     }
 
     /// Loads a bot. A fresh cached copy is returned at once; an expired one (still within
@@ -397,7 +586,19 @@ impl SiteStore {
         // The knowledge base is parsed once per version, and outside the cache lock so a burst
         // of changed bots doesn't hold up every other lookup.
         let (built, fetched) = match fetched {
-            Fetched::Found(record) if record.status == "active" => {
+            Fetched::Found(mut record) if record.status == "active" => {
+                let (mut listings, rotated) = self.listings_for(id, record.listings_ref()).await;
+                if rotated {
+                    // The dataset changed between reading the bot and fetching it: read the bot
+                    // again for the new sha (once), instead of treating it as an error.
+                    if let Fetched::Found(newer) = self.fetch(id).await {
+                        if newer.status == "active" && newer.listings_ref() != record.listings_ref()
+                        {
+                            record = newer;
+                            listings = self.listings_for(id, record.listings_ref()).await.0;
+                        }
+                    }
+                }
                 let key = record.version_key();
                 let previous = match self.entries.lock().unwrap().get(id) {
                     Some(Entry::Found { site, .. }) => Some(site.clone()),
@@ -408,7 +609,7 @@ impl SiteStore {
                 let kb = previous
                     .filter(|site| !site.version_key.is_empty() && site.version_key == key)
                     .map(|site| site.kb.clone());
-                let site = Arc::new(self.build(id, *record, kb));
+                let site = Arc::new(self.build(id, *record, kb, listings));
                 (Some(site), Fetched::Missing)
             }
             other => (None, other),
@@ -436,6 +637,7 @@ impl SiteStore {
                 if cacheable {
                     entries.insert(id.to_owned(), Entry::Missing { at: now });
                 }
+                self.forget_dataset(id);
                 Err(SiteError::NotFound)
             }
             (None, Fetched::Failed) => match entries.get_mut(id) {
@@ -452,6 +654,7 @@ impl SiteStore {
                     // Too old to serve (or never loaded): drop it so nothing stale lingers.
                     if matches!(entries.get(id), Some(Entry::Found { .. })) {
                         entries.remove(id);
+                        self.forget_dataset(id);
                     }
                     Err(SiteError::Unavailable)
                 }
@@ -462,6 +665,11 @@ impl SiteStore {
                 Entry::Missing { at } => at.elapsed() >= NEGATIVE_TTL,
                 Entry::Found { site, fetched, .. } => fetched.elapsed() >= self.stale_ttl(site),
             });
+            // Datasets of evicted bots go too, so they stay within the cache budget.
+            self.datasets
+                .lock()
+                .unwrap()
+                .retain(|id, _| matches!(entries.get(id), Some(Entry::Found { .. })));
         }
         result
     }
@@ -540,23 +748,13 @@ impl SiteStore {
             return Fetched::Failed;
         }
         // Read at most MAX_RESPONSE_BYTES, whatever the response claims.
-        let mut response = response;
-        let mut body = Vec::new();
-        loop {
-            match response.chunk().await {
-                Ok(Some(chunk)) if body.len() + chunk.len() <= MAX_RESPONSE_BYTES => {
-                    body.extend_from_slice(&chunk)
-                }
-                Ok(None) => break,
-                Ok(Some(_)) | Err(_) => {
-                    crate::log::log_event(
-                        "sites_api_failed",
-                        json!({ "bot": id, "detail": "response too large or unreadable" }),
-                    );
-                    return Fetched::Failed;
-                }
-            }
-        }
+        let Ok(body) = read_capped(response, MAX_RESPONSE_BYTES).await else {
+            crate::log::log_event(
+                "sites_api_failed",
+                json!({ "bot": id, "detail": "response too large or unreadable" }),
+            );
+            return Fetched::Failed;
+        };
         match serde_json::from_slice::<BotRecord>(&body) {
             Ok(record) => Fetched::Found(Box::new(record)),
             Err(_) => {
@@ -569,10 +767,17 @@ impl SiteStore {
         }
     }
 
-    fn build(&self, id: &str, record: BotRecord, kb: Option<Arc<KnowledgeBase>>) -> Site {
+    fn build(
+        &self,
+        id: &str,
+        record: BotRecord,
+        kb: Option<Arc<KnowledgeBase>>,
+        listings: Option<Arc<Listings>>,
+    ) -> Site {
         let version_key = record.version_key();
         let size = record.knowledge_base.len() * 3
             + record.instructions.as_deref().map_or(0, str::len)
+            + listings.as_ref().map_or(0, |l| l.approx_bytes())
             + 4096;
         let bot_name = non_empty(record.bot_name)
             .or_else(|| non_empty(record.name.clone()))
@@ -595,12 +800,22 @@ impl SiteStore {
         let partner_id = non_empty(record.partner_id);
         let privacy_url = non_empty(record.privacy_url)
             .filter(|u| u.starts_with("https://") || u.starts_with("http://"));
+        let mut system_prompt =
+            render_system_prompt(&template, &bot_name, lead_capture, self.text_only);
+        if listings.is_some() && !self.text_only {
+            // Text-only bots get the lookup itself with every turn instead.
+            system_prompt.insert_str(
+                system_prompt.len() - SAFETY_RULES.len(),
+                DIRECTORY_TOOL_HINT,
+            );
+        }
         Site {
             id: id.to_owned(),
-            system_prompt: render_system_prompt(&template, &bot_name, lead_capture),
+            system_prompt,
             kb: kb
                 .unwrap_or_else(|| Arc::new(KnowledgeBase::from_markdown(&record.knowledge_base))),
-            tool_definitions: tool_definitions(lead_capture),
+            tool_definitions: tool_definitions(lead_capture, listings.is_some() && !self.text_only),
+            listings,
             lead_capture,
             lead_webhook_url,
             allowed_origins,
@@ -729,6 +944,46 @@ mod tests {
         assert_eq!(r.version_key(), "v7");
         r.version = None;
         assert_eq!(r.version_key(), "2026-10-19T17:00:00.000Z");
+    }
+
+    #[test]
+    fn dataset_refs_are_read_leniently() {
+        let sha = "a".repeat(64);
+        let r = |datasets: Value| -> Option<DatasetRef> {
+            serde_json::from_value::<BotRecord>(json!({"status": "active", "datasets": datasets}))
+                .unwrap()
+                .listings_ref()
+        };
+        assert_eq!(
+            r(json!({"listings": {"version": 3, "sha256": sha.to_uppercase(), "bytes": 10}})),
+            Some(DatasetRef {
+                sha256: sha.clone(),
+                bytes: Some(10)
+            })
+        );
+        assert_eq!(r(json!(null)), None);
+        assert_eq!(r(json!({"listings": null})), None);
+        assert_eq!(
+            r(json!({"listings": {"sha256": "abc"}})),
+            None,
+            "not a sha256"
+        );
+        assert_eq!(r(json!("garbage")), None);
+        // The currently deployed dashboard sends no `datasets` key at all.
+        let old: BotRecord = serde_json::from_value(json!({"status": "active"})).unwrap();
+        assert_eq!(old.listings_ref(), None);
+    }
+
+    #[test]
+    fn sha_is_checked_over_the_body_or_its_canonical_json() {
+        use sha2::{Digest, Sha256};
+        let body = br#"{ "b": 1, "a": [1, 2.5, "x"] }"#;
+        let raw = hex::encode(Sha256::digest(body));
+        let canonical = hex::encode(Sha256::digest(br#"{"a":[1,2.5,"x"],"b":1}"#));
+        assert!(sha_matches(body, &raw));
+        assert!(sha_matches(body, &canonical));
+        assert!(!sha_matches(body, &"0".repeat(64)));
+        assert!(!sha_matches(b"not json", &canonical));
     }
 
     #[test]
