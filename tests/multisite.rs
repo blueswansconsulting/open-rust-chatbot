@@ -1307,6 +1307,29 @@ async fn a_text_only_directory_bot_gets_the_matching_rows_after_the_kb_excerpts(
 }
 
 #[tokio::test]
+async fn a_postcode_ranks_listings_by_distance_and_carries_to_the_next_turn() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    let mut ws = connect(&h.addr, "dir", ALPHA_ORIGIN).await.unwrap();
+    for question in [
+        "my postcode is BL6 4AB, I need an EICR",
+        "what about emergency ones?",
+    ] {
+        ws.send(Message::Text(question.into())).await.unwrap();
+        until_done(&mut ws).await;
+        let p = last_prompt(&prompts);
+        assert!(p.contains("within 25 km of BL6"), "{question}: {p}");
+        assert!(p.contains("km away"), "{p}");
+    }
+    let p = last_prompt(&prompts);
+    assert!(
+        p.contains("Emergency electricians within 25 km of BL6"),
+        "{p}"
+    );
+}
+
+#[tokio::test]
 async fn bots_without_datasets_never_fetch_one_and_get_no_block() {
     let (h, prompts) = start_text_only("Sure.").await;
     ask(&h.addr, "alpha", ALPHA_ORIGIN, BOLTON).await;

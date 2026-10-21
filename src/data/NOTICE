@@ -12,3 +12,20 @@ The list is used only for membership checks and is never shown to visitors.
 
 The short list of common UK first names in src/listings.rs (FIRST_NAME_LIST) was written for
 this project and is covered by the project's MIT licence.
+
+outcode-centroids.csv
+  Used by src/postcodes.rs to rank directory listings by distance from a visitor's postcode.
+  Source: OS Code-Point Open (CSV, GB), dataset version 2026.3.0 (copyright date 2026-07-20),
+  https://www.ordnancesurvey.co.uk/products/code-point-open
+  Licence: Open Government Licence v3.0,
+  https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/
+  Attribution:
+    Contains OS data © Crown copyright and database right 2026.
+    Contains Royal Mail data © Royal Mail copyright and database right 2026.
+    Contains National Statistics data © Crown copyright and database right 2026.
+  Changes: one row per outcode (postcode district), the mean position of its postcodes with
+  real coordinates (positional quality below 60), converted from National Grid (OSGB36) to
+  WGS84 latitude/longitude (Helmert transformation, about 5 m) and rounded to 4 decimal places.
+  Non-geographic districts are left out. Great Britain only: Code-Point Open has no Northern
+  Ireland (BT), Channel Islands or Isle of Man postcodes. Rebuild with:
+    python3 src/data/build-outcode-centroids.py codepo_gb.zip src/data/outcode-centroids.csv

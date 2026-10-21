@@ -233,6 +233,18 @@ hub page links and explicit "no listings" notes appended after the knowledge-bas
 3,000 characters; tool-calling models get the same text from a `search_directory_listings` tool.
 Listing text is treated as untrusted data: cleaned, length-capped and quoted.
 
+**Postcodes.** A UK postcode in the message ("BL6 4AB", "bl64ab") or an outward code with postcode
+context ("near BL6", "my postcode is WF1", "electrician in E5", or the outcode as the whole
+message; never "the M1 motorway" or "cell E5") replaces the place lookup: listings (filtered to the
+service asked about) are ranked by distance from that outcode's centre to each listing's `outcode`,
+within 25 km, nearest first with an approximate distance and an honest count ("Listings within
+25 km of BL6: 10 of 12"). With none in range the block says "No listings within 25 km of IV1" so
+the model offers an enquiry instead. Only the outcode is ever shown; a follow-up ("what about
+emergency ones?") keeps the previous message's postcode. Outcode centres come from OS Code-Point
+Open (Open Government Licence v3; GB only, so Northern Ireland postcodes get a "Great Britain
+only" no-coverage note), built by `src/data/build-outcode-centroids.py`, attribution in
+`src/data/NOTICE`. Listings without a known outcode are not ranked by distance.
+
 **Reply caps.** With `caps`, a bot answers at most `repliesPerHour` and `repliesPerDay` turns, and all
 bots with the same `partnerId` together at most `partnerRepliesPerDay` a day (UTC). One visitor can
 use at most a tenth of a bot's daily cap (but at least 10 turns), so a single source can't use it all up. A capped bot

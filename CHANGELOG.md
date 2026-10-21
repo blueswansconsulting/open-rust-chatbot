@@ -17,6 +17,9 @@ All notable changes are documented here. This project follows [Semantic Versioni
   sha256, verified and cached; every turn a deterministic lookup by service, place and business name
   adds complete, counted listing rows to text-only prompts, and a `search_directory_listings` tool
   for tool-calling models.
+- Postcode-aware listings: a UK postcode or an outward code with postcode context ranks listings
+  by distance (outcode centres from OS Code-Point Open, OGL v3), within 25 km, nearest first, with
+  honest counts and an explicit "No listings within 25 km of …" note; follow-ups keep the postcode.
 
 ### Fixed
 - Text-only replies: a `LEAD: {…}` written on the same line as the reply (or pretty-printed, or
