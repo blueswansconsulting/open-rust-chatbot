@@ -906,7 +906,11 @@ impl Listings {
         for (i, t) in toks.iter().enumerate() {
             // Typos only where a place is expected ("in Boltn", or "Oldam" written mid-sentence),
             // so everyday words like "button" (Sutton) or "Selling…" (Welling) are left alone.
+            let before_trade = toks
+                .get(i + 1)
+                .is_some_and(|n| used[i + 1] || TRADE_WORDS.contains(&n.text.as_str()));
             let place_like = t.name_like()
+                || (t.initial && t.capital && before_trade)
                 || (i > 0
                     && PLACE_PREPOSITIONS.contains(&toks[i - 1].text.as_str())
                     && (toks[i - 1].text != "for" || t.capital));
@@ -1011,7 +1015,8 @@ impl Listings {
     ) -> Vec<u32> {
         let has_other_match = has_service || !places.is_empty();
         // (word, could stand alone as a business name)
-        let mut query: Vec<(&str, bool)> = Vec::new();
+        // (word, could stand alone as a business name, capitalised)
+        let mut query: Vec<(&str, bool, bool)> = Vec::new();
         for (i, t) in toks.iter().enumerate() {
             let w = t.text.as_str();
             if used[i]
@@ -1027,27 +1032,35 @@ impl Listings {
             let introduces_self = prev(1).is_some_and(|p| SELF_INTRO.contains(&p))
                 || (prev(1) == Some("is") && matches!(prev(2), Some("name" | "this")));
             let after_place_word = prev(1).is_some_and(|p| ["in", "near", "around"].contains(&p));
-            // One word alone names a business only if it's written like a name ("Hayvern"), isn't
-            // an everyday word, and isn't the visitor's own name or where they are.
+            // One word alone names a business when it is written like one, and isn't an everyday
+            // word, the visitor's own name or where they are:
+            let len = w.chars().count();
             let code = w.chars().any(|c| c.is_ascii_digit()) && w.chars().any(char::is_alphabetic);
-            // "Curious Electrics" written out is a name even though "curious" is an everyday word.
+            // - followed by a trade word: "Hayvern Electrical", "jax group", "MK Electrics";
             let with_trade_word = toks
                 .get(i + 1)
-                .is_some_and(|n| n.capital && GENERIC.contains(n.text.as_str()));
-            let alone = ((t.name_like() && w.chars().count() >= 3) || code)
+                .is_some_and(|n| GENERIC.contains(n.text.as_str()));
+            // - capitalised mid-sentence ("is Hayvern any good"), or the message's subject
+            //   ("Hayvern phone number?");
+            let written_as_name = (t.name_like() && len >= 3) || (t.initial && len >= 4);
+            // - right after a word that introduces a name ("the number for hayvern").
+            let named = len >= 4
+                && prev(1)
+                    .is_some_and(|p| ["for", "about", "list", "contact", "called"].contains(&p));
+            let alone = (with_trade_word || written_as_name || named || code)
                 && (!COMMON_NAMES.contains(w) || with_trade_word)
                 && !introduces_self
                 && !after_place_word;
-            query.push((w, alone));
+            query.push((w, alone, t.capital));
         }
         // Name words the question contains: exactly, or misspelt when written like a name.
         // (index word, matched exactly, could stand alone)
         let mut matched: Vec<(&str, &[u32], bool, bool)> = Vec::new();
         let mut fuzzy_left = MAX_TYPO_WORDS;
-        for &(q, alone) in &query {
+        for &(q, alone, capital) in &query {
             if let Some((word, ids)) = self.name_index.get_key_value(q) {
                 matched.push((word, ids, true, alone));
-            } else if alone && q.chars().count() >= 6 && fuzzy_left > 0 {
+            } else if alone && capital && q.chars().count() >= 6 && fuzzy_left > 0 {
                 fuzzy_left -= 1;
                 for (word, ids) in &self.name_index {
                     if word.chars().count() >= 6 && plausible_typo(q, word) {
@@ -1144,8 +1157,15 @@ impl Listings {
             };
             let text = &question[first.0..last.1];
             let lower = normalise(text);
-            let meaningful = tokenize(&quotes(text))
-                .into_iter()
+            let words = tokenize(&quotes(text));
+            if words
+                .iter()
+                .any(|t| self.name_index.contains_key(t.text.as_str()))
+            {
+                continue; // part of a listed name: not "not listed"
+            }
+            let meaningful = words
+                .iter()
                 .filter(|t| {
                     !STOP.contains(t.text.as_str())
                         && !CALENDAR.contains(t.text.as_str())
@@ -1153,8 +1173,10 @@ impl Listings {
                         && t.text != "i"
                 })
                 .count();
+            // "Electrical Ltd" (left over from a name) is only trade words: not a business name.
+            let only_trade_words = words.iter().all(|t| GENERIC.contains(t.text.as_str()));
             let service = SYNONYM_RES.iter().any(|(re, _)| re.is_match(&lower));
-            if run.len() >= 2 && meaningful >= 2 && !service {
+            if run.len() >= 2 && meaningful >= 2 && !service && !only_trade_words {
                 return Some(clean(text, 60));
             }
         }
@@ -1561,6 +1583,57 @@ mod tests {
                 .names,
             ["Simon Dean Electrical Ltd"]
         );
+    }
+
+    #[test]
+    fn real_names_match_at_the_start_in_lowercase_and_in_tool_queries() {
+        // QA re-review repros: each found nothing after the first false-positive fix.
+        for (q, want) in [
+            ("Hayvern phone number?", "Hayvern Electrical Ltd"),
+            ("Hayvern", "Hayvern Electrical Ltd"),
+            ("Hayvern Electrical", "Hayvern Electrical Ltd"),
+            ("Hi. Hayvern phone?", "Hayvern Electrical Ltd"),
+            ("hayvern phone number?", "Hayvern Electrical Ltd"),
+            ("whats the number for hayvern", "Hayvern Electrical Ltd"),
+            (
+                "Jax Group any good?",
+                "Jax Group Electrical & Renewable Services",
+            ),
+            (
+                "is jax group any good",
+                "Jax Group Electrical & Renewable Services",
+            ),
+            ("Curious Electrics", "Curious Electrics"),
+            ("do you list curious electrics", "Curious Electrics"),
+            ("MK Electrics", "MK Electrics"),
+            ("Is MK Electrics in Bolton?", "MK Electrics"),
+            ("Tesla Electrics", "Tesla Electrics Limited"),
+            ("Absolutely Electrical number?", "Absolutely Electrical"),
+            ("is revive rewire any good", "Revive Rewire"),
+        ] {
+            let m = DEMO.lookup(q, "");
+            assert_eq!(m.names, [want], "{q}");
+            let b = DEMO.block(q, "");
+            assert!(!b.contains("No listing matches"), "{q}: {b}");
+        }
+    }
+
+    #[test]
+    fn leftover_trade_words_never_say_a_listed_firm_is_not_listed() {
+        for q in [
+            "Hayvern Electrical Ltd",
+            "Bright Sparks Electrical",
+            "Is MK Electrics in Bolton?",
+        ] {
+            let b = DEMO.block(q, "");
+            assert!(!b.contains("No listing matches"), "{q}: {b}");
+        }
+    }
+
+    #[test]
+    fn a_misspelt_town_can_start_the_message() {
+        assert_eq!(DEMO.lookup("Oldam fault finding", "").places, ["oldham"]);
+        assert_eq!(DEMO.lookup("Boltn rewire", "").places, ["bolton"]);
     }
 
     #[test]

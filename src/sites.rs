@@ -473,7 +473,10 @@ impl SiteStore {
         let Ok(_guard) =
             tokio::time::timeout(DATASET_TIMEOUT + SLOT_WAIT, self.dataset_lock.lock()).await
         else {
-            return (None, false); // served without listings this once; the next request retries
+            // Served without listings this once. Don't let this load be cached (it would hide the
+            // dataset for the cache TTL); the next request retries.
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+            return (None, false);
         };
         // Another request may have fetched it while this one waited.
         let current = self.current_dataset(id);
