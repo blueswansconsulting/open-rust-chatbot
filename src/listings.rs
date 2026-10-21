@@ -467,6 +467,31 @@ fn tokenize(text: &str) -> Vec<Tok> {
     if let Some(s) = start {
         push(&mut out, s, text.len());
     }
+    merge_initials(out)
+}
+
+/// Joins runs of two or more single letters into one word, so "M B Electrical", "M.B.
+/// Electrical" and "MB Electrical" all read as "mb electrical" (in names and in questions).
+fn merge_initials(toks: Vec<Tok>) -> Vec<Tok> {
+    let letter = |t: &Tok| t.text.chars().count() == 1 && t.text.chars().all(char::is_alphabetic);
+    let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
+    let mut run = 0; // single letters at the end of `out`
+    for t in toks {
+        if letter(&t) {
+            if run >= 1 {
+                let last = out.last_mut().expect("run is non-empty");
+                last.text.push_str(&t.text);
+                last.end = t.end;
+                last.capital &= t.capital;
+            } else {
+                out.push(t);
+            }
+            run += 1;
+        } else {
+            out.push(t);
+            run = 0;
+        }
+    }
     out
 }
 
@@ -1365,7 +1390,10 @@ impl Listings {
                 if k < 2 {
                     continue;
                 }
-                let full = words[k..].iter().all(|w| COMPANY.contains(&w.as_str()));
+                // "M B Electrical (Bolton) Limited": a town or "Ltd" after the name doesn't count.
+                let full = words[k..].iter().all(|w| {
+                    COMPANY.contains(&w.as_str()) || self.place_words.contains(w.as_str())
+                });
                 let has_ending = words[..k].iter().any(|w| NAME_SUFFIX.contains(&w.as_str()));
                 let extras = (0..toks.len())
                     .filter(|&j| (j < i || j >= i + k) && !used[j])
@@ -1454,7 +1482,11 @@ impl Listings {
                 })
                 .count();
             // "Electrical Ltd" (left over from a name) is only trade words: not a business name.
-            let only_trade_words = words.iter().all(|t| GENERIC.contains(t.text.as_str()));
+            // "Electrical Ltd" (left over from a name) is only trade words, and "A Z Electrical"
+            // only initials besides: never deny those, it may be a listed firm.
+            let only_trade_words = words
+                .iter()
+                .all(|t| GENERIC.contains(t.text.as_str()) || t.text.chars().count() <= 2);
             let service = SYNONYM_RES.iter().any(|(re, _)| re.is_match(&lower));
             if run.len() >= 2 && meaningful >= 2 && !service && !only_trade_words {
                 return Some(clean(text, 60));
@@ -2029,6 +2061,46 @@ mod tests {
         ] {
             assert!(DEMO.lookup(q, "").names.is_empty(), "{q}");
         }
+    }
+
+    #[test]
+    fn firms_known_by_their_initials_are_found_not_denied() {
+        // QA re-review repros (R9): each said the listed firm was "not listed".
+        for (q, want) in [
+            (
+                "Is M B Electrical any good?",
+                "M B Electrical (Bolton) Limited",
+            ),
+            (
+                "number for M B Electrical",
+                "M B Electrical (Bolton) Limited",
+            ),
+            ("MB Electrical phone?", "M B Electrical (Bolton) Limited"),
+            ("m b electrical number", "M B Electrical (Bolton) Limited"),
+            (
+                "Do you list A C Electrical?",
+                "A C Electrical (Rochdale) Ltd",
+            ),
+            ("number for A C Electrical", "A C Electrical (Rochdale) Ltd"),
+            (
+                "number for I C Electrical",
+                "I C Electrical Services Limited",
+            ),
+        ] {
+            // "AC Electrical" is listed too, and is an equally good match for these initials.
+            let names = DEMO.lookup(q, "").names;
+            assert!(names.iter().any(|n| n == want), "{q}: {names:?}");
+            assert!(!DEMO.block(q, "").contains("No listing matches"), "{q}");
+        }
+        // Initials nobody is listed under are never denied either: say nothing.
+        assert!(!DEMO
+            .block("Is Q X Electrical any good?", "")
+            .contains("No listing matches"));
+        // Ordinary single letters are untouched.
+        assert!(DEMO
+            .lookup("I need a rewire in Bolton", "")
+            .names
+            .is_empty());
     }
 
     #[test]
