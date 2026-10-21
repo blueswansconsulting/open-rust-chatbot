@@ -197,8 +197,12 @@ The server then fetches `GET SITES_API_URL/<id>/datasets/listings?sha=<sha256>` 
 bearer token (at most 3 MB, 10 s), checks the body's sha256 (over the body as sent, or over its
 canonical JSON: keys sorted, no whitespace) and parses it once. The parsed dataset is kept per bot
 and only replaced when the sha changes, so settings-only edits and invalidations never refetch it.
+A bot's first dataset is fetched before its first answer; after that, a new sha is fetched in the
+background while the previous dataset keeps being served, and the bot switches over once it has
+arrived. One dataset is fetched and parsed at a time, and concurrent requests share that fetch.
 If a new dataset can't be fetched or fails the check, the previous one keeps being served (and the
-same sha is retried after 30 seconds, or straight after an invalidation). `datasets: null` drops it.
+same sha is retried after 30 seconds, or straight after an invalidation). A `404` for the sha means
+it was replaced while being fetched: the bot is read again for the new one. `datasets: null` drops it.
 Bots without `datasets` behave exactly as before. The dataset (schema v1) is public directory data:
 
 ```json
@@ -217,9 +221,12 @@ Bots without `datasets` behave exactly as before. The dataset (schema v1) is pub
 
 At most 5,000 listings. Every turn the server looks up the visitor's message (and their previous
 message, for follow-ups like "and in Oldham?") by service (dataset names and aliases plus built-in
-synonyms such as "fuse box" or "landlord certificate"), place (whole words, one-letter typos of
-place names, everyday-word places like Reading only after "in/near/…" or next to a trade word) and
-business name. Text-only models get up to 10 matching rows, honest counts ("5 of 5", "10 of 154"),
+synonyms such as "fuse box" or "landlord certificate"), place (whole words; "Ashford" finds both
+"Ashford, Kent" and "Ashford, Surrey"; one-letter typos only where a place is written, such as "in
+Boltn"; everyday-word places like Reading only after "in/near/…" or next to a trade word) and
+business name (two words of the name, or one distinctive word written like a name; everyday words
+and the visitor's own name never match on their own). Name matches are offered as possibilities,
+not as a list to read out. Text-only models get up to 10 matching rows, honest counts ("5 of 5", "10 of 154"),
 hub page links and explicit "no listings" notes appended after the knowledge-base excerpts, at most
 3,000 characters; tool-calling models get the same text from a `search_directory_listings` tool.
 Listing text is treated as untrusted data: cleaned, length-capped and quoted.

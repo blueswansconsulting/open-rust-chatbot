@@ -400,6 +400,11 @@ pub struct SiteStore {
     /// Last failed dataset fetch per bot: (sha, when), so a broken dataset isn't refetched on
     /// every request.
     dataset_failures: Mutex<HashMap<String, (String, Instant)>>,
+    /// Held while a dataset is fetched and parsed, so at most one body is in memory at a time
+    /// and concurrent misses for the same sha collapse into one fetch (re-checked after it).
+    dataset_lock: tokio::sync::Mutex<()>,
+    /// Bots whose new dataset is being fetched in the background.
+    dataset_refreshing: Mutex<std::collections::HashSet<String>>,
 }
 
 impl SiteStore {
@@ -420,6 +425,8 @@ impl SiteStore {
             text_only: !config.llm.supports_tools(),
             datasets: Mutex::default(),
             dataset_failures: Mutex::default(),
+            dataset_lock: tokio::sync::Mutex::new(()),
+            dataset_refreshing: Mutex::default(),
         }
     }
 
@@ -437,11 +444,13 @@ impl SiteStore {
         self.dataset_failures.lock().unwrap().remove(id);
     }
 
-    /// The dataset `wanted` names: the cached one if its sha matches, else a fresh fetch. On any
-    /// failure the previous dataset (if any) is kept. The flag is true when the sites API says
-    /// that sha is no longer current (404), so the caller should re-read the bot.
+    /// The dataset `wanted` names. The cached one is used if its sha matches. If a different
+    /// (older) one is cached, it keeps being served while the new one is fetched in the
+    /// background, so no request waits on a dataset push. Only a bot with no dataset yet waits
+    /// for the fetch. On any failure the previous dataset (if any) is kept. The flag is true when
+    /// the sites API says the sha is no longer current (404), so the caller should re-read the bot.
     async fn listings_for(
-        &self,
+        self: &Arc<Self>,
         id: &str,
         wanted: Option<DatasetRef>,
     ) -> (Option<Arc<Listings>>, bool) {
@@ -449,23 +458,93 @@ impl SiteStore {
             self.forget_dataset(id);
             return (None, false);
         };
-        let current = self.datasets.lock().unwrap().get(id).cloned();
+        let current = self.current_dataset(id);
         if current
             .as_ref()
             .is_some_and(|l| l.sha256() == wanted.sha256)
+            || self.failed_recently(id, &wanted.sha256)
         {
             return (current, false);
         }
-        let failed_recently = self
-            .dataset_failures
+        if current.is_some() {
+            self.refresh_dataset_in_background(id, wanted);
+            return (current, false);
+        }
+        let Ok(_guard) =
+            tokio::time::timeout(DATASET_TIMEOUT + SLOT_WAIT, self.dataset_lock.lock()).await
+        else {
+            return (None, false); // served without listings this once; the next request retries
+        };
+        // Another request may have fetched it while this one waited.
+        let current = self.current_dataset(id);
+        if current
+            .as_ref()
+            .is_some_and(|l| l.sha256() == wanted.sha256)
+            || self.failed_recently(id, &wanted.sha256)
+        {
+            return (current, false);
+        }
+        match self.fetch_and_store(id, &wanted).await {
+            Ok(listings) => (Some(listings), false),
+            Err(rotated) => (current, rotated),
+        }
+    }
+
+    fn current_dataset(&self, id: &str) -> Option<Arc<Listings>> {
+        self.datasets.lock().unwrap().get(id).cloned()
+    }
+
+    fn failed_recently(&self, id: &str, sha: &str) -> bool {
+        self.dataset_failures
             .lock()
             .unwrap()
             .get(id)
-            .is_some_and(|(sha, at)| *sha == wanted.sha256 && at.elapsed() < DATASET_RETRY);
-        if failed_recently {
-            return (current, false);
+            .is_some_and(|(failed, at)| failed == sha && at.elapsed() < DATASET_RETRY)
+    }
+
+    /// Fetches the new dataset while the old one keeps being served. When it arrives (or the
+    /// sha turns out to be stale), the cached bot is dropped so the next request rebuilds it.
+    fn refresh_dataset_in_background(self: &Arc<Self>, id: &str, wanted: DatasetRef) {
+        if !self
+            .dataset_refreshing
+            .lock()
+            .unwrap()
+            .insert(id.to_owned())
+        {
+            return; // one dataset fetch per bot at a time
         }
-        match self.fetch_listings(id, &wanted).await {
+        let store = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            {
+                let _guard = store.dataset_lock.lock().await;
+                let done = store
+                    .current_dataset(&id)
+                    .is_some_and(|l| l.sha256() == wanted.sha256)
+                    || store.failed_recently(&id, &wanted.sha256);
+                let rebuild = done || {
+                    match store.fetch_and_store(&id, &wanted).await {
+                        Ok(_) => true,
+                        Err(rotated) => rotated,
+                    }
+                };
+                if rebuild {
+                    store.entries.lock().unwrap().remove(&id);
+                    // A load already in flight may hold the old dataset: don't let it cache.
+                    store.invalidations.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            store.dataset_refreshing.lock().unwrap().remove(&id);
+        });
+    }
+
+    /// Fetches, verifies and stores a dataset. Every failure is logged and backed off for
+    /// [`DATASET_RETRY`] (a 404 too, so a sha the API keeps refusing isn't refetched on every
+    /// request); the error is true for a 404 (the sha is no longer current).
+    async fn fetch_and_store(&self, id: &str, wanted: &DatasetRef) -> Result<Arc<Listings>, bool> {
+        let kept_previous = self.current_dataset(id).is_some();
+        let result = self.fetch_listings(id, wanted).await;
+        match result {
             Ok(listings) => {
                 crate::log::log_event(
                     "listings_loaded",
@@ -477,25 +556,23 @@ impl SiteStore {
                     .unwrap()
                     .insert(id.to_owned(), listings.clone());
                 self.dataset_failures.lock().unwrap().remove(id);
-                (Some(listings), false)
-            }
-            Err(detail) if detail == NOT_CURRENT => {
-                crate::log::log_event(
-                    "listings_sha_rotated",
-                    json!({ "bot": id, "sha256": wanted.sha256, "kept_previous": current.is_some() }),
-                );
-                (current, true)
+                Ok(listings)
             }
             Err(detail) => {
+                let rotated = detail == NOT_CURRENT;
                 crate::log::log_event(
-                    "listings_fetch_failed",
-                    json!({ "bot": id, "sha256": wanted.sha256, "detail": detail, "kept_previous": current.is_some() }),
+                    if rotated {
+                        "listings_sha_rotated"
+                    } else {
+                        "listings_fetch_failed"
+                    },
+                    json!({ "bot": id, "sha256": wanted.sha256, "detail": detail, "kept_previous": kept_previous }),
                 );
                 self.dataset_failures
                     .lock()
                     .unwrap()
                     .insert(id.to_owned(), (wanted.sha256.clone(), Instant::now()));
-                (current, false)
+                Err(rotated)
             }
         }
     }
@@ -580,7 +657,7 @@ impl SiteStore {
     }
 
     /// Fetches a bot and records the outcome in the cache.
-    async fn load(&self, id: &str) -> Result<Arc<Site>, SiteError> {
+    async fn load(self: &Arc<Self>, id: &str) -> Result<Arc<Site>, SiteError> {
         let generation = self.invalidations.load(Ordering::SeqCst);
         let fetched = self.fetch(id).await;
         // The knowledge base is parsed once per version, and outside the cache lock so a burst

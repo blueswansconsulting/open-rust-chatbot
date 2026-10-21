@@ -1264,6 +1264,9 @@ async fn start_text_only(reply: &'static str) -> (Harness, Prompts) {
         ("LLM_PROVIDER", "openclaw"),
         ("OPENCLAW_BRIDGE_URL", &bridge_url),
         ("OPENCLAW_BRIDGE_TOKEN", "t"),
+        // Some tests open several chats at once from one address.
+        ("MAX_CONNECTIONS_PER_IP", "50"),
+        ("RATE_LIMIT_MESSAGES", "1000"),
     ])
     .await;
     (h, prompts)
@@ -1395,12 +1398,84 @@ async fn a_failed_dataset_fetch_keeps_the_previous_dataset() {
         p.contains("\"Hayvern Electrical Ltd\""),
         "old dataset kept: {p}"
     );
-    // Once it can be fetched, the new one is used.
+    // Once it can be fetched, the new one is used (fetched in the background).
     h.sites.datasets_down.store(false, Ordering::SeqCst);
     assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+    ask_until(&h, &prompts, "\"Newname Electrical Ltd\"").await;
+}
+
+/// Asks the directory bot until its prompt contains `needle` (a background dataset fetch).
+async fn ask_until(h: &Harness, prompts: &Prompts, needle: &str) {
+    for _ in 0..100 {
+        ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+        if last_prompt(prompts).contains(needle) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("never saw {needle}: {}", last_prompt(prompts));
+}
+
+async fn ask_concurrently(h: &Harness, n: usize) {
+    let tasks: Vec<_> = (0..n)
+        .map(|_| {
+            let addr = h.addr.clone();
+            tokio::spawn(async move { ask(&addr, "dir", ALPHA_ORIGIN, BOLTON).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn concurrent_first_requests_fetch_the_dataset_once() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    ask_concurrently(&h, 8).await;
+    assert_eq!(h.sites.dataset_fetches("dir"), 1);
+    assert!(prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|p| p.contains("\"Hayvern Electrical Ltd\"")));
+}
+
+#[tokio::test]
+async fn a_dataset_push_is_fetched_once_in_the_background_while_the_old_one_is_served() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
     ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
-    let p = last_prompt(&prompts);
-    assert!(p.contains("\"Newname Electrical Ltd\""), "{p}");
+    let newer = LISTINGS.replace("Hayvern", "Pushed");
+    let new_sha = h.sites.set_dataset("dir", newer.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 2, Some(&new_sha)));
+    assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+    ask_concurrently(&h, 8).await;
+    // Every one of them was answered (from the old or the new dataset), none waited for a 503.
+    assert!(prompts.lock().unwrap().iter().all(|p| p.contains("5 of 5")));
+    ask_until(&h, &prompts, "\"Pushed Electrical Ltd\"").await;
+    assert_eq!(h.sites.dataset_fetches("dir"), 2, "one fetch per sha");
+}
+
+#[tokio::test]
+async fn a_sha_that_keeps_404ing_is_backed_off() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    // The bot names a sha the API never serves (e.g. a partner mismatch).
+    h.sites
+        .set("dir", directory_bot("dir", 1, Some(&"b".repeat(64))));
+    for _ in 0..3 {
+        assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+        ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    }
+    assert!(!last_prompt(&prompts).contains("Directory listings"));
+    // Invalidations clear the backoff, so that's one fetch per load; without them, none.
+    let before = h.sites.dataset_fetches("dir");
+    for _ in 0..3 {
+        ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    }
+    assert_eq!(h.sites.dataset_fetches("dir"), before);
 }
 
 #[tokio::test]
