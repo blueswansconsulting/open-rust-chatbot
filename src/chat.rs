@@ -189,7 +189,7 @@ const WORD_FIRST_NAMES: &str = "dawn faith hope joy penny ray drew lance guy gra
 rose heath cliff rich gene wade chase sunny summer autumn violet daisy poppy lily iris pearl ruby \
 amber jade crystal hazel heather ginger robin jay dean mark bill frank miles rob pat sue sky reed \
 glen grace will max mo carol rod sandy bob joe kim jack hunter mason carter cole dale gale \
-skye";
+skye dan al ed basil don ted roy sid art nat val viv bea";
 
 fn send(tx: &Sender, frame: Value) {
     let _ = tx.send(frame.to_string());
@@ -2250,6 +2250,8 @@ mod tests {
             ("Hi, name's Jo Bloggs, call me", "Jo Bloggs"),
             ("I'm Grant Ward, call me", "Grant Ward"),
             ("I'm Mo Farah, call me", "Mo Farah"),
+            ("I'm Dan Hill, call me", "Dan Hill"),
+            ("I'm Ed Wood, call me", "Ed Wood"),
         ] {
             assert_eq!(name_in_text(text).as_deref(), Some(want), "{text}");
         }
