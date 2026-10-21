@@ -72,7 +72,7 @@ const NOT_BEFORE: [&str; 22] = [
 ];
 /// Words right after an outcode that make it something else ("M1 motorway", "E5 cell", "GU10
 /// downlights", "B32 breakers").
-const NOT_AFTER: [&str; 45] = [
+const NOT_AFTER: [&str; 44] = [
     "motorway",
     "mway",
     "junction",
@@ -110,7 +110,6 @@ const NOT_AFTER: [&str; 45] = [
     "fitting",
     "fittings",
     "holder",
-    "socket",
     "petrol",
     "fuel",
     "cable",
@@ -121,18 +120,22 @@ const NOT_AFTER: [&str; 45] = [
 ];
 /// Words anywhere in the message that make a lone outcode a spreadsheet cell, a road or a
 /// vitamin.
-const NOT_IN_MESSAGE: [&str; 11] = [
+/// Only without strong context ("near BL6", "my postcode is BL6"); "junction box" and "solar
+/// cells" are everyday electrician words, so they are not here.
+const NOT_IN_MESSAGE: [&str; 8] = [
     "spreadsheet",
     "excel",
     "formula",
-    "cell",
-    "cells",
     "motorway",
     "worksheet",
     "vlookup",
-    "junction",
     "vitamin",
     "vitamins",
+];
+/// Words after an ordinal that make "B1 2nd" a floor or exit, not a postcode.
+const ORDINAL_NOUNS: [&str; 12] = [
+    "floor", "floors", "flat", "exit", "junction", "time", "times", "year", "years", "storey",
+    "door", "turning",
 ];
 /// Words two back that make "in B12" a quantity, not a place ("rich in B12").
 const NOT_TWO_BEFORE: [&str; 5] = ["rich", "high", "low", "deficient", "lacking"];
@@ -226,6 +229,20 @@ pub fn outcode(outcode: &str) -> Option<Postcode> {
     known(outcode, 0..0)
 }
 
+/// True if `inward` ("2nd") is an ordinal: written in lower case, or followed by "floor",
+/// "exit"…. "BL1 2ND" on its own is a postcode.
+fn ordinal_at(inward: &str, rest: &str) -> bool {
+    let suffix = inward.get(1..).unwrap_or_default();
+    if !["st", "nd", "rd", "th"].contains(&suffix.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    let next = WORD
+        .find(rest)
+        .map(|w| w.as_str().to_lowercase())
+        .unwrap_or_default();
+    ORDINAL_NOUNS.contains(&next.as_str()) || suffix.bytes().all(|b| b.is_ascii_lowercase())
+}
+
 /// The first postcode in `text`: a full one anywhere, else an outward code with postcode
 /// context. `service_context` is true when the message names a service or trade.
 pub fn find(text: &str, service_context: bool) -> Option<Postcode> {
@@ -235,12 +252,11 @@ pub fn find(text: &str, service_context: bool) -> Option<Postcode> {
         None => text,
     };
     let full = FULL.captures_iter(text).find_map(|c| {
-        let inward = c[2].to_ascii_lowercase();
-        // "B1 2nd floor", "M1 1st exit" are ordinals, not inward codes.
-        if ["st", "nd", "rd", "th"].contains(&&inward[1..]) {
+        let whole = c.get(0)?;
+        // "B1 2nd floor", "M1 1st exit" are ordinals; "BL1 2ND" is a postcode.
+        if ordinal_at(&c[2], &text[whole.end()..]) {
             return None;
         }
-        let whole = c.get(0)?;
         known(&c[1], whole.range())
     });
     if full.is_some() {
@@ -251,12 +267,9 @@ pub fn find(text: &str, service_context: bool) -> Option<Postcode> {
         .find_iter(text)
         .map(|m| (m.range(), m.as_str().to_lowercase()))
         .collect();
-    if words
+    let vetoed = words
         .iter()
-        .any(|(_, w)| NOT_IN_MESSAGE.contains(&w.as_str()))
-    {
-        return None;
-    }
+        .any(|(_, w)| NOT_IN_MESSAGE.contains(&w.as_str()));
     for m in OUTWARD.find_iter(text) {
         let Some(p) = known(m.as_str(), m.range()) else {
             continue;
@@ -271,8 +284,9 @@ pub fn find(text: &str, service_context: bool) -> Option<Postcode> {
             after.is_some_and(|w| ["area", "based", "postcode", "district"].contains(&w));
         if prev.is_some_and(|w| NOT_BEFORE.contains(&w)) && !area_after
             || prev2.is_some_and(|w| NOT_TWO_BEFORE.contains(&w))
-            || after.is_some_and(|w| {
-                NOT_AFTER.contains(&w) || JUNCTION.is_match(w) || ORDINAL.is_match(w)
+            || after.is_some_and(|w| NOT_AFTER.contains(&w) || JUNCTION.is_match(w))
+            || words.get(at + 1).is_some_and(|(r, w)| {
+                ORDINAL.is_match(w) && ordinal_at(&text[r.clone()], &text[r.end..])
             })
             || text[m.end()..].starts_with(':')
         {
@@ -288,12 +302,9 @@ pub fn find(text: &str, service_context: bool) -> Option<Postcode> {
         let postcode_is = prev2.is_some_and(|w| ["postcode", "code", "outcode"].contains(&w))
             && prev.is_some_and(|w| ["is", "was", "s"].contains(&w))
             || prev.is_some_and(|w| ["postcode's", "postcode\u{2019}s"].contains(&w));
-        if whole_message
-            || postcode_is
-            || area_after
-            || prev.is_some_and(|w| BEFORE.contains(&w))
-            || service_context
-        {
+        let strong =
+            whole_message || postcode_is || area_after || prev.is_some_and(|w| BEFORE.contains(&w));
+        if strong || service_context && !vetoed {
             return Some(p);
         }
     }
