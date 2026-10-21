@@ -72,6 +72,29 @@ static EMAIL_IN_TEXT: LazyLock<Regex> =
 /// A UK-style phone number typed by the visitor ("07700 900123", "+44 7700 900123").
 static PHONE_IN_TEXT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:\+44\s?\d|\b0\d)[\d ]{7,12}\d\b").unwrap());
+/// The visitor giving their name: "I'm Sam Test", "my name is Jo", "this is Priya Shah".
+static NAME_IN_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i:\b(?:i['\u{2019}]?m|i am|my name is|this is|it['\u{2019}]?s)\s+)(\p{Lu}[\p{L}'\u{2019}-]*(?:\s+\p{Lu}[\p{L}'\u{2019}-]*)?)").unwrap()
+});
+/// Words that follow "I'm" without being a name ("I'm Looking for…").
+const NOT_A_NAME: [&str; 16] = [
+    "looking",
+    "interested",
+    "after",
+    "based",
+    "in",
+    "from",
+    "wondering",
+    "hoping",
+    "trying",
+    "just",
+    "not",
+    "sure",
+    "the",
+    "a",
+    "here",
+    "available",
+];
 /// The visitor asking to be called back, so a phone number they typed is a lead.
 static CALL_ME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:call|ring|phone|text|contact)\s+(?:me|us)\b|\bcall[- ]?back\b|\bget (?:back )?in touch\b").unwrap()
@@ -96,23 +119,95 @@ fn fallback_contact(text: &str) -> Option<(Option<String>, Option<String>)> {
     (email.is_some() || phone.is_some()).then_some((email, phone))
 }
 
+/// The visitor's own name, if they gave one ("I'm Sam Test (Claude QA)" -> "Sam Test").
+fn name_in_text(text: &str) -> Option<String> {
+    let c = NAME_IN_TEXT.captures(text)?;
+    let name = c.get(1)?.as_str().trim_end_matches(['\'', '\u{2019}', '-']);
+    let first = name.split_whitespace().next()?.to_lowercase();
+    (!NOT_A_NAME.contains(&first.as_str())).then(|| name.to_owned())
+}
+
+/// The visitor's message for the card, without the contact details and self-introduction it
+/// repeats ("Can someone call me about a rewire in Bolton?").
+fn lead_message(text: &str) -> String {
+    let mut out = EMAIL_IN_TEXT.replace_all(text, " ").into_owned();
+    out = PHONE_IN_TEXT.replace_all(&out, " ").into_owned();
+    if let Some(m) = NAME_IN_TEXT.find(&out) {
+        // Drop the introduction and anything bracketed right after it.
+        let mut end = m.end();
+        let rest = &out[end..];
+        if let Some(stripped) = rest.trim_start().strip_prefix('(') {
+            if let Some(close) = stripped.find(')') {
+                end += rest.len() - stripped.len() + close + 1;
+            }
+        }
+        out.replace_range(m.start()..end, " ");
+    }
+    let words: Vec<&str> = out.split_whitespace().collect();
+    let joined = words.join(" ");
+    // Rejoin, dropping spaces before punctuation and punctuation left dangling after other
+    // punctuation ("Bolton? , ." -> "Bolton?").
+    let mut cleaned = String::new();
+    for c in joined.chars() {
+        let last = cleaned.trim_end().chars().last();
+        if ",;:.".contains(c) && last.is_some_and(|l| ".?!,;:".contains(l)) {
+            continue;
+        }
+        if ",;:.?!".contains(c) && cleaned.ends_with(' ') {
+            cleaned.pop();
+        }
+        cleaned.push(c);
+    }
+    let trimmed =
+        cleaned.trim_matches(|c: char| c == ',' || c == ';' || c == ':' || c.is_whitespace());
+    let mut message: String = trimmed.chars().take(300).collect();
+    if message.is_empty() {
+        message = "Asked to be called back".into();
+    }
+    message
+}
+
 /// Splits a text-only reply into what the visitor sees and the optional `LEAD: {…}` arguments.
+/// The lead may be on its own line or the same line as the reply, pretty-printed, or wrapped
+/// in a code fence; everything from `LEAD:` up to the end of its JSON is never shown, and an
+/// unparsable `LEAD:` hides the rest of its line.
 pub(crate) fn split_lead_line(raw: &str) -> (String, Option<serde_json::Map<String, Value>>) {
     let mut lead = None;
-    let mut visible = Vec::new();
-    for line in raw.lines() {
-        if let Some(rest) = line.trim().strip_prefix("LEAD:") {
-            if let Some(map) = serde_json::from_str::<Value>(rest.trim())
-                .ok()
-                .and_then(|v| v.as_object().cloned())
-            {
+    let mut visible = String::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find("LEAD:") {
+        let before = &rest[..at];
+        // An opening code fence just before the marker belongs to it.
+        let before = before.trim_end();
+        let before = before
+            .strip_suffix("```json")
+            .or_else(|| before.strip_suffix("```"))
+            .unwrap_or(before);
+        visible.push_str(before);
+        let after = &rest[at + "LEAD:".len()..];
+        let body = after.trim_start_matches(|c: char| c.is_whitespace() || c == '`');
+        let body = body.strip_prefix("json").map_or(body, str::trim_start);
+        let mut values = serde_json::Deserializer::from_str(body).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(Value::Object(map))) => {
                 lead = Some(map);
+                let tail = &body[values.byte_offset()..];
+                // A closing fence and punctuation after the JSON go with it.
+                rest = tail.trim_start_matches(|c: char| {
+                    c.is_whitespace() || c == '`' || ".,;!".contains(c)
+                });
             }
-            continue; // never show the line, even if it doesn't parse
+            _ => {
+                // Unparsable: hide the rest of this line.
+                rest = after.find('\n').map_or("", |n| after[n..].trim_start());
+            }
         }
-        visible.push(line);
+        if !rest.is_empty() && !visible.is_empty() {
+            visible.push('\n');
+        }
     }
-    (visible.join("\n").trim().to_owned(), lead)
+    visible.push_str(rest);
+    (visible.trim().to_owned(), lead)
 }
 
 /// `{"type":"resume","token":"…"|null}`: the widget asking to continue (or start) a session.
@@ -426,7 +521,8 @@ impl ChatSession {
                 }
             }
         }
-        // Text-only providers answer in one piece, so buffer it to take out the hidden lead line.
+        // Buffer the whole reply before sending anything, so the hidden lead line can never be
+        // streamed to the widget: it may come anywhere, even mid-line.
         let mut raw = String::new();
         let mut stream = self.shared.llm.stream(&messages, &[]).await?;
         while let Some(event) = stream.next().await {
@@ -456,14 +552,16 @@ impl ChatSession {
                 arguments,
             };
             if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, None, &call) {
+                // The model's lead is the card: no second card from the fallback below.
                 self.offer_lead(lead, tx);
+                send(tx, json!({ "type": "done" }));
+                log_event(
+                    "turn_complete",
+                    json!({ "session": self.session_id, "hops": 0 }),
+                );
+                return Ok(());
             }
-            send(tx, json!({ "type": "done" }));
-            log_event(
-                "turn_complete",
-                json!({ "session": self.session_id, "hops": 0 }),
-            );
-            return Ok(());
+            // An invalid lead line (no usable phone or email) falls back to what the visitor typed.
         }
 
         // Fallback when the model didn't add a lead line: offer a card for an email in the text,
@@ -475,10 +573,11 @@ impl ChatSession {
             .flatten()
         {
             let mut arguments = serde_json::Map::new();
-            arguments.insert("name".into(), json!("Website visitor"));
+            let name = name_in_text(text).unwrap_or_else(|| "Website visitor".into());
+            arguments.insert("name".into(), json!(name));
             arguments.insert("email".into(), email.map_or(Value::Null, |e| json!(e)));
             arguments.insert("phone".into(), phone.map_or(Value::Null, |p| json!(p)));
-            arguments.insert("message".into(), json!(text));
+            arguments.insert("message".into(), json!(lead_message(text)));
             let call = ToolCall {
                 id: "server-lead".into(),
                 name: "propose_lead".into(),
@@ -635,6 +734,71 @@ mod tests {
         );
         let (visible, lead) = split_lead_line("No lead here.");
         assert_eq!((visible.as_str(), lead.is_none()), ("No lead here.", true));
+    }
+
+    /// The reply seen in production, with the lead on the same line as the sentence.
+    const LIVE_REPLY: &str = "The directory team can follow up about your rewire request in Bolton. LEAD: {\"name\":\"Sam Test (Claude QA)\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire in Bolton\"}";
+
+    #[test]
+    fn a_lead_on_the_same_line_is_parsed_and_hidden() {
+        let (visible, lead) = split_lead_line(LIVE_REPLY);
+        assert_eq!(
+            visible,
+            "The directory team can follow up about your rewire request in Bolton."
+        );
+        let lead = lead.expect("parsed");
+        assert_eq!(lead["name"], "Sam Test (Claude QA)");
+        assert_eq!(lead["phone"], "07700 900123");
+    }
+
+    #[test]
+    fn lead_lines_in_other_shapes_are_parsed_and_hidden() {
+        let json = r#"{"name":"Jo","phone":"07700 900123","email":null}"#;
+        for raw in [
+            format!("Thanks Jo.\nLEAD: {json}"),
+            format!("Thanks Jo. LEAD: {json}."),
+            format!("Thanks Jo.\n\nLEAD:{json}\n"),
+            format!("Thanks Jo.\n```json\nLEAD: {json}\n```"),
+            format!("Thanks Jo.\n```\nLEAD: {json}\n```\n"),
+            format!("Thanks Jo.\nLEAD: ```json\n{json}\n```"),
+            "Thanks Jo.\nLEAD: {\n  \"name\": \"Jo\",\n  \"phone\": \"07700 900123\"\n}".to_owned(),
+        ] {
+            let (visible, lead) = split_lead_line(&raw);
+            assert_eq!(visible, "Thanks Jo.", "{raw:?}");
+            assert_eq!(lead.expect("parsed")["phone"], "07700 900123", "{raw:?}");
+        }
+        // Text after the lead is still shown; a broken lead mid-line hides only that line's rest.
+        let (visible, lead) = split_lead_line(&format!("Thanks. LEAD: {json} Speak soon!"));
+        assert_eq!(
+            (visible.as_str(), lead.is_some()),
+            ("Thanks.\nSpeak soon!", true)
+        );
+        let (visible, lead) = split_lead_line("Thanks. LEAD: {broken\nAnything else?");
+        assert_eq!(
+            (visible.as_str(), lead.is_none()),
+            ("Thanks.\nAnything else?", true)
+        );
+        assert!(!split_lead_line("ok LEAD:").0.contains("LEAD"));
+    }
+
+    #[test]
+    fn the_fallback_card_uses_the_visitors_name_and_a_clean_message() {
+        let text =
+            "Can someone call me about a rewire in Bolton? I'm Sam Test (Claude QA), 07700 900123.";
+        assert_eq!(name_in_text(text).as_deref(), Some("Sam Test"));
+        assert_eq!(
+            lead_message(text),
+            "Can someone call me about a rewire in Bolton?"
+        );
+        assert_eq!(name_in_text("my name is jo, call me on 07700 900123"), None);
+        assert_eq!(
+            name_in_text("Hi, this is Priya Shah, ring me").as_deref(),
+            Some("Priya Shah")
+        );
+        assert_eq!(name_in_text("I'm looking for an electrician"), None);
+        assert_eq!(name_in_text("I'm Looking for an electrician"), None);
+        assert_eq!(name_in_text("call me on 07700 900123"), None);
+        assert_eq!(lead_message("07700 900123"), "Asked to be called back");
     }
 
     #[test]
