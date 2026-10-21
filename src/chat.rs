@@ -152,21 +152,21 @@ static OWN_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// A number that belongs to someone else: "call them on …", "their number is …".
 static THIRD_PARTY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:\b(?:call|ring|phone|rang|called|phoned|try|tried|contact|contacted)\s+(?:them|him|her)\s+(?:on|at)|\b(?:their|his|her)\s+(?:number|phone|mobile|landline|tel|no)(?:\s+(?:number|no))?(?:\s+(?:is|was)|'s|\u{2019}s)?)\s*[:-]?\s*$").unwrap()
+    Regex::new(r"(?i)(?:\b(?:call|ring|phone|rang|called|phoned|try|tried|contact|contacted)\s+(?:them|him|her)\s+(?:on|at)|\b(?:their|his|her)\s+(?:number|phone|mobile|landline|tel|no|office)(?:\s+(?:number|no))?(?:\s+(?:is|was)|'s|\u{2019}s)?|\b[\w-]+['\u{2019}]s\s+(?:office|number|phone|mobile|landline|tel)(?:\s+(?:number|no))?\s+(?:is|was))\s*[:-]?\s*$").unwrap()
 });
 /// A number the visitor already tried: "tried to call 0161…", "I rang 0161…".
 static PAST_CALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:tried\s+(?:to\s+)?(?:call|ring|phone|calling|ringing|phoning)|called|rang|phoned|dialled|dialed)(?:\s+(?:on|at))?\s*$").unwrap()
+    Regex::new(r"(?i)\b(?:(?:tried|trying|try)\s+(?:to\s+)?(?:call|ring|phone|calling|ringing|phoning|get\s+through\s+to)|keep\s+(?:calling|ringing|phoning)|called|rang|phoned|dialled|dialed)(?:\s+(?:on|at))?\s*$").unwrap()
 });
 /// When the visitor wants the call: "4pm", "after 4pm", "between 2pm and 4pm", "12-2pm",
 /// "10:30", "tomorrow morning", "Monday to Friday", "weekday evenings", "anytime". Only times
 /// next to the call request or the number count (see [`call_times`]).
 static TIME_IN_TEXT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:(?:after|before|from|at|around|about|by|until|till|between)\s+)?(?:\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)?\s*(?:-|\u{2013}|to|and)\s*\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\b|\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)\b|\d{1,2}:\d{2}\b|noon\b|midday\b|lunchtime\b)|\b(?:on\s+)?(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?\s*(?:-|\u{2013}|to)\s*(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*|(?:this|any)\s+(?:morning|afternoon|evening)|tonight|tomorrow(?:\s+(?:morning|afternoon|evening))?|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?(?:\s+(?:mornings?|afternoons?|evenings?))?|(?:weekdays?|weekends?)(?:\s+(?:mornings?|afternoons?|evenings?))?|mornings|afternoons|evenings|any\s?time)\b").unwrap()
+    Regex::new(r"(?i)\b(?:(?:after|before|from|at|around|about|by|until|till|between)\s+)?(?:[0-9]{1,2}(?:[:.][0-9]{2})?\s*(?:am|pm)?\s*(?:-|\u{2013}|to|and)\s*[0-9]{1,2}(?:[:.][0-9]{2})?\s*(?:am|pm)\b|[0-9]{1,2}(?:[:.][0-9]{2})?\s*(?:am|pm)\b|[0-9]{1,2}:[0-9]{2}\b|noon\b|midday\b|lunchtime\b)|\b(?:on\s+)?(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?\s*(?:-|\u{2013}|to)\s*(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*|(?:this|any)\s+(?:morning|afternoon|evening)|tonight|tomorrow(?:\s+(?:morning|afternoon|evening))?|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?(?:\s+(?:mornings?|afternoons?|evenings?))?|(?:weekdays?|weekends?)(?:\s+(?:mornings?|afternoons?|evenings?))?|mornings|afternoons|evenings|any\s?time)\b").unwrap()
 });
 /// "after 5", "before 9": an hour without am/pm, checked in code so "after 5 years" isn't one.
 static BARE_HOUR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:after|before|from|around|by|until|till)\s+(\d{1,2})\b").unwrap()
+    Regex::new(r"(?i)\b(?:after|before|from|around|by|until|till)\s+([0-9]{1,2})\b").unwrap()
 });
 /// Words that may follow a bare hour ("after 5 please").
 const AFTER_BARE_HOUR: [&str; 10] = [
@@ -208,10 +208,24 @@ fn fallback_contact(text: &str) -> Option<(Option<String>, Option<String>)> {
 
 /// True if "call"/"ring" sits right before or after the number at `range`.
 fn call_next_to(text: &str, range: &std::ops::Range<usize>) -> bool {
-    if CALL_BEFORE.is_match(&text[..range.start]) {
-        return true;
-    }
-    CALL_AFTER.captures(&text[range.end..]).is_some_and(|c| {
+    CALL_BEFORE.is_match(&text[..range.start]) || call_after(text, range)
+}
+
+/// True if "call"/"ring" sits right after the number at `range` ("07700 900123, call me"), and
+/// is not the start of another number's "call me on …".
+fn call_after(text: &str, range: &std::ops::Range<usize>) -> bool {
+    let after = &text[range.end..];
+    CALL_AFTER.captures(after).is_some_and(|c| {
+        let rest = after[c.get(0).map_or(0, |m| m.end())..].trim_start();
+        let lead_in = rest.to_lowercase();
+        if c.get(2)
+            .is_some_and(|w| ["me", "us"].contains(&w.as_str().to_lowercase().as_str()))
+            && (lead_in.starts_with("on ")
+                || lead_in.starts_with("at ")
+                || lead_in.starts_with(':'))
+        {
+            return false;
+        }
         let verb = c[1].to_lowercase();
         let next = c.get(2).map(|w| w.as_str().to_lowercase());
         match next.as_deref() {
@@ -247,10 +261,12 @@ fn fallback_contact_checked(
         if !(asked || next_to) {
             continue;
         }
-        let rank = if next_to || OWN_NUMBER.is_match(before) {
+        let rank = if CALL_BEFORE.is_match(before) || OWN_NUMBER.is_match(before) {
             0
-        } else {
+        } else if next_to {
             1
+        } else {
+            2
         };
         if best.as_ref().is_some_and(|b| b.0 <= rank) || is_business(&digits) {
             continue;
@@ -380,7 +396,15 @@ fn introduced_name(text: &str) -> Option<(String, std::ops::Range<usize>)> {
         let (whole, intro, name) = (c.get(0)?, c.get(1)?, c.get(2)?);
         // After "my name is" any capitalised word is a name; after "I'm" an everyday word
         // ("Retired", "Desperate") is not, unless it is also a first name ("Grace", "Will").
-        let named = intro.as_str().to_lowercase().contains("name");
+        let intro_lower = intro.as_str().to_lowercase();
+        let named = intro_lower.contains("name");
+        // A bare "name is" ("the company name is …") only counts at the start of a sentence.
+        if named && !intro_lower.starts_with("my") {
+            let before = text[..intro.start()].trim_end();
+            if !(before.is_empty() || before.ends_with(['.', '!', '?', ','])) {
+                continue;
+            }
+        }
         // Try the longest run of capitalised words first, then shorter ones.
         let words: Vec<(usize, usize)> = name
             .as_str()
@@ -402,16 +426,29 @@ fn introduced_name(text: &str) -> Option<(String, std::ops::Range<usize>)> {
             let stop = candidate
                 .split_whitespace()
                 .any(|w| not_a_name.contains(w.to_lowercase().as_str()));
-            // A single everyday word ("Retired"); two capitalised words are almost always a name.
-            let everyday = !named && n == 1 && {
-                let w = candidate
-                    .to_lowercase()
-                    .trim_end_matches(['\'', '\u{2019}', '-'])
-                    .to_owned();
-                crate::listings::english_word(&w)
-                    && !crate::listings::first_name(&w)
-                    && !WORD_FIRST_NAMES.split_whitespace().any(|n| n == w)
+            // Everyday words ("Retired", "Hard Of Hearing"), unless one is a first name ("Grant
+            // Ward", "Rose Smith").
+            let first = |w: &str| {
+                crate::listings::first_name(w)
+                    || WORD_FIRST_NAMES.split_whitespace().any(|n| n == w)
             };
+            let words: Vec<String> = candidate
+                .split_whitespace()
+                .map(|w| {
+                    w.to_lowercase()
+                        .trim_end_matches(['\'', '\u{2019}', '-'])
+                        .to_owned()
+                })
+                .collect();
+            let everyday = !named
+                && !words.iter().any(|w| first(w))
+                && if n == 1 {
+                    crate::listings::english_word(&words[0])
+                } else {
+                    words
+                        .iter()
+                        .all(|w| w.chars().count() < 3 || crate::listings::english_word(w))
+                };
             if follows && !stop && !everyday {
                 let name = candidate
                     .trim_end_matches(['\'', '\u{2019}', '-'])
@@ -490,10 +527,14 @@ fn next_to(text: &str, a: &std::ops::Range<usize>, b: &std::ops::Range<usize>) -
         return true;
     };
     !gap.contains(['.', ';', '!', '?', '\n'])
-        && gap.split_whitespace().count() <= 2
+        && gap
+            .split_whitespace()
+            .filter(|w| w.chars().any(char::is_alphanumeric))
+            .count()
+            <= 2
         && gap
             .split(|c: char| c.is_whitespace() || c == ',')
-            .filter(|w| !w.is_empty())
+            .filter(|w| w.chars().any(char::is_alphanumeric))
             .all(|w| TIME_GAP_WORDS.contains(&w.to_lowercase().as_str()))
 }
 
@@ -585,11 +626,17 @@ fn lead_message(text: &str) -> String {
         if ",;:.?!".contains(c) && cleaned.ends_with(' ') {
             cleaned.pop();
         }
+        // A run of dashes left where a number was ("call me – – after").
+        if "-\u{2013}\u{2014}".contains(c) && last.is_some_and(|l| "-\u{2013}\u{2014}".contains(l))
+        {
+            continue;
+        }
         cleaned.push(c);
     }
     // Words left hanging where a number was ("call me on", "my number is").
-    const DANGLING: [&str; 12] = [
+    const DANGLING: [&str; 13] = [
         "on", "at", "via", "is", "number", "mobile", "phone", "email", "tel", "my", "me:", "and",
+        "or",
     ];
     const DASHES: &str = ",;:-\u{2013}\u{2014}";
     let mut message = cleaned
@@ -621,10 +668,15 @@ fn lead_message(text: &str) -> String {
         message = head.to_owned();
     }
     let message: String = message.chars().take(300).collect();
-    let bare = message
-        .trim_matches(|c: char| !c.is_alphanumeric())
-        .to_lowercase();
-    if bare.is_empty() || ["call", "ring", "phone", "text"].contains(&bare.as_str()) {
+    let bare = message.to_lowercase();
+    let bare: Vec<&str> = bare
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    const BARE: [&str; 9] = [
+        "call", "ring", "phone", "text", "please", "pls", "thanks", "thank", "cheers",
+    ];
+    if bare.iter().all(|w| BARE.contains(w)) {
         return "Asked to be called back".into();
     }
     let mut chars = message.trim().chars();
@@ -2154,5 +2206,73 @@ mod tests {
             !known.contains("07700900123"),
             "the visitor's own number: {known:?}"
         );
+    }
+
+    #[test]
+    fn qa_lead_lows_someone_elses_number_never_beats_call_me_on() {
+        // QA re-review 2, R-M1 and R-M2.
+        for (text, want) in [
+            (
+                "My wife's number is 07700 900456, call me on 07700 900123",
+                Some("07700900123"),
+            ),
+            (
+                "Their office is 0161 496 0000, call me on 07700 900123",
+                Some("07700900123"),
+            ),
+            ("Hayvern's number is 0161 496 0000, please call me", None),
+            ("The installer's number is 0161 496 0000. Call me", None),
+            (
+                "I've been trying to ring 0161 496 0000 all day, can you call me?",
+                None,
+            ),
+            ("I keep calling 0161 496 0000, call me back", None),
+            ("my number is 07700 900123, call me", Some("07700900123")),
+        ] {
+            assert_eq!(phone_of(text).as_deref(), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn qa_lead_lows_business_names_and_phrases_are_not_the_visitors_name() {
+        // QA re-review 2, R-M3.
+        for text in [
+            "The company name is Bright Spark Electrical, call me on 07700 900123",
+            "Their name is Hayvern, call me on 07700 900123",
+            "The business name's Acme, please call me on 07700 900123",
+            "I'm Hard Of Hearing, call me",
+            "I'm Free Tomorrow, call me",
+        ] {
+            assert_eq!(name_in_text(text), None, "{text}");
+        }
+        for (text, want) in [
+            ("Name is Brook, call me", "Brook"),
+            ("Hi, name's Jo Bloggs, call me", "Jo Bloggs"),
+            ("I'm Grant Ward, call me", "Grant Ward"),
+            ("I'm Mo Farah, call me", "Mo Farah"),
+        ] {
+            assert_eq!(name_in_text(text).as_deref(), Some(want), "{text}");
+        }
+    }
+
+    #[test]
+    fn qa_lead_lows_dashes_digits_and_bare_verbs() {
+        // QA re-review 2, lows.
+        assert_eq!(
+            best_time("call me \u{2013} 07700 900123 \u{2013} after 4pm").as_deref(),
+            Some("after 4pm")
+        );
+        assert_eq!(
+            lead_message("call me \u{2014} 07700 900123 \u{2014} tomorrow"),
+            "Call me"
+        );
+        assert_eq!(
+            lead_message("call me on 07700 900123 after 6pm or weekends"),
+            "Call me"
+        );
+        assert_eq!(best_time("call me 07700 900123 \u{663}pm"), None);
+        for text in ["call 07700 900123 please", "call 07700 900123 thanks"] {
+            assert_eq!(lead_message(text), "Asked to be called back", "{text}");
+        }
     }
 }
