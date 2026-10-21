@@ -4,6 +4,7 @@
 pub mod chat;
 pub mod config;
 pub mod kb;
+pub mod listings;
 pub mod llm;
 pub mod log;
 pub mod rate_limit;

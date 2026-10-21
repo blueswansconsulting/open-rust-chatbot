@@ -40,6 +40,14 @@ struct FakeSites {
     usage_status: AtomicU64,
     /// What `GET /internal/usage/today` returns.
     seed: Mutex<Value>,
+    /// Listings dataset per bot: (sha256 it is served under, body).
+    datasets: Mutex<HashMap<String, (String, Vec<u8>)>>,
+    dataset_fetches: Mutex<HashMap<String, usize>>,
+    /// Answer dataset requests with 503.
+    datasets_down: AtomicBool,
+    /// When a dataset request asks for a sha that is not current, the bot record (for that id)
+    /// switches to this one: the platform rotated the dataset mid-flight.
+    rotate_on_404: Mutex<Option<(String, Value)>>,
 }
 
 impl FakeSites {
@@ -96,6 +104,46 @@ async fn fake_bot(
             axum::Json(json!({"error": "not_found"})),
         )
             .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ShaQuery {
+    sha: String,
+}
+
+async fn fake_dataset(
+    State(sites): State<Arc<FakeSites>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ShaQuery>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    *sites
+        .dataset_fetches
+        .lock()
+        .unwrap()
+        .entry(id.clone())
+        .or_default() += 1;
+    if headers.get("authorization").and_then(|v| v.to_str().ok())
+        != Some(&format!("Bearer {TOKEN}"))
+    {
+        return (StatusCode::UNAUTHORIZED, "no").into_response();
+    }
+    if sites.datasets_down.load(Ordering::SeqCst) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
+    }
+    match sites.datasets.lock().unwrap().get(&id) {
+        Some((sha, body)) if *sha == q.sha => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body.clone(),
+        )
+            .into_response(),
+        _ => {
+            if let Some((rid, newer)) = sites.rotate_on_404.lock().unwrap().take() {
+                sites.bots.lock().unwrap().insert(rid, newer);
+            }
+            StatusCode::NOT_FOUND.into_response()
+        }
     }
 }
 
@@ -174,6 +222,7 @@ async fn start_with_seed(seed: Value, extra: &[(&str, &str)]) -> Harness {
     *sites.seed.lock().unwrap() = seed;
     let api = axum::Router::new()
         .route("/internal/bots/{id}", get(fake_bot))
+        .route("/internal/bots/{id}/datasets/listings", get(fake_dataset))
         .route("/internal/usage", post(fake_usage))
         .route("/internal/usage/today", get(fake_seed))
         .with_state(sites.clone());
@@ -1144,4 +1193,411 @@ async fn an_invalid_batch_is_dropped() {
     wait_for(|| reported(&h, "alpha") == 1).await;
     tokio::time::sleep(Duration::from_millis(2200)).await;
     assert_eq!(reported(&h, "alpha"), 1, "not resent after a 400");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Listings datasets.
+
+const LISTINGS: &str = include_str!("fixtures/listings-demo.json");
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+impl FakeSites {
+    fn dataset_fetches(&self, id: &str) -> usize {
+        self.dataset_fetches
+            .lock()
+            .unwrap()
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+    }
+    /// Serves `body` for `id` and returns its sha256 (over the exact bytes).
+    fn set_dataset(&self, id: &str, body: &[u8]) -> String {
+        let sha = sha256_hex(body);
+        self.datasets
+            .lock()
+            .unwrap()
+            .insert(id.into(), (sha.clone(), body.to_vec()));
+        sha
+    }
+}
+
+fn directory_bot(id: &str, version: u64, sha: Option<&str>) -> Value {
+    let mut b = bot(
+        id,
+        ALPHA_ORIGIN,
+        "# About\n\nThe directory lists local electricians.",
+        "Dir",
+    );
+    b["version"] = json!(version);
+    b["datasets"] = match sha {
+        Some(sha) => json!({ "listings": { "version": 1, "sha256": sha, "bytes": 1000 } }),
+        None => json!(null),
+    };
+    b
+}
+
+type Prompts = Arc<Mutex<Vec<String>>>;
+
+/// A text-only (OpenClaw) server whose bridge records prompts and answers with `reply`.
+async fn start_text_only(reply: &'static str) -> (Harness, Prompts) {
+    let prompts: Prompts = Arc::default();
+    let sink = prompts.clone();
+    let bridge = axum::Router::new().route(
+        "/bridge",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock()
+                    .unwrap()
+                    .push(body["message"].as_str().unwrap_or_default().to_owned());
+                axum::Json(json!({ "text": reply }))
+            }
+        }),
+    );
+    let bridge_url = format!("http://{}/bridge", spawn(bridge).await);
+    let h = start(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "openclaw"),
+        ("OPENCLAW_BRIDGE_URL", &bridge_url),
+        ("OPENCLAW_BRIDGE_TOKEN", "t"),
+        // Some tests open several chats at once from one address.
+        ("MAX_CONNECTIONS_PER_IP", "50"),
+        ("RATE_LIMIT_MESSAGES", "1000"),
+    ])
+    .await;
+    (h, prompts)
+}
+
+fn last_prompt(prompts: &Prompts) -> String {
+    prompts.lock().unwrap().last().cloned().unwrap_or_default()
+}
+
+const BOLTON: &str = "Who are the commercial electricians in Bolton?";
+
+#[tokio::test]
+async fn a_text_only_directory_bot_gets_the_matching_rows_after_the_kb_excerpts() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    let p = last_prompt(&prompts);
+    let block = p
+        .find("Directory listings matching this question")
+        .unwrap_or_else(|| panic!("{p}"));
+    let kb = p
+        .find("Knowledge-base excerpts")
+        .or_else(|| p.find("No knowledge-base excerpt"))
+        .unwrap();
+    let lead = p.find("Call-back requests").unwrap();
+    assert!(kb < block && block < lead, "order: kb, listings, lead: {p}");
+    assert!(
+        p.contains("5 of 5") && p.contains("\"Hayvern Electrical Ltd\""),
+        "{p}"
+    );
+    // The text-only prompt never mentions the tool-era lead wording.
+    assert!(!p.contains("propose_lead"), "{p}");
+    assert!(!p.contains("name and email"), "{p}");
+    assert!(p.contains("phone number or email"), "{p}");
+    assert!(p.contains("directory team"), "{p}");
+    assert_eq!(h.sites.dataset_fetches("dir"), 1);
+}
+
+#[tokio::test]
+async fn bots_without_datasets_never_fetch_one_and_get_no_block() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    ask(&h.addr, "alpha", ALPHA_ORIGIN, BOLTON).await;
+    let p = last_prompt(&prompts);
+    assert!(!p.contains("Directory listings"), "{p}");
+    assert!(!p.contains("directory team"), "{p}");
+    // A record with an unknown `datasets` shape is the same as none.
+    let mut odd = bot("odd", ALPHA_ORIGIN, "# x\n\ny", "Odd");
+    odd["datasets"] = json!("garbage");
+    h.sites.set("odd", odd);
+    let reply = ask(&h.addr, "odd", ALPHA_ORIGIN, BOLTON).await;
+    assert_eq!(reply, "Sure.", "the bot still answers");
+    assert!(!last_prompt(&prompts).contains("Directory listings"));
+    assert_eq!(
+        h.sites.dataset_fetches("alpha") + h.sites.dataset_fetches("odd"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_dataset_whose_sha_does_not_match_is_rejected() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let real = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    // Serve different bytes under the advertised sha.
+    let tampered = LISTINGS.replace("Hayvern", "Hacked");
+    h.sites
+        .datasets
+        .lock()
+        .unwrap()
+        .insert("dir".into(), (real.clone(), tampered.into_bytes()));
+    h.sites.set("dir", directory_bot("dir", 1, Some(&real)));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    let p = last_prompt(&prompts);
+    assert!(
+        !p.contains("Hacked") && !p.contains("Directory listings"),
+        "{p}"
+    );
+    assert_eq!(h.sites.dataset_fetches("dir"), 1);
+}
+
+#[tokio::test]
+async fn a_canonical_json_sha_is_accepted_even_if_the_body_is_pretty_printed() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let value: Value = serde_json::from_str(LISTINGS).unwrap();
+    // serde_json's Map is a BTreeMap here, so to_vec is sorted-key compact JSON.
+    let canonical = sha256_hex(&serde_json::to_vec(&value).unwrap());
+    h.sites.datasets.lock().unwrap().insert(
+        "dir".into(),
+        (canonical.clone(), LISTINGS.as_bytes().to_vec()),
+    );
+    h.sites
+        .set("dir", directory_bot("dir", 1, Some(&canonical)));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    assert!(last_prompt(&prompts).contains("5 of 5"));
+}
+
+#[tokio::test]
+async fn a_settings_only_change_does_not_refetch_the_dataset() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    let mut changed = directory_bot("dir", 2, Some(&sha));
+    changed["instructions"] = json!("You are {bot_name}. NEW-PROMPT. {lead_instructions}");
+    h.sites.set("dir", changed);
+    assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    let p = last_prompt(&prompts);
+    assert!(p.contains("NEW-PROMPT") && p.contains("5 of 5"), "{p}");
+    assert_eq!(h.sites.fetches("dir"), 2, "the bot was refetched");
+    assert_eq!(h.sites.dataset_fetches("dir"), 1, "the dataset was not");
+}
+
+#[tokio::test]
+async fn a_failed_dataset_fetch_keeps_the_previous_dataset() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    // A new dataset is announced but can't be fetched.
+    let newer = LISTINGS.replace("Hayvern", "Newname");
+    let new_sha = h.sites.set_dataset("dir", newer.as_bytes());
+    h.sites.datasets_down.store(true, Ordering::SeqCst);
+    h.sites.set("dir", directory_bot("dir", 2, Some(&new_sha)));
+    assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    let p = last_prompt(&prompts);
+    assert!(
+        p.contains("\"Hayvern Electrical Ltd\""),
+        "old dataset kept: {p}"
+    );
+    // Once it can be fetched, the new one is used (fetched in the background).
+    h.sites.datasets_down.store(false, Ordering::SeqCst);
+    assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+    ask_until(&h, &prompts, "\"Newname Electrical Ltd\"").await;
+}
+
+/// Asks the directory bot until its prompt contains `needle` (a background dataset fetch).
+async fn ask_until(h: &Harness, prompts: &Prompts, needle: &str) {
+    for _ in 0..100 {
+        ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+        if last_prompt(prompts).contains(needle) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("never saw {needle}: {}", last_prompt(prompts));
+}
+
+async fn ask_concurrently(h: &Harness, n: usize) {
+    let tasks: Vec<_> = (0..n)
+        .map(|_| {
+            let addr = h.addr.clone();
+            tokio::spawn(async move { ask(&addr, "dir", ALPHA_ORIGIN, BOLTON).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn concurrent_first_requests_fetch_the_dataset_once() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    ask_concurrently(&h, 8).await;
+    assert_eq!(h.sites.dataset_fetches("dir"), 1);
+    assert!(prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|p| p.contains("\"Hayvern Electrical Ltd\"")));
+}
+
+#[tokio::test]
+async fn a_dataset_push_is_fetched_once_in_the_background_while_the_old_one_is_served() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    let newer = LISTINGS.replace("Hayvern", "Pushed");
+    let new_sha = h.sites.set_dataset("dir", newer.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 2, Some(&new_sha)));
+    assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+    ask_concurrently(&h, 8).await;
+    // Every one of them was answered (from the old or the new dataset), none waited for a 503.
+    assert!(prompts.lock().unwrap().iter().all(|p| p.contains("5 of 5")));
+    ask_until(&h, &prompts, "\"Pushed Electrical Ltd\"").await;
+    assert_eq!(h.sites.dataset_fetches("dir"), 2, "one fetch per sha");
+}
+
+#[tokio::test]
+async fn a_sha_that_keeps_404ing_is_backed_off() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    // The bot names a sha the API never serves (e.g. a partner mismatch).
+    h.sites
+        .set("dir", directory_bot("dir", 1, Some(&"b".repeat(64))));
+    for _ in 0..3 {
+        assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+        ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    }
+    assert!(!last_prompt(&prompts).contains("Directory listings"));
+    // Invalidations clear the backoff, so that's one fetch per load; without them, none.
+    let before = h.sites.dataset_fetches("dir");
+    for _ in 0..3 {
+        ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    }
+    assert_eq!(h.sites.dataset_fetches("dir"), before);
+}
+
+#[tokio::test]
+async fn removing_the_dataset_ref_drops_the_listings() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    h.sites.set("dir", directory_bot("dir", 2, None));
+    assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    assert!(!last_prompt(&prompts).contains("Directory listings"));
+}
+
+#[tokio::test]
+async fn an_oversized_dataset_is_refused() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let mut big = LISTINGS.trim_end().trim_end_matches('}').to_owned();
+    big.push_str(&format!(
+        ",\"padding\":\"{}\"}}",
+        "x".repeat(3 * 1024 * 1024)
+    ));
+    let sha = h.sites.set_dataset("dir", big.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    assert!(!last_prompt(&prompts).contains("Directory listings"));
+}
+
+#[tokio::test]
+async fn a_text_only_call_back_with_just_a_phone_number_offers_the_card() {
+    let (h, prompts) = start_text_only(
+        "Thanks Sam, the directory team will call you.\nLEAD: {\"name\":\"Sam\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Wants Hayvern to call\"}",
+    )
+    .await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    let mut ws = connect(&h.addr, "dir", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text(
+        "Can you get Hayvern to call me? I'm Sam, 07700 900123".into(),
+    ))
+    .await
+    .unwrap();
+    let frames = until_done(&mut ws).await;
+    let card = frames
+        .iter()
+        .find(|f| f["type"] == "card")
+        .expect("a lead card");
+    assert_eq!(card["card"]["lead"]["phone"], "07700 900123");
+    assert!(card["card"]["lead"].get("email").is_none());
+    assert!(!text_of(&frames).contains("LEAD:"));
+    assert!(last_prompt(&prompts).contains("\"Hayvern Electrical Ltd\""));
+}
+
+#[tokio::test]
+async fn a_lead_line_without_a_name_still_offers_the_card() {
+    let (h, _prompts) = start_text_only(
+        "Thanks, the team will call you.\nLEAD: {\"name\":null,\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":null}",
+    )
+    .await;
+    let mut ws = connect(&h.addr, "alpha", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text("call me on 07700 900123".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut ws).await;
+    let card = frames.iter().find(|f| f["type"] == "card").expect("card");
+    assert_eq!(card["card"]["lead"]["phone"], "07700 900123");
+    assert_eq!(card["card"]["lead"]["name"], "Website visitor");
+}
+
+#[tokio::test]
+async fn a_phone_number_without_a_lead_line_still_offers_a_card_when_asking_for_a_call() {
+    let (h, _prompts) = start_text_only("I can pass that on.").await;
+    let mut ws = connect(&h.addr, "alpha", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text("Please call me back on 07700 900123".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut ws).await;
+    let card = frames.iter().find(|f| f["type"] == "card").expect("card");
+    assert_eq!(card["card"]["lead"]["phone"], "07700 900123");
+    // A number mentioned without asking to be called is not a lead.
+    let mut ws = connect(&h.addr, "alpha", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text(
+        "Is 01204 579975 the right number for Hayvern?".into(),
+    ))
+    .await
+    .unwrap();
+    let frames = until_done(&mut ws).await;
+    assert!(!frames.iter().any(|f| f["type"] == "card"));
+}
+
+#[tokio::test]
+async fn a_sha_rotated_mid_flight_rereads_the_bot_and_uses_the_new_dataset() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let newer = LISTINGS.replace("Hayvern", "Rotated");
+    let new_sha = h.sites.set_dataset("dir", newer.as_bytes());
+    // The bot still names the old sha when first read; the platform has already moved on.
+    let old_sha = sha256_hex(LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&old_sha)));
+    *h.sites.rotate_on_404.lock().unwrap() =
+        Some(("dir".into(), directory_bot("dir", 2, Some(&new_sha))));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    let p = last_prompt(&prompts);
+    assert!(p.contains("\"Rotated Electrical Ltd\""), "{p}");
+    assert_eq!(h.sites.fetches("dir"), 2, "the bot was re-read once");
+    assert_eq!(h.sites.dataset_fetches("dir"), 2);
+}
+
+#[tokio::test]
+async fn a_dataset_that_fails_to_parse_keeps_the_previous_one() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    // A correctly hashed body that isn't a valid v1 dataset.
+    let broken = br#"{"schema_version": 2, "listings": []}"#;
+    let bad_sha = h.sites.set_dataset("dir", broken);
+    h.sites.set("dir", directory_bot("dir", 2, Some(&bad_sha)));
+    assert_eq!(invalidate(&h.addr, "dir", TOKEN).await, 204);
+    ask(&h.addr, "dir", ALPHA_ORIGIN, BOLTON).await;
+    let p = last_prompt(&prompts);
+    assert!(
+        p.contains("\"Hayvern Electrical Ltd\""),
+        "previous kept: {p}"
+    );
 }

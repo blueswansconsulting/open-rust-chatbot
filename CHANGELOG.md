@@ -13,3 +13,12 @@ All notable changes are documented here. This project follows [Semantic Versioni
 - Docker image (distroless, non-root) and compose file.
 - Multi-site mode: many bots from one server under `/b/<id>/...`, with settings, knowledge base and
   allowed origins loaded from a sites API (`SITES_API_URL`), cached, and invalidated on demand.
+- Directory listings datasets: bots can name a listings dataset (`datasets.listings`), fetched by
+  sha256, verified and cached; every turn a deterministic lookup by service, place and business name
+  adds complete, counted listing rows to text-only prompts, and a `search_directory_listings` tool
+  for tool-calling models.
+
+### Fixed
+- Text-only prompts no longer carry the tool-era lead wording ("call propose_lead … name and
+  email"): a phone number or an email is enough, a typed phone number with a call-back request
+  offers the card, and directory bots say the directory team follows up.
