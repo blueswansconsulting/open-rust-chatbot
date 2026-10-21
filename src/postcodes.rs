@@ -15,7 +15,7 @@ use std::sync::LazyLock;
 
 static CENTROIDS: &str = include_str!("data/outcode-centroids.csv");
 
-/// (outcode padded with zero bytes, lat, lon), sorted by outcode. About 2,900 rows, 35 KB.
+/// (outcode padded with zero bytes, lat, lon), sorted by outcode. About 2,750 rows, 33 KB.
 static TABLE: LazyLock<Vec<([u8; 4], f32, f32)>> = LazyLock::new(|| {
     let mut rows: Vec<([u8; 4], f32, f32)> = CENTROIDS
         .lines()
@@ -42,9 +42,13 @@ static FULL: LazyLock<Regex> = LazyLock::new(|| {
 static OUTWARD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b([a-z]{1,2}[0-9][a-z0-9]?)\b").unwrap());
 static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{L}\p{N}']+").unwrap());
+/// A motorway junction ("J4") after an outcode-shaped road name.
+static JUNCTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^j[0-9]{1,2}[a-z]?$").unwrap());
+/// An ordinal after an outcode-shaped flat or floor ("B1 2nd floor").
+static ORDINAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9]+(?:st|nd|rd|th)$").unwrap());
 
 /// Words right before an outcode that make it a postcode ("near BL6", "postcode BL6").
-const BEFORE: [&str; 10] = [
+const BEFORE: [&str; 15] = [
     "in",
     "near",
     "nr",
@@ -55,13 +59,20 @@ const BEFORE: [&str; 10] = [
     "district",
     "area",
     "from",
+    "at",
+    "cover",
+    "covering",
+    "serving",
+    "serve",
 ];
-/// Words right before an outcode that make it something else ("the M1", "cell E5").
-const NOT_BEFORE: [&str; 12] = [
+/// Words right before an outcode that make it something else ("the M1", "cell E5", "fit GU10").
+const NOT_BEFORE: [&str; 22] = [
     "the", "junction", "jct", "cell", "cells", "column", "row", "range", "vitamin", "a", "an", "j",
+    "fit", "fitted", "fitting", "change", "replace", "replaced", "type", "size", "model", "rated",
 ];
-/// Words right after an outcode that make it something else ("M1 motorway", "E5 cell").
-const NOT_AFTER: [&str; 16] = [
+/// Words right after an outcode that make it something else ("M1 motorway", "E5 cell", "GU10
+/// downlights", "B32 breakers").
+const NOT_AFTER: [&str; 45] = [
     "motorway",
     "mway",
     "junction",
@@ -72,15 +83,45 @@ const NOT_AFTER: [&str; 16] = [
     "eastbound",
     "westbound",
     "services",
+    "ring",
+    "road",
+    "exit",
+    "slip",
     "cell",
     "cells",
     "column",
     "row",
     "formula",
     "spreadsheet",
+    "breaker",
+    "breakers",
+    "mcb",
+    "mcbs",
+    "rcbo",
+    "rcbos",
+    "bulb",
+    "bulbs",
+    "lamp",
+    "lamps",
+    "downlight",
+    "downlights",
+    "spotlight",
+    "spotlights",
+    "fitting",
+    "fittings",
+    "holder",
+    "socket",
+    "petrol",
+    "fuel",
+    "cable",
+    "deficiency",
+    "levels",
+    "supplement",
+    "supplements",
 ];
-/// Words anywhere in the message that make a lone outcode a spreadsheet cell or a road.
-const NOT_IN_MESSAGE: [&str; 8] = [
+/// Words anywhere in the message that make a lone outcode a spreadsheet cell, a road or a
+/// vitamin.
+const NOT_IN_MESSAGE: [&str; 11] = [
     "spreadsheet",
     "excel",
     "formula",
@@ -89,7 +130,12 @@ const NOT_IN_MESSAGE: [&str; 8] = [
     "motorway",
     "worksheet",
     "vlookup",
+    "junction",
+    "vitamin",
+    "vitamins",
 ];
+/// Words two back that make "in B12" a quantity, not a place ("rich in B12").
+const NOT_TWO_BEFORE: [&str; 5] = ["rich", "high", "low", "deficient", "lacking"];
 
 /// The outcode as a lookup key: upper case, 2 to 4 letters and digits, zero padded.
 fn key(outcode: &str) -> Option<[u8; 4]> {
@@ -105,12 +151,32 @@ fn key(outcode: &str) -> Option<[u8; 4]> {
 }
 
 /// Where a GB outcode's postcodes are on average (WGS84 degrees), if it is a geographic one.
+/// London districts split into sub-districts ("W1" is W1A…W1W, "SW1" is SW1A…SW1Y) get the
+/// mean of their sub-districts.
 pub fn centroid(outcode: &str) -> Option<(f64, f64)> {
     let k = key(outcode)?;
     let t = &*TABLE;
-    t.binary_search_by_key(&k, |r| r.0)
-        .ok()
-        .map(|i| (t[i].1 as f64, t[i].2 as f64))
+    if let Ok(i) = t.binary_search_by_key(&k, |r| r.0) {
+        return Some((t[i].1 as f64, t[i].2 as f64));
+    }
+    let len = k.iter().position(|&b| b == 0).unwrap_or(4);
+    if len >= 4 || !k[len - 1].is_ascii_digit() {
+        return None;
+    }
+    // Sub-districts: the same characters then one letter ("W1" -> "W1A").
+    let from = t.partition_point(|r| r.0 < k);
+    let subs: Vec<&([u8; 4], f32, f32)> = t[from..]
+        .iter()
+        .take_while(|r| r.0[..len] == k[..len])
+        .filter(|r| r.0[len].is_ascii_alphabetic() && (len + 1 == 4 || r.0[len + 1] == 0))
+        .collect();
+    if subs.is_empty() {
+        return None;
+    }
+    let n = subs.len() as f64;
+    let lat = subs.iter().map(|r| r.1 as f64).sum::<f64>() / n;
+    let lon = subs.iter().map(|r| r.2 as f64).sum::<f64>() / n;
+    Some((lat, lon))
 }
 
 /// How many outcodes the table has.
@@ -132,15 +198,16 @@ pub fn distance_km(a: (f64, f64), b: (f64, f64)) -> f64 {
     2.0 * 6371.0088 * h.sqrt().min(1.0).asin()
 }
 
-/// A postcode recognised in a message: its outcode in upper case, and where it is (None for
-/// Northern Ireland, which the table does not cover).
+/// A postcode recognised in a message: its outcode in upper case, where it is (None for
+/// Northern Ireland, which the table does not cover) and where it was in the message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Postcode {
     pub outcode: Box<str>,
     pub at: Option<(f64, f64)>,
+    pub span: std::ops::Range<usize>,
 }
 
-fn known(outcode: &str) -> Option<Postcode> {
+fn known(outcode: &str, span: std::ops::Range<usize>) -> Option<Postcode> {
     let outcode = outcode.to_ascii_uppercase();
     let at = centroid(&outcode);
     let northern_ireland = outcode.len() >= 3
@@ -149,7 +216,14 @@ fn known(outcode: &str) -> Option<Postcode> {
     (at.is_some() || northern_ireland).then(|| Postcode {
         outcode: outcode.into(),
         at,
+        span,
     })
+}
+
+/// A known outcode as a [`Postcode`] (for one carried over from an earlier turn).
+pub fn outcode(outcode: &str) -> Option<Postcode> {
+    key(outcode)?;
+    known(outcode, 0..0)
 }
 
 /// The first postcode in `text`: a full one anywhere, else an outward code with postcode
@@ -160,28 +234,46 @@ pub fn find(text: &str, service_context: bool) -> Option<Postcode> {
         Some((at, _)) => &text[..at],
         None => text,
     };
-    if let Some(p) = FULL.captures_iter(text).find_map(|c| known(&c[1])) {
-        return Some(p);
+    let full = FULL.captures_iter(text).find_map(|c| {
+        let inward = c[2].to_ascii_lowercase();
+        // "B1 2nd floor", "M1 1st exit" are ordinals, not inward codes.
+        if ["st", "nd", "rd", "th"].contains(&&inward[1..]) {
+            return None;
+        }
+        let whole = c.get(0)?;
+        known(&c[1], whole.range())
+    });
+    if full.is_some() {
+        return full;
     }
-    let lower = text.to_lowercase();
-    let words: Vec<&str> = WORD.find_iter(&lower).map(|m| m.as_str()).collect();
-    if words.iter().any(|w| NOT_IN_MESSAGE.contains(w)) {
+    // The message's words, once, with where each is.
+    let words: Vec<(std::ops::Range<usize>, String)> = WORD
+        .find_iter(text)
+        .map(|m| (m.range(), m.as_str().to_lowercase()))
+        .collect();
+    if words
+        .iter()
+        .any(|(_, w)| NOT_IN_MESSAGE.contains(&w.as_str()))
+    {
         return None;
     }
     for m in OUTWARD.find_iter(text) {
-        let Some(p) = known(m.as_str()) else {
+        let Some(p) = known(m.as_str(), m.range()) else {
             continue;
         };
-        let before: Vec<String> = WORD
-            .find_iter(&text[..m.start()])
-            .map(|w| w.as_str().to_lowercase())
-            .collect();
-        let after = WORD
-            .find(&text[m.end()..])
-            .map(|w| w.as_str().to_lowercase());
-        let prev = before.last().map(String::as_str);
-        if prev.is_some_and(|w| NOT_BEFORE.contains(&w))
-            || after.as_deref().is_some_and(|w| NOT_AFTER.contains(&w))
+        let at = words.partition_point(|(r, _)| r.start < m.start());
+        let before: Vec<&str> = words[..at].iter().map(|(_, w)| w.as_str()).collect();
+        let after = words.get(at + 1).map(|(_, w)| w.as_str());
+        let prev = before.last().copied();
+        let prev2 = before.len().checked_sub(2).map(|i| before[i]);
+        // "the E5 area", "a BL6 based electrician" are postcodes after all.
+        let area_after =
+            after.is_some_and(|w| ["area", "based", "postcode", "district"].contains(&w));
+        if prev.is_some_and(|w| NOT_BEFORE.contains(&w)) && !area_after
+            || prev2.is_some_and(|w| NOT_TWO_BEFORE.contains(&w))
+            || after.is_some_and(|w| {
+                NOT_AFTER.contains(&w) || JUNCTION.is_match(w) || ORDINAL.is_match(w)
+            })
             || text[m.end()..].starts_with(':')
         {
             continue;
@@ -190,15 +282,15 @@ pub fn find(text: &str, service_context: bool) -> Option<Postcode> {
             || (words.len() <= 3
                 && before
                     .iter()
-                    .all(|w| ["it's", "its", "it", "is", "thats", "that's"].contains(&w.as_str()))
+                    .all(|w| ["it's", "its", "it", "is", "thats", "that's"].contains(w))
                 && after.is_none());
         // "my postcode is BL6", "postcode's BL6", "post code: BL6".
-        let postcode_is = before.len() >= 2
-            && ["is", "was", "s"].contains(&before[before.len() - 1].as_str())
-            && ["postcode", "code", "outcode"].contains(&before[before.len() - 2].as_str())
+        let postcode_is = prev2.is_some_and(|w| ["postcode", "code", "outcode"].contains(&w))
+            && prev.is_some_and(|w| ["is", "was", "s"].contains(&w))
             || prev.is_some_and(|w| ["postcode's", "postcode\u{2019}s"].contains(&w));
         if whole_message
             || postcode_is
+            || area_after
             || prev.is_some_and(|w| BEFORE.contains(&w))
             || service_context
         {

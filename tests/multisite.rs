@@ -1327,6 +1327,13 @@ async fn a_postcode_ranks_listings_by_distance_and_carries_to_the_next_turn() {
         p.contains("Emergency electricians within 25 km of BL6"),
         "{p}"
     );
+    // Two turns on, the session still remembers BL6.
+    ws.send(Message::Text("and rewiring?".into()))
+        .await
+        .unwrap();
+    until_done(&mut ws).await;
+    let p = last_prompt(&prompts);
+    assert!(p.contains("Rewiring within 25 km of BL6"), "{p}");
 }
 
 #[tokio::test]

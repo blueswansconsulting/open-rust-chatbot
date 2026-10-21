@@ -240,10 +240,13 @@ service asked about) are ranked by distance from that outcode's centre to each l
 within 25 km, nearest first with an approximate distance and an honest count ("Listings within
 25 km of BL6: 10 of 12"). With none in range the block says "No listings within 25 km of IV1" so
 the model offers an enquiry instead. Only the outcode is ever shown; a follow-up ("what about
-emergency ones?") keeps the previous message's postcode. Outcode centres come from OS Code-Point
+emergency ones?", "and rewiring?") keeps the conversation's last postcode until a town is asked
+about; a town named with the postcode ("Bolton BL6") keeps its own list too. Outcode centres come from OS Code-Point
 Open (Open Government Licence v3; GB only, so Northern Ireland postcodes get a "Great Britain
 only" no-coverage note), built by `src/data/build-outcode-centroids.py`, attribution in
-`src/data/NOTICE`. Listings without a known outcode are not ranked by distance.
+`src/data/NOTICE`. A listing without an outcode is placed at its town's centre (the mean of that
+town's located listings), or else left out of postcode lists. Outcode-shaped part codes and roads
+("GU10 downlights", "B32 breakers", "M1 J4", "M60 ring road", "rich in B12") are not postcodes.
 
 **Reply caps.** With `caps`, a bot answers at most `repliesPerHour` and `repliesPerDay` turns, and all
 bots with the same `partnerId` together at most `partnerRepliesPerDay` a day (UTC). One visitor can
