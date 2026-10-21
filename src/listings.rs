@@ -228,7 +228,7 @@ fn english_words_from(restart: usize) -> impl Iterator<Item = String> {
 
 /// True if `word` is in the English word list. Binary search over the restart lines, then a
 /// short scan.
-fn english_word(word: &str) -> bool {
+pub(crate) fn english_word(word: &str) -> bool {
     if !(3..=10).contains(&word.len()) || !word.bytes().all(|b| b.is_ascii_lowercase()) {
         return false;
     }
@@ -281,7 +281,7 @@ fn everyday_word(word: &str) -> bool {
     COMMON_NAMES.contains(word) || english_word(word)
 }
 
-fn first_name(word: &str) -> bool {
+pub(crate) fn first_name(word: &str) -> bool {
     FIRST_NAMES.contains(word)
 }
 
@@ -897,6 +897,11 @@ impl Listings {
 
     pub fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    /// Every listed business's phone number, as stored.
+    pub fn phones(&self) -> impl Iterator<Item = &str> {
+        self.listings.iter().filter_map(|l| l.phone.as_deref())
     }
 
     pub fn len(&self) -> usize {

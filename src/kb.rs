@@ -219,6 +219,11 @@ impl KnowledgeBase {
         ))
     }
 
+    /// The text of every chunk.
+    pub fn texts(&self) -> impl Iterator<Item = &str> {
+        self.chunks.iter().map(|c| c.text.as_str())
+    }
+
     pub fn load(path: &Path) -> std::io::Result<Self> {
         Ok(Self::from_markdown(&std::fs::read_to_string(path)?))
     }

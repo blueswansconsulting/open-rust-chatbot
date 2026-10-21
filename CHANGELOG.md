@@ -26,3 +26,10 @@ All notable changes are documented here. This project follows [Semantic Versioni
 - Text-only prompts no longer carry the tool-era lead wording ("call propose_lead … name and
   email"): a phone number or an email is enough, a typed phone number with a call-back request
   offers the card, and directory bots say the directory team follows up.
+- Text-only fallback card: a bare call-back request next to a number ("call 07700 900123", "give
+  me a ring", "can you call", "07700 900123, please call") now offers the card; a listed business's
+  or the knowledge base's number, or one about someone else ("call them on …"), never does. A
+  reference word ("job", "quote") only hides the number straight after it, and never a UK mobile.
+  Call-back times ("after 4pm", "tomorrow morning") go in the card's best time, leftover greetings
+  and connectors ("Hi", "and", "!") are dropped, and everyday words after "I'm" ("Retired",
+  "Desperate") are no longer taken as names.

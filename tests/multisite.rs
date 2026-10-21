@@ -1783,3 +1783,45 @@ async fn the_fallback_card_survives_digits_typed_after_the_number() {
         assert_eq!(cards[0]["card"]["lead"]["name"], "Sam", "{question}");
     }
 }
+
+#[tokio::test]
+async fn a_listed_firms_number_typed_by_the_visitor_never_becomes_their_card() {
+    // QA of #22, low 1: "please call 01204 579975" is about Hayvern, not the visitor.
+    let (h, _prompts) = start_text_only(
+        "Sure. LEAD: {\"name\":\"Sam\",\"phone\":\"01204 579975\",\"email\":null,\"best_time\":null,\"message\":\"Call Hayvern\"}",
+    )
+    .await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    for text in [
+        "can you call 01204 579975 for me?",
+        "please call 01204 579975",
+        "I tried to call them on 01204 579975, can you call me?",
+    ] {
+        let mut ws = connect(&h.addr, "dir", ALPHA_ORIGIN).await.unwrap();
+        ws.send(Message::Text(text.into())).await.unwrap();
+        let frames = until_done(&mut ws).await;
+        assert!(cards(&frames).is_empty(), "{text}: {frames:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_bare_call_request_offers_a_card_with_the_time_in_best_time() {
+    let (h, _prompts) = start_text_only("I can pass that on.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    let mut ws = connect(&h.addr, "dir", ALPHA_ORIGIN).await.unwrap();
+    ws.send(Message::Text(
+        "Hi I'm Mo, ring 07700 900123 after 4pm about an EICR".into(),
+    ))
+    .await
+    .unwrap();
+    let frames = until_done(&mut ws).await;
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1, "{frames:?}");
+    let lead = &cards[0]["card"]["lead"];
+    assert_eq!(lead["name"], "Mo");
+    assert_eq!(lead["phone"], "07700 900123");
+    assert_eq!(lead["bestTime"], "after 4pm");
+    assert_eq!(lead["message"], "Ring about an EICR");
+}
