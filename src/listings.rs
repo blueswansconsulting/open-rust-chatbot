@@ -168,6 +168,8 @@ const PRODUCT_WORDS: [&str; 18] = [
     "meters",
 ];
 /// Words that show the visitor is looking a business up, anywhere in the message.
+/// Within two words of the name, and not the visitor's own ("my number is…"); "good" only as
+/// "any good".
 const LOOKUP_CUES: [&str; 15] = [
     "number", "numbers", "phone", "contact", "website", "email", "reviews", "review", "rating",
     "ratings", "address", "details", "listed", "list", "good",
@@ -1143,16 +1145,14 @@ impl Listings {
         let has_other_match = has_service || !places.is_empty();
         // A business name typed out ("lime electrical number", "Revive Rewire", "simon dean")
         // beats single-word matching: the longest such name wins.
-        let typed = self.typed_names(toks, used);
+        let typed = self.typed_names(toks, used, places);
         if let Some(best) = typed.iter().map(|(k, _)| *k).max() {
-            let mut ids: Vec<u32> = Vec::new();
-            for (k, id) in typed {
-                if k == best && !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
-            ids.truncate(MAX_ROWS);
-            return ids;
+            let ids: Vec<u32> = typed
+                .into_iter()
+                .filter(|(k, _)| *k == best)
+                .map(|(_, id)| id)
+                .collect();
+            return self.distinct_listings(ids);
         }
         // (word, could stand alone as a business name)
         // (word, could stand alone as a business name, capitalised, not an everyday word or name)
@@ -1296,10 +1296,27 @@ impl Listings {
         if hits.first().is_some_and(|h| h.0 == full) {
             hits.retain(|h| h.0 == full);
         }
-        hits.into_iter()
-            .map(|(_, _, id)| id)
-            .take(MAX_ROWS)
-            .collect()
+        self.distinct_listings(hits.into_iter().map(|(_, _, id)| id).collect())
+    }
+
+    /// Drops repeats of a listing (the same id, or the same name and profile page listed twice),
+    /// keeping the first, and caps the count.
+    fn distinct_listings(&self, ids: Vec<u32>) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for id in ids {
+            let l = &self.listings[id as usize];
+            let repeat = out.iter().any(|&o| {
+                let other = &self.listings[o as usize];
+                o == id || (other.name == l.name && other.profile_url == l.profile_url)
+            });
+            if !repeat {
+                out.push(id);
+            }
+            if out.len() == MAX_ROWS {
+                break;
+            }
+        }
+        out
     }
 
     /// Business names typed out from their first word, as (words matched, listing). The start of
@@ -1308,11 +1325,22 @@ impl Listings {
     ///   electrical bolton");
     /// - it is the whole name, written in capitals ("Revive Rewire") or after a word like "list"
     ///   ("do you list curious electrics");
-    /// - it includes the name's ending and the visitor is looking someone up ("lime electrical
-    ///   number"), so "safe electrical work?" is not "SAFE Electrical Solutions".
-    fn typed_names(&self, toks: &[Tok], used: &[bool]) -> Vec<(usize, u32)> {
+    /// - it includes the name's ending and the visitor is looking someone up, right next to it
+    ///   ("lime electrical number"), so "safe electrical work?" is not "SAFE Electrical Solutions".
+    ///
+    /// Except for a whole name written in capitals, the first and last need a distinctive word
+    /// ("lime", "simon dean"): "emergency electrician" or "kent electrical" is a search, not a
+    /// firm. With a town in the message, the firm must be in it (again unless written in full).
+    fn typed_names(&self, toks: &[Tok], used: &[bool], places: &[u32]) -> Vec<(usize, u32)> {
         const COMPANY: [&str; 4] = ["ltd", "limited", "llp", "plc"];
-        let lookup = toks.iter().any(|t| LOOKUP_CUES.contains(&t.text.as_str()));
+        let cue_at = |j: usize| {
+            toks.get(j).is_some_and(|t| {
+                let prev = j.checked_sub(1).map(|p| toks[p].text.as_str());
+                LOOKUP_CUES.contains(&t.text.as_str())
+                    && !matches!(prev, Some("my" | "our" | "me" | "mine"))
+                    && (t.text != "good" || prev == Some("any"))
+            })
+        };
         let mut checks = 64;
         let mut out = Vec::new();
         for i in 0..toks.len() {
@@ -1342,9 +1370,32 @@ impl Listings {
                 let extras = (0..toks.len())
                     .filter(|&j| (j < i || j >= i + k) && !used[j])
                     .count();
-                let capitals = toks[i..i + k].iter().all(|t| t.capital);
+                // "Down to Earth Electrical": small words may stay lowercase.
+                let capitals = toks[i..i + k]
+                    .iter()
+                    .all(|t| t.capital || (t.text.len() <= 3 && STOP.contains(t.text.as_str())));
                 let after_cue = i > 0 && NAME_CUES.contains(&toks[i - 1].text.as_str());
-                if extras == 0 || (full && (capitals || after_cue)) || (has_ending && lookup) {
+                let written_in_full = full && capitals;
+                let distinctive = (i..i + k).any(|j| {
+                    let w = toks[j].text.as_str();
+                    !used[j]
+                        && (self.name_index.contains_key(w)
+                            || w.strip_suffix('s')
+                                .is_some_and(|b| self.name_index.contains_key(b)))
+                        && !COMMON_NAMES.contains(w)
+                        && !GENERIC.contains(w)
+                        && !self.place_words.contains(w)
+                });
+                let lookup = (i.saturating_sub(2)..i).any(cue_at) || (i + k..i + k + 2).any(cue_at);
+                let in_place = places.is_empty()
+                    || places
+                        .iter()
+                        .any(|&p| self.places[p as usize].members.contains(&id));
+                let ok = written_in_full
+                    || (in_place
+                        && ((full && after_cue)
+                            || (distinctive && (extras == 0 || (has_ending && lookup)))));
+                if ok {
                     out.push((k, id));
                 }
             }
@@ -1907,15 +1958,15 @@ mod tests {
             ),
             ("route electrical ltd", "Route Electrical Ltd"),
             (
-                "bright sparks electrical",
+                "Bright Sparks Electrical Services",
                 "Bright Sparks Electrical Services Ltd",
             ),
-            ("smart electrical solutions", "Smart Electrical Solutions"),
+            ("Smart Electrical Solutions", "Smart Electrical Solutions"),
             ("ideal electricians ltd number", "Ideal Electricians Ltd"),
-            ("complete electrical", "Complete Electrical"),
-            ("curious electrics", "Curious Electrics"),
+            ("Complete Electrical", "Complete Electrical"),
+            ("do you list curious electrics", "Curious Electrics"),
             (
-                "down to earth electrical",
+                "Down to Earth Electrical Contractors",
                 "Down to Earth Electrical Contractors",
             ),
             ("simon dean", "Simon Dean Electrical Ltd"),
@@ -1924,7 +1975,7 @@ mod tests {
                 "Peter Whiting Electrical Contractors",
             ),
             ("toms electrical", "Tom's Electrical Services Ltd"),
-            ("mayday electrical bolton", "Mayday Electrical"),
+            ("mayday electrical london", "Mayday Electrical"),
             ("jax", "Jax Group Electrical & Renewable Services"),
             (
                 "Is jax any good",
@@ -1937,15 +1988,64 @@ mod tests {
         ] {
             assert_eq!(DEMO.lookup(q, "").names, [want], "{q}");
         }
-        // Still not names: the visitor is describing work, not looking a firm up.
+        // Still not names: the visitor is describing work or searching, not looking a firm up.
+        // Names made only of everyday and trade words count only when written out in capitals.
         for q in [
             "safe electrical work?",
             "complete rewire please",
             "Is safe electrical work certified?",
             "Down to earth advice please",
+            // QA re-review repros (R8).
+            "emergency electrician",
+            "emergency electrician bolton",
+            "your local electrician",
+            "contact electrician",
+            "certified electricians",
+            "smart electrical",
+            "complete electrical",
+            "safe electrical",
+            "total electric",
+            "absolutely electrical",
+            "everything electric",
+            "all electrical",
+            "kent electrical",
+            "north london electricians",
+            "south london electricians",
+            "west london electrical",
+            "bright sparks electrical",
+            "smart electrical solutions",
+            "is smart electrical work good value?",
+            "need a safe electrical installation, my number is 07700 900123",
+            "my email is jo@example.com, I want a total electric rewire",
         ] {
             assert!(DEMO.lookup(q, "").names.is_empty(), "{q}");
         }
+        // With a town, a typed name must be a firm in that town.
+        for q in [
+            "smart electrical bolton",
+            "complete electrical bolton",
+            "ideal electrical bolton",
+            "safe electrical oldham",
+        ] {
+            assert!(DEMO.lookup(q, "").names.is_empty(), "{q}");
+        }
+    }
+
+    #[test]
+    fn a_listing_entered_twice_is_named_once() {
+        let ds = json!({"schema_version": 1, "services": [], "places": [], "listings": [
+            {"id": "a", "name": "Zorvex Electrical", "profile_url": "https://d.example/z", "places": [], "services": []},
+            {"id": "b", "name": "Zorvex Electrical", "profile_url": "https://d.example/z", "places": [], "services": []},
+        ]});
+        let t = Listings::parse(ds.to_string().as_bytes(), "x").unwrap();
+        assert_eq!(
+            t.lookup("zorvex electrical number", "").names,
+            ["Zorvex Electrical"]
+        );
+        assert_eq!(
+            t.lookup("Is Zorvex any good?", "").names,
+            ["Zorvex Electrical"]
+        );
     }
 
     #[test]
