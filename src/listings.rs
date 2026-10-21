@@ -1745,14 +1745,15 @@ impl Listings {
                 if !in_near.is_empty() && rows.is_empty() && all > 0 {
                     continue;
                 }
+                let total = rows.len();
                 out.push(Section {
                     heading: SectionKind::Place {
                         place: p,
                         service: svc,
                     },
-                    total: rows.len(),
+                    total,
                     rows,
-                    also: !in_near.is_empty(),
+                    also: !in_near.is_empty() && total < all,
                 });
             }
         }
