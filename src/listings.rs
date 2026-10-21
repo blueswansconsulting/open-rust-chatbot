@@ -140,6 +140,39 @@ const NAME_SUFFIX: [&str; 17] = [
     "llp",
 ];
 
+/// Brands that are also listed firms' names ("Tesla Electrics", "Hive Serv"): they only name a
+/// firm when a name ending follows ("Tesla Electrics"), never in "Tesla charger".
+const BRAND_WORDS: [&str; 14] = [
+    "tesla", "hive", "nest", "ring", "octopus", "myenergi", "zappi", "pod", "ohme", "wylex",
+    "hager", "andersen", "rolec", "easee",
+];
+/// Product and service words: "Tesla charger", "Hive heating" are products, not firms.
+const PRODUCT_WORDS: [&str; 18] = [
+    "charger",
+    "chargers",
+    "charging",
+    "charge",
+    "wall",
+    "connector",
+    "thermostat",
+    "thermostats",
+    "heating",
+    "doorbell",
+    "doorbells",
+    "battery",
+    "batteries",
+    "panel",
+    "panels",
+    "app",
+    "meter",
+    "meters",
+];
+/// Words that show the visitor is looking a business up, anywhere in the message.
+const LOOKUP_CUES: [&str; 15] = [
+    "number", "numbers", "phone", "contact", "website", "email", "reviews", "review", "rating",
+    "ratings", "address", "details", "listed", "list", "good",
+];
+
 /// Words before a business name written in lowercase ("do you list curious electrics").
 const NAME_CUES: [&str; 12] = [
     "for",
@@ -160,8 +193,8 @@ const NAME_CUES: [&str; 12] = [
 /// /usr/share/dict/web2), lower-case, 3 to 12 letters, sorted bytewise. A business name made of
 /// one of these ("Voltage", "Complete") only counts when written as a name.
 static ENGLISH_WORDS: &str = include_str!("data/english-words.txt");
-/// First names (BSD's /usr/share/dict/propernames, public domain), lower-case, sorted. A lone
-/// first name is usually the visitor's own ("Simon here").
+/// First names (FreeBSD's share/dict/propernames, distributed with BSD; see src/data/NOTICE),
+/// lower-case, sorted. A lone first name is usually the visitor's own ("Simon here").
 static FIRST_NAMES: &str = include_str!("data/first-names.txt");
 
 /// Binary search in a sorted, newline-separated word list, without allocating.
@@ -337,6 +370,9 @@ pub struct Listings {
     synonym_services: Vec<Vec<u16>>,
     /// Distinctive business-name word -> listings whose name has it.
     name_index: HashMap<Box<str>, Vec<u32>>,
+    /// First word of a business name -> listings whose name starts with it, for names typed in
+    /// full in lowercase ("lime electrical number").
+    name_starts: HashMap<Box<str>, Vec<u32>>,
 }
 
 /// What the lookup recognised in a question (slugs and listing names, for tests and logs).
@@ -678,6 +714,7 @@ impl Listings {
         order.sort_by_key(|&i| (raw.listings[i].position.unwrap_or(i64::MAX), i));
         let mut listings = Vec::with_capacity(order.len());
         let mut name_index: HashMap<Box<str>, Vec<u32>> = HashMap::new();
+        let mut name_starts: HashMap<Box<str>, Vec<u32>> = HashMap::new();
         for i in order {
             let l = &raw.listings[i];
             let ix = listings.len() as u32;
@@ -709,6 +746,9 @@ impl Listings {
             distinct.dedup();
             for w in &distinct {
                 name_index.entry(w.as_str().into()).or_default().push(ix);
+            }
+            if let Some(first) = words_of(&name).into_iter().next() {
+                name_starts.entry(first.into()).or_default().push(ix);
             }
             let area = match (
                 non_empty(l.town.as_deref(), 40),
@@ -754,6 +794,10 @@ impl Listings {
             v.shrink_to_fit();
         }
         name_index.shrink_to_fit();
+        for v in name_starts.values_mut() {
+            v.shrink_to_fit();
+        }
+        name_starts.shrink_to_fit();
         place_phrases.shrink_to_fit();
         Ok(Listings {
             sha256: sha256.to_owned(),
@@ -765,6 +809,7 @@ impl Listings {
             service_phrases,
             synonym_services,
             name_index,
+            name_starts,
         })
     }
 
@@ -820,6 +865,7 @@ impl Listings {
         let names: usize = self
             .name_index
             .iter()
+            .chain(&self.name_starts)
             .map(|(k, v)| ENTRY + BOX + 24 + k.len() + v.capacity() * 4)
             .sum();
         let words: usize = self.place_words.iter().map(|w| ENTRY + BOX + w.len()).sum();
@@ -1095,6 +1141,19 @@ impl Listings {
         has_service: bool,
     ) -> Vec<u32> {
         let has_other_match = has_service || !places.is_empty();
+        // A business name typed out ("lime electrical number", "Revive Rewire", "simon dean")
+        // beats single-word matching: the longest such name wins.
+        let typed = self.typed_names(toks, used);
+        if let Some(best) = typed.iter().map(|(k, _)| *k).max() {
+            let mut ids: Vec<u32> = Vec::new();
+            for (k, id) in typed {
+                if k == best && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            ids.truncate(MAX_ROWS);
+            return ids;
+        }
         // (word, could stand alone as a business name)
         // (word, could stand alone as a business name, capitalised, not an everyday word or name)
         let mut query: Vec<(&str, bool, bool, bool)> = Vec::new();
@@ -1122,10 +1181,18 @@ impl Listings {
             let capitalised_name = suffix_next && t.capital && next.is_some_and(|n| n.capital);
             let common = everyday_word(w);
             let person = first_name(w);
+            let brand = BRAND_WORDS.contains(&w);
+            // "Tesla charger", "Hive heating": a product, not the firm called Tesla or Hive.
+            let product_next = next.is_some_and(|n| {
+                PRODUCT_WORDS.contains(&n.text.as_str()) || used.get(i + 1) == Some(&true)
+            }) && !suffix_next;
             // Whether this one word, on its own, names a business:
             let alone = !introduces_self
                 && !after_place_word
-                && if person {
+                && !product_next
+                && if brand {
+                    suffix_next
+                } else if person {
                     // a first name only as part of a capitalised name ("Simon Electrical");
                     capitalised_name
                 } else if common {
@@ -1137,7 +1204,8 @@ impl Listings {
                         || code
                         || (t.name_like() && len >= 3)
                         || (t.initial && len >= 4)
-                        || (len >= 4 && prev(1).is_some_and(|p| NAME_CUES.contains(&p)))
+                        || toks.len() == 1
+                        || (len >= 3 && prev(1).is_some_and(|p| NAME_CUES.contains(&p)))
                 };
             query.push((w, alone, t.capital, !common && !person));
         }
@@ -1184,7 +1252,6 @@ impl Listings {
                 }
             }
         }
-        let mut phrase_checks = 50;
         let mut hits: Vec<(u32, u32, u32)> = scores
             .into_iter()
             .filter_map(|(id, sc)| {
@@ -1199,15 +1266,9 @@ impl Listings {
                 let listing = &self.listings[id as usize];
                 let n = listing.name_words as usize;
                 let m = words.len();
-                // One word written like a name; two words of the name, at least one of them not
-                // an everyday word or written as a name ("Simon Dean"); or the whole name after a
-                // word that introduces one ("do you list curious electrics").
-                let strong = alone
-                    || (m >= 2 && (uncommon || all_capital))
-                    || (phrase_checks > 0 && {
-                        phrase_checks -= 1;
-                        self.whole_name_after_cue(toks, &listing.name)
-                    });
+                // One word written like a name, or two words of the name, at least one of them
+                // not an everyday word or all written as a name ("Simon Dean").
+                let strong = alone || (m >= 2 && (uncommon || all_capital));
                 // With a town in the question, a one-word match must be in that town.
                 let in_place = places.is_empty()
                     || places
@@ -1241,21 +1302,54 @@ impl Listings {
             .collect()
     }
 
-    /// True if the whole business name ("Curious Electrics", ignoring "Ltd") is in the message,
-    /// right after a word like "list" or "about". Service words in it count ("revive rewire").
-    fn whole_name_after_cue(&self, toks: &[Tok], name: &str) -> bool {
-        let words: Vec<String> = words_of(name)
-            .into_iter()
-            .filter(|w| !["ltd", "limited", "llp", "plc"].contains(&w.as_str()))
-            .collect();
-        if words.len() < 2 {
-            return false;
+    /// Business names typed out from their first word, as (words matched, listing). The start of
+    /// a name counts (two words or more, "Tom's" typed as "toms" too) when:
+    /// - it is all the message has, apart from a town or service ("simon dean", "mayday
+    ///   electrical bolton");
+    /// - it is the whole name, written in capitals ("Revive Rewire") or after a word like "list"
+    ///   ("do you list curious electrics");
+    /// - it includes the name's ending and the visitor is looking someone up ("lime electrical
+    ///   number"), so "safe electrical work?" is not "SAFE Electrical Solutions".
+    fn typed_names(&self, toks: &[Tok], used: &[bool]) -> Vec<(usize, u32)> {
+        const COMPANY: [&str; 4] = ["ltd", "limited", "llp", "plc"];
+        let lookup = toks.iter().any(|t| LOOKUP_CUES.contains(&t.text.as_str()));
+        let mut checks = 64;
+        let mut out = Vec::new();
+        for i in 0..toks.len() {
+            let text = toks[i].text.as_str();
+            let Some(ids) = self.name_starts.get(text).or_else(|| {
+                text.strip_suffix('s')
+                    .and_then(|base| self.name_starts.get(base))
+            }) else {
+                continue;
+            };
+            for &id in ids {
+                if checks == 0 {
+                    return out;
+                }
+                checks -= 1;
+                let words = words_of(&self.listings[id as usize].name);
+                let k = words
+                    .iter()
+                    .zip(&toks[i..])
+                    .take_while(|(w, t)| **w == t.text || format!("{w}s") == t.text)
+                    .count();
+                if k < 2 {
+                    continue;
+                }
+                let full = words[k..].iter().all(|w| COMPANY.contains(&w.as_str()));
+                let has_ending = words[..k].iter().any(|w| NAME_SUFFIX.contains(&w.as_str()));
+                let extras = (0..toks.len())
+                    .filter(|&j| (j < i || j >= i + k) && !used[j])
+                    .count();
+                let capitals = toks[i..i + k].iter().all(|t| t.capital);
+                let after_cue = i > 0 && NAME_CUES.contains(&toks[i - 1].text.as_str());
+                if extras == 0 || (full && (capitals || after_cue)) || (has_ending && lookup) {
+                    out.push((k, id));
+                }
+            }
         }
-        (1..toks.len()).any(|i| {
-            toks.len() - i >= words.len()
-                && NAME_CUES.contains(&toks[i - 1].text.as_str())
-                && words.iter().zip(&toks[i..]).all(|(w, t)| *w == t.text)
-        })
+        out
     }
 
     /// A capitalised multi-word phrase that is not a place or service: probably a business name
@@ -1293,11 +1387,11 @@ impl Listings {
             let text = &question[first.0..last.1];
             let lower = normalise(text);
             let words = tokenize(&quotes(text));
-            if words
-                .iter()
-                .any(|t| self.name_index.contains_key(t.text.as_str()))
-            {
-                continue; // part of a listed name: not "not listed"
+            if words.iter().any(|t| {
+                self.name_index.contains_key(t.text.as_str())
+                    || BRAND_WORDS.contains(&t.text.as_str())
+            }) {
+                continue; // part of a listed name, or a product brand: not "not listed"
             }
             let meaningful = words
                 .iter()
@@ -1800,6 +1894,73 @@ mod tests {
             let m = DEMO.lookup(q, "");
             assert!(m.names.is_empty(), "{q}: {:?}", m.names);
         }
+    }
+
+    #[test]
+    fn names_made_of_everyday_words_are_found_when_typed_out() {
+        // QA re-review repros (R6): each found nothing and the bot said "name no business".
+        for (q, want) in [
+            ("lime electrical number", "Lime Electrical"),
+            (
+                "voltage electrical phone?",
+                "Voltage Electrical Services (UK) Ltd",
+            ),
+            ("route electrical ltd", "Route Electrical Ltd"),
+            (
+                "bright sparks electrical",
+                "Bright Sparks Electrical Services Ltd",
+            ),
+            ("smart electrical solutions", "Smart Electrical Solutions"),
+            ("ideal electricians ltd number", "Ideal Electricians Ltd"),
+            ("complete electrical", "Complete Electrical"),
+            ("curious electrics", "Curious Electrics"),
+            (
+                "down to earth electrical",
+                "Down to Earth Electrical Contractors",
+            ),
+            ("simon dean", "Simon Dean Electrical Ltd"),
+            (
+                "peter whiting electrical",
+                "Peter Whiting Electrical Contractors",
+            ),
+            ("toms electrical", "Tom's Electrical Services Ltd"),
+            ("mayday electrical bolton", "Mayday Electrical"),
+            ("jax", "Jax Group Electrical & Renewable Services"),
+            (
+                "Is jax any good",
+                "Jax Group Electrical & Renewable Services",
+            ),
+            ("Revive Rewire", "Revive Rewire"),
+            ("Electric James", "Electric James"),
+            ("electric james", "Electric James"),
+            ("Tesla Electrics", "Tesla Electrics Limited"),
+        ] {
+            assert_eq!(DEMO.lookup(q, "").names, [want], "{q}");
+        }
+        // Still not names: the visitor is describing work, not looking a firm up.
+        for q in [
+            "safe electrical work?",
+            "complete rewire please",
+            "Is safe electrical work certified?",
+            "Down to earth advice please",
+        ] {
+            assert!(DEMO.lookup(q, "").names.is_empty(), "{q}");
+        }
+    }
+
+    #[test]
+    fn product_brands_are_not_the_firms_named_after_them() {
+        // QA re-review repros (R7).
+        for q in [
+            "Tesla charger install",
+            "about Tesla chargers",
+            "tesla wall connector fitted",
+            "Is Hive heating compatible",
+        ] {
+            assert!(DEMO.lookup(q, "").names.is_empty(), "{q}");
+        }
+        let b = DEMO.block("Is Octopus Energy ok", "");
+        assert!(!b.contains("No listing matches"), "{b}");
     }
 
     #[test]

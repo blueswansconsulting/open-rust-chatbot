@@ -1,0 +1,14 @@
+Word lists used by src/listings.rs to tell business names from everyday words.
+
+english-words.txt
+  Source: FreeBSD share/dict/web2 (Webster's Second International Dictionary, 1934).
+  The FreeBSD README for share/dict states: "The 1934 copyright has lapsed, according to the
+  supplier."
+  Changes: lower-case entries of 3 to 12 letters only, sorted bytewise, duplicates removed.
+
+first-names.txt
+  Source: FreeBSD share/dict/propernames, distributed as part of FreeBSD (no separate licence
+  is stated for this file; see https://www.freebsd.org/copyright/).
+  Changes: lower-cased, entries of 3 or more letters only, sorted bytewise, duplicates removed.
+
+Both lists are used only for membership checks and are never shown to visitors.
