@@ -36,11 +36,16 @@ fn previous_question<'a>(history: &'a [Message], current: &str) -> &'a str {
         .unwrap_or_default()
 }
 
+/// The model answered with nothing a visitor could see. Not an outage: a visitor's message
+/// can cause it.
+const NO_VISIBLE_TEXT: &str = "model returned no visible text";
+
 /// Errors that mean the model is unreachable: network/transport failures, timeouts, 5xx, 429
 /// and auth failures. Anything else (rejected input, tool loops, empty or filtered replies)
 /// could be caused by a visitor and must not mark the chat as down.
 pub fn is_availability_failure(detail: &str) -> bool {
-    const OUTAGE_MARKERS: [&str; 7] = [
+    const OUTAGE_MARKERS: [&str; 8] = [
+        "auth failed",
         "request failed",
         "stream read failed",
         "timed out",
@@ -1297,6 +1302,8 @@ impl ChatSession {
         self.offer.begin_turn(text);
         let max_history = self.shared.config.limits.max_history_messages;
         let links = self.link_policy(text);
+        // Whether the visitor has seen any text this turn, on any hop.
+        let mut shown_any = false;
         for hop in 0..=MAX_TOOL_HOPS {
             // What the visitor is shown: plain text with only allowed links, cleaned as it
             // streams (see `reply::ReplyFilter`).
@@ -1335,6 +1342,13 @@ impl ChatSession {
                 send(tx, json!({ "type": "token", "value": rest }));
             }
 
+            // Text, or a lead card the visitor will see.
+            shown_any |= !reply.trim().is_empty() || calls.iter().any(|c| c.name == "propose_lead");
+            if calls.is_empty() && !shown_any {
+                // Nothing to show (all reasoning, or the token budget spent on it): an error the
+                // visitor can see and the operator can find, not a blank success.
+                return Err(NO_VISIBLE_TEXT.into());
+            }
             if calls.is_empty() {
                 self.history.push(Message::new(Role::Assistant, reply));
                 self.history = trim_history(&self.history, max_history);
@@ -1411,6 +1425,9 @@ impl ChatSession {
             .chars()
             .filter(|&c| !crate::reply::is_invisible(c))
             .collect();
+        if raw.trim().is_empty() {
+            return Err(NO_VISIBLE_TEXT.into());
+        }
         let (reply, lead_args) = split_lead_line(&raw);
         let reply = crate::reply::clean_reply(&reply, &self.link_policy(text), true);
 
@@ -2115,10 +2132,12 @@ mod tests {
         ));
         assert!(is_availability_failure("timed out waiting for the model"));
         assert!(is_availability_failure("HTTP 401: invalid key"));
+        assert!(is_availability_failure("auth failed: HTTP 403: forbidden"));
         assert!(!is_availability_failure("bridge HTTP 403"));
         assert!(!is_availability_failure("HTTP 400: bad request"));
         assert!(!is_availability_failure("too many tool hops"));
         assert!(!is_availability_failure("bridge returned no text"));
+        assert!(!is_availability_failure(NO_VISIBLE_TEXT));
         assert!(!is_availability_failure("provider error: content filtered"));
     }
 

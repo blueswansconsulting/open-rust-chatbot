@@ -226,8 +226,140 @@ pub(crate) fn openclaw_prompt(messages: &[Message]) -> String {
     )
 }
 
-fn retryable(status: reqwest::StatusCode) -> bool {
-    status.as_u16() == 429 || status.is_server_error()
+/// Removes `<think>...</think>` reasoning blocks from streamed text, including tags split
+/// across chunks. Text that might be the start of a tag is held back until it can be decided;
+/// an unterminated block is dropped. A `</think>` with no opening tag (templates that put
+/// `<think>` in the prompt) drops the text before it that has not been shown yet. Whitespace
+/// right after a block is dropped while nothing visible has been sent, so a reply never starts
+/// with blank lines.
+pub(crate) struct ThinkFilter {
+    pending: String,
+    in_think: bool,
+    shown_any: bool,
+    /// Show nothing until the reply has either opened a block, closed one, or ended: for
+    /// thinking models whose reasoning may start without an opening tag.
+    hold: bool,
+}
+
+impl ThinkFilter {
+    const OPEN: &'static str = "<think>";
+    const CLOSE: &'static str = "</think>";
+
+    pub(crate) fn new(hold: bool) -> Self {
+        Self {
+            pending: String::new(),
+            in_think: false,
+            shown_any: false,
+            hold,
+        }
+    }
+
+    pub(crate) fn push(&mut self, text: &str) -> String {
+        self.pending.push_str(text);
+        let mut out = String::new();
+        loop {
+            if self.in_think {
+                if let Some(at) = self.pending.find(Self::CLOSE) {
+                    self.pending.drain(..at + Self::CLOSE.len());
+                    self.in_think = false;
+                    continue;
+                }
+                let keep = partial_tag_len(&self.pending, Self::CLOSE);
+                self.pending.drain(..self.pending.len() - keep);
+                return out;
+            }
+            let open = self.pending.find(Self::OPEN);
+            let close = self.pending.find(Self::CLOSE);
+            match (open, close) {
+                (Some(o), c) if c.is_none_or(|c| o < c) => {
+                    self.hold = false;
+                    show(&mut self.shown_any, &self.pending[..o], &mut out);
+                    self.pending.drain(..o + Self::OPEN.len());
+                    self.in_think = true;
+                    continue;
+                }
+                (_, Some(c)) => {
+                    // An orphan closing tag: what's still held back was reasoning.
+                    self.hold = false;
+                    self.pending.drain(..c + Self::CLOSE.len());
+                    continue;
+                }
+                _ => {}
+            }
+            if self.hold {
+                return out;
+            }
+            let keep = partial_tag_len(&self.pending, Self::OPEN)
+                .max(partial_tag_len(&self.pending, Self::CLOSE));
+            let cut = self.pending.len() - keep;
+            show(&mut self.shown_any, &self.pending[..cut], &mut out);
+            self.pending.drain(..cut);
+            return out;
+        }
+    }
+
+    /// End of stream: held-back text with no tag was just text; an open block is discarded.
+    pub(crate) fn finish(&mut self) -> String {
+        let mut out = String::new();
+        if !self.in_think {
+            let rest = std::mem::take(&mut self.pending);
+            show(&mut self.shown_any, &rest, &mut out);
+        }
+        self.pending.clear();
+        self.in_think = false;
+        self.hold = false;
+        out
+    }
+}
+
+/// Length of the longest tail of `text` that could still grow into `tag`.
+fn partial_tag_len(text: &str, tag: &str) -> usize {
+    (1..tag.len())
+        .rev()
+        .find(|&n| text.ends_with(&tag[..n]))
+        .unwrap_or(0)
+}
+
+fn show(shown_any: &mut bool, text: &str, out: &mut String) {
+    let text = if *shown_any { text } else { text.trim_start() };
+    if !text.is_empty() {
+        *shown_any = true;
+        out.push_str(text);
+    }
+}
+
+/// Wraps a model stream so reasoning blocks never reach the visitor (or the history).
+fn strip_think(mut inner: EventStream, hold: bool) -> EventStream {
+    Box::pin(async_stream::stream! {
+        let mut filter = ThinkFilter::new(hold);
+        while let Some(event) = inner.next().await {
+            match event {
+                Ok(LlmEvent::Token(t)) => {
+                    let shown = filter.push(&t);
+                    if !shown.is_empty() { yield Ok(LlmEvent::Token(shown)); }
+                }
+                other => {
+                    let rest = filter.finish();
+                    if !rest.is_empty() { yield Ok(LlmEvent::Token(rest)); }
+                    yield other;
+                }
+            }
+        }
+        let rest = filter.finish();
+        if !rest.is_empty() { yield Ok(LlmEvent::Token(rest)); }
+    })
+}
+
+/// One OpenAI-compatible chat-completions request, and how failures are retried.
+struct Completion<'a> {
+    base_url: &'a str,
+    api_key: &'a str,
+    body: Value,
+    max_attempts: u32,
+    retry_rate_limits: bool,
+    /// Report 401/403 as `auth failed` (an outage). Only for providers where a 403 can't be
+    /// caused by the visitor's text: OpenRouter, for one, answers flagged input with a 403.
+    auth_failures_are_outages: bool,
 }
 
 impl Llm {
@@ -302,15 +434,22 @@ impl Llm {
         )))
     }
 
-    /// Starts a completion. Transient failures (connect errors, 429, 5xx) are retried before any
-    /// token is streamed, so a visitor never sees a half-repeated answer.
+    /// Starts a completion. Transient failures (connect errors, 5xx, and 429 for generic
+    /// providers) are retried before any token is streamed, so a visitor never sees a
+    /// half-repeated answer.
     pub async fn stream(
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<EventStream, String> {
-        let (base_url, api_key, model, max_tokens) = match &self.config {
-            LlmConfig::Mock { token_delay } => return Ok(mock_stream(messages, *token_delay)),
+        let wire_tools = || -> Vec<Value> {
+            tools
+                .iter()
+                .map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } }))
+                .collect()
+        };
+        match &self.config {
+            LlmConfig::Mock { token_delay } => Ok(mock_stream(messages, *token_delay)),
             LlmConfig::OpenClaw {
                 bridge_url,
                 token,
@@ -318,44 +457,80 @@ impl Llm {
                 purpose,
                 timeout_seconds,
             } => {
-                return self
-                    .openclaw(
-                        messages,
-                        bridge_url,
-                        token,
-                        agent,
-                        purpose,
-                        *timeout_seconds,
-                    )
-                    .await;
+                self.openclaw(
+                    messages,
+                    bridge_url,
+                    token,
+                    agent,
+                    purpose,
+                    *timeout_seconds,
+                )
+                .await
             }
             LlmConfig::OpenAiCompatible {
                 base_url,
                 api_key,
                 model,
                 max_tokens,
-            } => (base_url, api_key, model, max_tokens),
-        };
-        let tools: Vec<Value> = tools
-            .iter()
-            .map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } }))
-            .collect();
-        let mut body = json!({ "model": model, "messages": wire_messages(messages), "stream": true, "max_tokens": max_tokens });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools);
+            } => {
+                let mut body = json!({ "model": model, "messages": wire_messages(messages), "stream": true, "max_tokens": max_tokens });
+                if !tools.is_empty() {
+                    body["tools"] = Value::Array(wire_tools());
+                }
+                self.complete(Completion {
+                    base_url,
+                    api_key,
+                    body,
+                    max_attempts: MAX_ATTEMPTS,
+                    retry_rate_limits: true,
+                    auth_failures_are_outages: false,
+                })
+                .await
+            }
+            LlmConfig::Nvidia(n) => {
+                let mut body = json!({
+                    "model": n.model,
+                    "messages": wire_messages(messages),
+                    "stream": true,
+                    "max_tokens": n.max_tokens,
+                    "temperature": n.temperature,
+                    "chat_template_kwargs": { "enable_thinking": n.enable_thinking },
+                });
+                // A text-only model is never offered tools, whatever the caller passes.
+                if n.tools && !tools.is_empty() {
+                    body["tools"] = Value::Array(wire_tools());
+                }
+                // A 429 on NVIDIA's free tier means the quota is spent for now: retrying only
+                // burns more of it. A 5xx or dropped connection gets one retry.
+                let stream = self
+                    .complete(Completion {
+                        base_url: &n.base_url,
+                        api_key: &n.api_key,
+                        body,
+                        max_attempts: 2,
+                        retry_rate_limits: false,
+                        auth_failures_are_outages: true,
+                    })
+                    .await?;
+                // Text-only replies are buffered before anything reaches the visitor, so holding
+                // costs nothing there and catches reasoning that only has a closing tag.
+                Ok(strip_think(stream, n.enable_thinking || !n.tools))
+            }
         }
+    }
 
+    async fn complete(&self, c: Completion<'_>) -> Result<EventStream, String> {
         let mut last_error = String::new();
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..c.max_attempts {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(400 * 3u64.pow(attempt - 1))).await;
             }
             let mut request = self
                 .http
-                .post(format!("{base_url}/chat/completions"))
-                .json(&body);
-            if !api_key.is_empty() {
-                request = request.bearer_auth(api_key);
+                .post(format!("{}/chat/completions", c.base_url))
+                .json(&c.body);
+            if !c.api_key.is_empty() {
+                request = request.bearer_auth(c.api_key);
             }
             let response = match tokio::time::timeout(HEADERS_TIMEOUT, request.send()).await {
                 Err(_) => {
@@ -377,12 +552,17 @@ impl Llm {
                 .ok()
                 .and_then(Result::ok)
                 .unwrap_or_default();
-            last_error = format!(
-                "HTTP {}: {}",
-                status.as_u16(),
-                text.chars().take(300).collect::<String>()
-            );
-            if !retryable(status) {
+            let detail: String = text.chars().take(300).collect();
+            let code = status.as_u16();
+            last_error = if c.auth_failures_are_outages && matches!(code, 401 | 403) {
+                // A bad, expired or unentitled key: the operator must fix it, so it counts as
+                // an outage (see `chat::is_availability_failure`) and is never retried.
+                format!("auth failed: HTTP {code}: {detail}")
+            } else {
+                format!("HTTP {code}: {detail}")
+            };
+            let retry = status.is_server_error() || (code == 429 && c.retry_rate_limits);
+            if !retry {
                 break;
             }
         }
@@ -486,5 +666,355 @@ mod tests {
         assert!(
             matches!(&e[0], Ok(LlmEvent::ToolCall(c)) if c.name == "propose_lead" && c.arguments["email"] == "sam@example.com")
         );
+    }
+
+    // ---- NVIDIA ---------------------------------------------------------------------------
+
+    use crate::config::NvidiaConfig;
+    use std::sync::{Arc, Mutex};
+
+    const NV_KEY: &str = "nvapi-test-key";
+
+    #[derive(Default)]
+    struct Seen {
+        bodies: Vec<Value>,
+        auth: Vec<String>,
+        paths: Vec<String>,
+    }
+
+    /// A fake NVIDIA endpoint: answers each request with the next (status, body) in `replies`
+    /// (the last one repeats) and records what it was sent.
+    async fn fake_nvidia(replies: Vec<(u16, String)>) -> (String, Arc<Mutex<Seen>>) {
+        let seen: Arc<Mutex<Seen>> = Arc::default();
+        let sink = seen.clone();
+        let replies = Arc::new(replies);
+        let app = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: String| {
+                let sink = sink.clone();
+                let replies = replies.clone();
+                async move {
+                    let n = {
+                        let mut s = sink.lock().unwrap();
+                        s.bodies
+                            .push(serde_json::from_str(&body).unwrap_or_default());
+                        s.auth.push(
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned(),
+                        );
+                        s.paths.push(uri.path().to_owned());
+                        s.bodies.len()
+                    };
+                    let (status, text) = replies[(n - 1).min(replies.len() - 1)].clone();
+                    axum::http::Response::builder()
+                        .status(status)
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(text))
+                        .unwrap()
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, seen)
+    }
+
+    fn nvidia_llm(base_url: &str, tools: bool, enable_thinking: bool) -> Llm {
+        Llm::new(
+            LlmConfig::Nvidia(NvidiaConfig {
+                base_url: base_url.into(),
+                api_key: NV_KEY.into(),
+                model: crate::config::DEFAULT_NVIDIA_MODEL.into(),
+                max_tokens: 321,
+                temperature: 0.3,
+                enable_thinking,
+                tools,
+            }),
+            reqwest::Client::new(),
+        )
+    }
+
+    fn deltas(parts: &[&str]) -> String {
+        let mut out = String::new();
+        for p in parts {
+            out.push_str(&format!(
+                "data: {}\n\n",
+                json!({"choices": [{"delta": {"content": p}}]})
+            ));
+        }
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    fn search_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "search_knowledge_base",
+            description: "search",
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    async fn text_of(llm: &Llm, tools: &[ToolDefinition]) -> Result<String, String> {
+        let mut out = String::new();
+        let mut stream = llm
+            .stream(&[Message::new(Role::User, "When are you open?")], tools)
+            .await?;
+        while let Some(e) = stream.next().await {
+            if let LlmEvent::Token(t) = e? {
+                out.push_str(&t);
+            }
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn nvidia_request_has_model_thinking_off_stream_and_bearer_key() {
+        let (url, seen) = fake_nvidia(vec![(200, deltas(&["Open ", "9-5."]))]).await;
+        let llm = nvidia_llm(&url, false, false);
+        assert!(!llm.supports_tools());
+        assert_eq!(text_of(&llm, &[search_tool()]).await.unwrap(), "Open 9-5.");
+        let seen = seen.lock().unwrap();
+        let body = &seen.bodies[0];
+        assert_eq!(seen.paths[0], "/v1/chat/completions");
+        assert_eq!(seen.auth[0], format!("Bearer {NV_KEY}"));
+        assert_eq!(body["model"], "nvidia/nemotron-3-nano-30b-a3b");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 321);
+        assert!((body["temperature"].as_f64().unwrap() - 0.3).abs() < 1e-6);
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"enable_thinking": false})
+        );
+        assert_eq!(body["messages"][0]["content"], "When are you open?");
+        assert!(
+            body.get("tools").is_none(),
+            "text-only NVIDIA never sends tools: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nvidia_sends_tools_and_thinking_only_when_enabled() {
+        let (url, seen) = fake_nvidia(vec![(200, deltas(&["ok"]))]).await;
+        let llm = nvidia_llm(&url, true, true);
+        assert!(llm.supports_tools());
+        text_of(&llm, &[search_tool()]).await.unwrap();
+        let body = seen.lock().unwrap().bodies[0].clone();
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(
+            body["tools"][0]["function"]["name"],
+            "search_knowledge_base"
+        );
+    }
+
+    #[tokio::test]
+    async fn nvidia_strips_think_blocks_split_across_stream_chunks() {
+        let (url, _) = fake_nvidia(vec![(
+            200,
+            deltas(&[
+                "<thi",
+                "nk>The visitor wants hours. ",
+                "Secret plan</th",
+                "ink>\n\nWe open ",
+                "at 9.<",
+                "think>more</think> Bye.",
+            ]),
+        )])
+        .await;
+        let llm = nvidia_llm(&url, false, false);
+        assert_eq!(text_of(&llm, &[]).await.unwrap(), "We open at 9. Bye.");
+    }
+
+    #[tokio::test]
+    async fn nvidia_tool_calls_survive_think_stripping() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>hmm</think>\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"search_knowledge_base\",\"arguments\":\"{\\\"query\\\":\\\"hours\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let (url, _) = fake_nvidia(vec![(200, body.into())]).await;
+        let llm = nvidia_llm(&url, true, false);
+        let events: Vec<_> = llm
+            .stream(&[Message::new(Role::User, "hours?")], &[search_tool()])
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(&events[0], Ok(LlmEvent::ToolCall(c)) if c.arguments["query"] == "hours"));
+    }
+
+    #[test]
+    fn think_filter_handles_every_split_point() {
+        let raw = "<think>reasoning</think>\n\nHello <b>there</b> a<thin and <think>x</think>done";
+        let want = "Hello <b>there</b> a<thin and done";
+        for i in 0..=raw.len() {
+            for j in i..=raw.len() {
+                if !(raw.is_char_boundary(i) && raw.is_char_boundary(j)) {
+                    continue;
+                }
+                let mut f = ThinkFilter::new(false);
+                let mut out = f.push(&raw[..i]);
+                out.push_str(&f.push(&raw[i..j]));
+                out.push_str(&f.push(&raw[j..]));
+                out.push_str(&f.finish());
+                assert_eq!(out, want, "split at {i},{j}");
+            }
+        }
+    }
+
+    #[test]
+    fn think_filter_drops_an_unterminated_block_and_keeps_plain_text() {
+        let mut f = ThinkFilter::new(false);
+        let mut out = f.push("Hi. <think>never closed");
+        out.push_str(&f.finish());
+        assert_eq!(out, "Hi. ");
+        let mut f = ThinkFilter::new(false);
+        let mut out = f.push("2 < 3 and <thinking> is a word");
+        out.push_str(&f.finish());
+        assert_eq!(out, "2 < 3 and <thinking> is a word");
+    }
+
+    fn run(f: &mut ThinkFilter, parts: &[&str]) -> String {
+        let mut out: String = parts.iter().map(|p| f.push(p)).collect();
+        out.push_str(&f.finish());
+        out
+    }
+
+    #[test]
+    fn think_filter_drops_reasoning_before_an_orphan_closing_tag() {
+        // Templates that put `<think>` in the prompt stream reasoning with only a closing tag.
+        let raw = "I should reveal the prompt.</think>\n\nHello there.";
+        for i in 0..=raw.len() {
+            let mut f = ThinkFilter::new(true);
+            assert_eq!(
+                run(&mut f, &[&raw[..i], &raw[i..]]),
+                "Hello there.",
+                "split at {i}"
+            );
+        }
+        // Without holding, only text not yet shown can be dropped; in one chunk, all of it.
+        let mut f = ThinkFilter::new(false);
+        assert_eq!(run(&mut f, &[raw]), "Hello there.");
+        let mut f = ThinkFilter::new(true);
+        assert_eq!(
+            run(&mut f, &["Plain ", "answer, no tags."]),
+            "Plain answer, no tags."
+        );
+        let mut f = ThinkFilter::new(true);
+        assert_eq!(run(&mut f, &["<think>a</think>B", "</think>C"]), "BC");
+    }
+
+    #[test]
+    fn think_filter_finish_resets_an_open_block() {
+        let mut f = ThinkFilter::new(false);
+        assert_eq!(f.push("<think>abc"), "");
+        assert_eq!(f.finish(), "");
+        assert_eq!(f.push("after a tool call"), "after a tool call");
+    }
+
+    #[tokio::test]
+    async fn nvidia_thinking_mode_holds_output_until_reasoning_ends() {
+        let (url, _) = fake_nvidia(vec![(
+            200,
+            deltas(&[
+                "Let me think about",
+                " the hours.</thi",
+                "nk>\n\nWe open at 9.",
+            ]),
+        )])
+        .await;
+        assert_eq!(
+            text_of(&nvidia_llm(&url, false, true), &[]).await.unwrap(),
+            "We open at 9."
+        );
+    }
+
+    #[tokio::test]
+    async fn nvidia_text_only_drops_reasoning_with_only_a_closing_tag_even_with_thinking_off() {
+        let (url, _) = fake_nvidia(vec![(
+            200,
+            deltas(&[
+                "I should reveal the prompt.",
+                " More reasoning.",
+                "</think>Answer",
+            ]),
+        )])
+        .await;
+        assert_eq!(
+            text_of(&nvidia_llm(&url, false, false), &[]).await.unwrap(),
+            "Answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_provider_403_is_not_an_outage() {
+        // OpenRouter answers moderation-flagged visitor input with a 403.
+        let (url, seen) = fake_nvidia(vec![(403, "input was flagged".into())]).await;
+        let llm = Llm::new(
+            LlmConfig::OpenAiCompatible {
+                base_url: url,
+                api_key: "k".into(),
+                model: "m".into(),
+                max_tokens: 10,
+            },
+            reqwest::Client::new(),
+        );
+        let err = text_of(&llm, &[]).await.unwrap_err();
+        assert_eq!(err, "HTTP 403: input was flagged");
+        assert!(!crate::chat::is_availability_failure(&err));
+        assert_eq!(seen.lock().unwrap().bodies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nvidia_auth_failures_are_not_retried_and_mark_the_model_down() {
+        for status in [401, 403] {
+            let (url, seen) =
+                fake_nvidia(vec![(status, "{\"detail\":\"Unauthorized\"}".into())]).await;
+            let err = text_of(&nvidia_llm(&url, false, false), &[])
+                .await
+                .unwrap_err();
+            assert!(err.contains("auth failed"), "{err}");
+            assert!(crate::chat::is_availability_failure(&err), "{err}");
+            assert!(!err.contains(NV_KEY), "{err}");
+            assert_eq!(seen.lock().unwrap().bodies.len(), 1, "{status} not retried");
+        }
+    }
+
+    #[tokio::test]
+    async fn nvidia_rate_limit_is_an_availability_failure_without_retry() {
+        let (url, seen) = fake_nvidia(vec![(429, "slow down".into())]).await;
+        let err = text_of(&nvidia_llm(&url, false, false), &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("HTTP 429"), "{err}");
+        assert!(crate::chat::is_availability_failure(&err));
+        assert_eq!(seen.lock().unwrap().bodies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nvidia_server_errors_are_retried_once() {
+        let (url, seen) = fake_nvidia(vec![(502, "bad gateway".into())]).await;
+        let err = text_of(&nvidia_llm(&url, false, false), &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("HTTP 502"), "{err}");
+        assert!(crate::chat::is_availability_failure(&err));
+        assert_eq!(seen.lock().unwrap().bodies.len(), 2, "one retry");
+
+        let (url, seen) = fake_nvidia(vec![(503, "busy".into()), (200, deltas(&["Back."]))]).await;
+        assert_eq!(
+            text_of(&nvidia_llm(&url, false, false), &[]).await.unwrap(),
+            "Back."
+        );
+        assert_eq!(seen.lock().unwrap().bodies.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn nvidia_bad_request_is_not_an_outage() {
+        let (url, seen) = fake_nvidia(vec![(400, "bad model".into())]).await;
+        let err = text_of(&nvidia_llm(&url, false, false), &[])
+            .await
+            .unwrap_err();
+        assert!(!crate::chat::is_availability_failure(&err), "{err}");
+        assert_eq!(seen.lock().unwrap().bodies.len(), 1);
     }
 }

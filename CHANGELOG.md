@@ -6,6 +6,14 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ### Added
 - Rust (axum) server with a single embedded, dependency-free JavaScript widget.
+- NVIDIA provider (`LLM_PROVIDER=nvidia`, `NVIDIA_API_KEY`): build.nvidia.com / NIM, default model
+  `nvidia/nemotron-3-nano-30b-a3b`, thinking off, `<think>` blocks stripped from streamed replies,
+  text only unless `NVIDIA_TOOLS=true`; 401/403 are logged as `auth failed` and count as an
+  outage, 5xx is retried once, 429 is not.
+- A model reply with no visible text (for example only reasoning) is now an error the visitor sees,
+  not a blank answer; it does not count as an outage.
+- An unknown `LLM_PROVIDER` is now a startup error (previously it silently meant OpenAI-compatible).
+  LLM API keys and bridge tokens are redacted from debug output.
 - OpenAI-compatible streaming with tool calling, retries and timeouts; OpenClaw bridge provider.
 - Markdown knowledge base search tool.
 - Lead capture with visitor confirmation and HMAC-signed webhooks.
