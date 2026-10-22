@@ -27,10 +27,11 @@ history, even when the tags are split across stream chunks. An unterminated `<th
 dropped. Reasoning sent in a separate `reasoning_content` field is ignored.
 
 Some chat templates put the opening `<think>` in the prompt, so the reply starts with reasoning and
-only a closing `</think>`. With `NVIDIA_ENABLE_THINKING=true` the server holds the reply back until
-it either opens or closes a reasoning block (or ends), and drops everything before an unmatched
-`</think>`, so visitors see the answer in one go rather than streamed. With thinking off, text
-before an unmatched `</think>` is dropped only if it has not been streamed yet.
+only a closing `</think>`. In text-only mode (the default) and whenever
+`NVIDIA_ENABLE_THINKING=true`, the server holds the reply back until it either opens or closes a
+reasoning block (or ends), and drops everything before an unmatched `</think>`. Text-only replies
+are never streamed to visitors anyway. With `NVIDIA_TOOLS=true` and thinking off, replies stream as
+they arrive, and text before an unmatched `</think>` is dropped only if it has not been sent yet.
 
 If a reply has no visible text left (only reasoning, or the token budget was spent on it), the
 visitor gets the generic error and `turn_failed` is logged with `model returned no visible text`.

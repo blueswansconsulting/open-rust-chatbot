@@ -1009,3 +1009,43 @@ async fn nvidia_reply_that_is_only_reasoning_is_an_error_not_a_blank_answer() {
         .as_u16();
     assert_eq!(status, 200, "an empty reply is not an outage");
 }
+
+#[tokio::test]
+async fn tool_model_blank_final_hop_after_shown_text_is_still_a_normal_reply() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let api = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = counter.clone();
+            async move {
+                let body = match counter.fetch_add(1, Ordering::SeqCst) {
+                    // Turn 1, hop 0: text plus a search; hop 1: nothing more to say.
+                    0 => "data: {\"choices\":[{\"delta\":{\"content\":\"Let me check.\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"search_knowledge_base\",\"arguments\":\"{\\\"query\\\":\\\"hours\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n",
+                    // Every later request: a blank answer.
+                    _ => "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\ndata: [DONE]\n\n",
+                };
+                axum::http::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    let addr = serve(&[("MOCK_LLM", "false"), ("LLM_BASE_URL", &url)]).await;
+    let mut ws = connect(&addr, ORIGIN).await.unwrap();
+    ws.send(Message::Text("When are you open?".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut ws).await;
+    assert_eq!(frames.last().unwrap()["type"], "done", "{frames:?}");
+    assert!(text_of(&frames).starts_with("Let me check."));
+    // A turn where the model says nothing at all is an error, not a blank bubble.
+    ws.send(Message::Text("Thanks".into())).await.unwrap();
+    let frames = until_done(&mut ws).await;
+    assert_eq!(frames.last().unwrap()["type"], "error", "{frames:?}");
+}

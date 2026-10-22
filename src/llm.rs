@@ -512,7 +512,9 @@ impl Llm {
                         auth_failures_are_outages: true,
                     })
                     .await?;
-                Ok(strip_think(stream, n.enable_thinking))
+                // Text-only replies are buffered before anything reaches the visitor, so holding
+                // costs nothing there and catches reasoning that only has a closing tag.
+                Ok(strip_think(stream, n.enable_thinking || !n.tools))
             }
         }
     }
@@ -881,19 +883,17 @@ mod tests {
     fn think_filter_drops_reasoning_before_an_orphan_closing_tag() {
         // Templates that put `<think>` in the prompt stream reasoning with only a closing tag.
         let raw = "I should reveal the prompt.</think>\n\nHello there.";
-        for hold in [true, false] {
-            for i in 0..=raw.len() {
-                let mut f = ThinkFilter::new(true);
-                assert_eq!(
-                    run(&mut f, &[&raw[..i], &raw[i..]]),
-                    "Hello there.",
-                    "split at {i}"
-                );
-            }
-            // Without holding, only text not yet shown can be dropped; in one chunk, all of it.
-            let mut f = ThinkFilter::new(hold);
-            assert_eq!(run(&mut f, &[raw]), "Hello there.");
+        for i in 0..=raw.len() {
+            let mut f = ThinkFilter::new(true);
+            assert_eq!(
+                run(&mut f, &[&raw[..i], &raw[i..]]),
+                "Hello there.",
+                "split at {i}"
+            );
         }
+        // Without holding, only text not yet shown can be dropped; in one chunk, all of it.
+        let mut f = ThinkFilter::new(false);
+        assert_eq!(run(&mut f, &[raw]), "Hello there.");
         let mut f = ThinkFilter::new(true);
         assert_eq!(
             run(&mut f, &["Plain ", "answer, no tags."]),
@@ -925,6 +925,23 @@ mod tests {
         assert_eq!(
             text_of(&nvidia_llm(&url, false, true), &[]).await.unwrap(),
             "We open at 9."
+        );
+    }
+
+    #[tokio::test]
+    async fn nvidia_text_only_drops_reasoning_with_only_a_closing_tag_even_with_thinking_off() {
+        let (url, _) = fake_nvidia(vec![(
+            200,
+            deltas(&[
+                "I should reveal the prompt.",
+                " More reasoning.",
+                "</think>Answer",
+            ]),
+        )])
+        .await;
+        assert_eq!(
+            text_of(&nvidia_llm(&url, false, false), &[]).await.unwrap(),
+            "Answer"
         );
     }
 

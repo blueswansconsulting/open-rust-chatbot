@@ -1302,6 +1302,8 @@ impl ChatSession {
         self.offer.begin_turn(text);
         let max_history = self.shared.config.limits.max_history_messages;
         let links = self.link_policy(text);
+        // Whether the visitor has seen any text this turn, on any hop.
+        let mut shown_any = false;
         for hop in 0..=MAX_TOOL_HOPS {
             // What the visitor is shown: plain text with only allowed links, cleaned as it
             // streams (see `reply::ReplyFilter`).
@@ -1340,7 +1342,9 @@ impl ChatSession {
                 send(tx, json!({ "type": "token", "value": rest }));
             }
 
-            if calls.is_empty() && reply.trim().is_empty() {
+            // Text, or a lead card the visitor will see.
+            shown_any |= !reply.trim().is_empty() || calls.iter().any(|c| c.name == "propose_lead");
+            if calls.is_empty() && !shown_any {
                 // Nothing to show (all reasoning, or the token budget spent on it): an error the
                 // visitor can see and the operator can find, not a blank success.
                 return Err(NO_VISIBLE_TEXT.into());
