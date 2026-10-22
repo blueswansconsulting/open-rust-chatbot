@@ -878,3 +878,97 @@ async fn single_site_config_answers_with_no_server_texts() {
     let v: Value = res.json().await.unwrap();
     assert!(v["title"].is_null() && v["greeting"].is_null(), "{v}");
 }
+
+/// A fake build.nvidia.com endpoint that records request bodies and answers with `reply`.
+async fn fake_nvidia(status: u16, reply: &'static str) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let sink = bodies.clone();
+    let api = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(body);
+                axum::http::Response::builder()
+                    .status(status)
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(reply))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+    (url, bodies)
+}
+
+#[tokio::test]
+async fn nvidia_text_only_gets_kb_context_and_visitors_never_see_reasoning() {
+    let (url, bodies) = fake_nvidia(
+        200,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"<thi\"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"content\":\"nk>Visitor asks hours; KB says 8am.</th\"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"content\":\"ink>\\n\\nWe're open 8am to 6pm.\"}}]}\n\n\
+         data: [DONE]\n\n",
+    )
+    .await;
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "nvidia"),
+        ("NVIDIA_API_KEY", "nvapi-e2e"),
+        ("NVIDIA_BASE_URL", &url),
+    ])
+    .await;
+    let mut ws = connect(&addr, ORIGIN).await.unwrap();
+    ws.send(Message::Text("What are your opening hours?".into()))
+        .await
+        .unwrap();
+    let frames = until_done(&mut ws).await;
+    assert_eq!(text_of(&frames), "We're open 8am to 6pm.", "{frames:?}");
+    assert!(frames.iter().all(|f| f["type"] != "tool_start"));
+    let body = bodies.lock().unwrap()[0].clone();
+    assert_eq!(body["model"], "nvidia/nemotron-3-nano-30b-a3b");
+    assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    assert!(body.get("tools").is_none(), "{body}");
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("Knowledge-base excerpts"), "{system}");
+
+    // The next turn's history holds only what the visitor saw, never the reasoning.
+    ws.send(Message::Text("Thanks!".into())).await.unwrap();
+    until_done(&mut ws).await;
+    let history = bodies.lock().unwrap()[1]["messages"].to_string();
+    assert!(!history.contains("KB says"), "{history}");
+}
+
+#[tokio::test]
+async fn nvidia_bad_key_marks_the_chat_down_for_every_visitor() {
+    let (url, bodies) = fake_nvidia(401, "{\"status\":401,\"title\":\"Unauthorized\"}").await;
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "nvidia"),
+        ("NVIDIA_API_KEY", "nvapi-revoked"),
+        ("NVIDIA_BASE_URL", &url),
+        ("TRUST_PROXY_HEADERS", "true"),
+    ])
+    .await;
+    for ip in ["198.51.100.1", "198.51.100.2"] {
+        let mut ws = connect_from(&addr, ORIGIN, ip).await.unwrap();
+        for _ in 0..2 {
+            ws.send(Message::Text("hello".into())).await.unwrap();
+            let frames = until_done(&mut ws).await;
+            assert_eq!(frames.last().unwrap()["type"], "error");
+            assert!(!frames.iter().any(|f| f.to_string().contains("nvapi")));
+        }
+    }
+    assert_eq!(bodies.lock().unwrap().len(), 4, "401 is never retried");
+    let status = reqwest::get(format!("http://{addr}/availability"))
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(
+        status, 503,
+        "an auth failure is an outage, not visitor noise"
+    );
+}

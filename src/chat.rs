@@ -40,7 +40,8 @@ fn previous_question<'a>(history: &'a [Message], current: &str) -> &'a str {
 /// and auth failures. Anything else (rejected input, tool loops, empty or filtered replies)
 /// could be caused by a visitor and must not mark the chat as down.
 pub fn is_availability_failure(detail: &str) -> bool {
-    const OUTAGE_MARKERS: [&str; 7] = [
+    const OUTAGE_MARKERS: [&str; 8] = [
+        "auth failed",
         "request failed",
         "stream read failed",
         "timed out",
@@ -2115,6 +2116,7 @@ mod tests {
         ));
         assert!(is_availability_failure("timed out waiting for the model"));
         assert!(is_availability_failure("HTTP 401: invalid key"));
+        assert!(is_availability_failure("auth failed: HTTP 403: forbidden"));
         assert!(!is_availability_failure("bridge HTTP 403"));
         assert!(!is_availability_failure("HTTP 400: bad request"));
         assert!(!is_availability_failure("too many tool hops"));

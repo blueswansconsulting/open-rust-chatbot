@@ -72,7 +72,7 @@ impl std::fmt::Debug for SitesConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum LlmConfig {
     Mock {
         token_delay: Duration,
@@ -91,12 +91,89 @@ pub enum LlmConfig {
         purpose: String,
         timeout_seconds: u64,
     },
+    /// NVIDIA's hosted NIM API (build.nvidia.com), OpenAI-compatible with a few extras.
+    Nvidia(NvidiaConfig),
 }
+
+/// `LLM_PROVIDER=nvidia`: see `.env.example` for the variables.
+#[derive(Clone)]
+pub struct NvidiaConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub temperature: f32,
+    /// Sent as `chat_template_kwargs.enable_thinking`. Off by default: reasoning text is
+    /// slower, costs tokens and must never reach a visitor.
+    pub enable_thinking: bool,
+    /// Whether the model is trusted with OpenAI tool calls (`NVIDIA_TOOLS=true`).
+    pub tools: bool,
+}
+
+pub const DEFAULT_NVIDIA_MODEL: &str = "nvidia/nemotron-3-nano-30b-a3b";
+pub const DEFAULT_NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 
 impl LlmConfig {
     /// Text-only providers get knowledge-base context injected and server-side lead detection.
     pub fn supports_tools(&self) -> bool {
-        !matches!(self, LlmConfig::OpenClaw { .. })
+        match self {
+            LlmConfig::OpenClaw { .. } => false,
+            LlmConfig::Nvidia(n) => n.tools,
+            LlmConfig::Mock { .. } | LlmConfig::OpenAiCompatible { .. } => true,
+        }
+    }
+}
+
+/// Keys and tokens are never printed, so a stray `{:?}` can't leak them into logs.
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LlmConfig::Mock { token_delay } => f
+                .debug_struct("Mock")
+                .field("token_delay", token_delay)
+                .finish(),
+            LlmConfig::OpenAiCompatible {
+                base_url,
+                model,
+                max_tokens,
+                ..
+            } => f
+                .debug_struct("OpenAiCompatible")
+                .field("base_url", base_url)
+                .field("api_key", &"<redacted>")
+                .field("model", model)
+                .field("max_tokens", max_tokens)
+                .finish(),
+            LlmConfig::OpenClaw {
+                bridge_url,
+                agent,
+                purpose,
+                timeout_seconds,
+                ..
+            } => f
+                .debug_struct("OpenClaw")
+                .field("bridge_url", bridge_url)
+                .field("token", &"<redacted>")
+                .field("agent", agent)
+                .field("purpose", purpose)
+                .field("timeout_seconds", timeout_seconds)
+                .finish(),
+            LlmConfig::Nvidia(n) => n.fmt(f),
+        }
+    }
+}
+
+impl std::fmt::Debug for NvidiaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Nvidia")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("enable_thinking", &self.enable_thinking)
+            .field("tools", &self.tools)
+            .finish()
     }
 }
 
@@ -148,6 +225,19 @@ impl Env<'_> {
 
     fn flag(&self, key: &str) -> bool {
         matches!(self.get(key).as_deref(), Some("true" | "1" | "yes"))
+    }
+
+    /// A strict boolean: unset is `default`, anything but true/false/1/0/yes/no is an error.
+    fn bool(&self, key: &str, default: bool, errors: &mut Vec<String>) -> bool {
+        match self.get(key).map(|v| v.to_ascii_lowercase()).as_deref() {
+            None => default,
+            Some("true" | "1" | "yes") => true,
+            Some("false" | "0" | "no") => false,
+            Some(v) => {
+                errors.push(format!("{key} must be true or false (got {v:?})"));
+                default
+            }
+        }
     }
 
     fn num<T: std::str::FromStr>(&self, key: &str, default: T, errors: &mut Vec<String>) -> T {
@@ -281,37 +371,21 @@ impl Config {
             LlmConfig::Mock {
                 token_delay: Duration::from_millis(env.num("MOCK_TOKEN_DELAY_MS", 20, &mut errors)),
             }
-        } else if env.get("LLM_PROVIDER").as_deref() == Some("openclaw") {
-            let bridge_url = env.get("OPENCLAW_BRIDGE_URL").unwrap_or_default();
-            let token = env.get("OPENCLAW_BRIDGE_TOKEN").unwrap_or_default();
-            if bridge_url.is_empty() || token.is_empty() {
-                errors.push("OPENCLAW_BRIDGE_URL and OPENCLAW_BRIDGE_TOKEN are required when LLM_PROVIDER=openclaw".into());
-            }
-            LlmConfig::OpenClaw {
-                bridge_url,
-                token,
-                agent: env.get("OPENCLAW_AGENT").unwrap_or_else(|| "main".into()),
-                purpose: env
-                    .get("OPENCLAW_PURPOSE")
-                    .unwrap_or_else(|| "website_chat".into()),
-                timeout_seconds: env.num("OPENCLAW_TIMEOUT_SECONDS", 90, &mut errors),
-            }
         } else {
-            let api_key = env.get("LLM_API_KEY").unwrap_or_default();
-            let base_url = env
-                .get("LLM_BASE_URL")
-                .unwrap_or_else(|| "https://api.openai.com/v1".into());
-            // Local servers such as Ollama do not need a key.
-            if api_key.is_empty() && base_url.starts_with("https://") {
-                errors.push(
-                    "LLM_API_KEY is required (or set MOCK_LLM=true with DEV_MODE=true)".into(),
-                );
-            }
-            LlmConfig::OpenAiCompatible {
-                base_url: base_url.trim_end_matches('/').to_owned(),
-                api_key,
-                model: env.get("LLM_MODEL").unwrap_or_else(|| "gpt-4o-mini".into()),
-                max_tokens: env.num("LLM_MAX_TOKENS", 400, &mut errors),
+            let provider = env
+                .get("LLM_PROVIDER")
+                .map(|p| p.to_ascii_lowercase())
+                .unwrap_or_else(|| "openai".into());
+            match provider.as_str() {
+                "openclaw" => openclaw_config(&env, &mut errors),
+                "nvidia" => LlmConfig::Nvidia(nvidia_config(&env, &mut errors)),
+                "openai" | "openai-compatible" => openai_config(&env, &mut errors),
+                other => {
+                    errors.push(format!(
+                        "LLM_PROVIDER {other:?} is not supported (use openai, nvidia or openclaw)"
+                    ));
+                    openai_config(&env, &mut errors)
+                }
             }
         };
 
@@ -409,6 +483,97 @@ impl Config {
             Err(ConfigError(errors))
         }
     }
+}
+
+fn openclaw_config(env: &Env, errors: &mut Vec<String>) -> LlmConfig {
+    let bridge_url = env.get("OPENCLAW_BRIDGE_URL").unwrap_or_default();
+    let token = env.get("OPENCLAW_BRIDGE_TOKEN").unwrap_or_default();
+    if bridge_url.is_empty() || token.is_empty() {
+        errors.push(
+            "OPENCLAW_BRIDGE_URL and OPENCLAW_BRIDGE_TOKEN are required when LLM_PROVIDER=openclaw"
+                .into(),
+        );
+    }
+    LlmConfig::OpenClaw {
+        bridge_url,
+        token,
+        agent: env.get("OPENCLAW_AGENT").unwrap_or_else(|| "main".into()),
+        purpose: env
+            .get("OPENCLAW_PURPOSE")
+            .unwrap_or_else(|| "website_chat".into()),
+        timeout_seconds: env.num("OPENCLAW_TIMEOUT_SECONDS", 90, errors),
+    }
+}
+
+fn openai_config(env: &Env, errors: &mut Vec<String>) -> LlmConfig {
+    let api_key = env.get("LLM_API_KEY").unwrap_or_default();
+    let base_url = env
+        .get("LLM_BASE_URL")
+        .unwrap_or_else(|| "https://api.openai.com/v1".into());
+    // Local servers such as Ollama do not need a key.
+    if api_key.is_empty() && base_url.starts_with("https://") {
+        errors.push("LLM_API_KEY is required (or set MOCK_LLM=true with DEV_MODE=true)".into());
+    }
+    LlmConfig::OpenAiCompatible {
+        base_url: base_url.trim_end_matches('/').to_owned(),
+        api_key,
+        model: env.get("LLM_MODEL").unwrap_or_else(|| "gpt-4o-mini".into()),
+        max_tokens: env.num("LLM_MAX_TOKENS", 400, errors),
+    }
+}
+
+fn nvidia_config(env: &Env, errors: &mut Vec<String>) -> NvidiaConfig {
+    let api_key = env.get("NVIDIA_API_KEY").unwrap_or_default();
+    if api_key.is_empty() {
+        errors.push(
+            "NVIDIA_API_KEY is required when LLM_PROVIDER=nvidia (create one at build.nvidia.com)"
+                .into(),
+        );
+    }
+    let base_url = env
+        .get("NVIDIA_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_NVIDIA_BASE_URL.into());
+    let base_url = base_url.trim_end_matches('/').to_owned();
+    if !valid_api_base_url(&base_url) {
+        // The key is sent to this URL, so it must be https (plain http only for a local NIM).
+        errors.push(format!(
+            "NVIDIA_BASE_URL {base_url:?} must be an https URL like {DEFAULT_NVIDIA_BASE_URL} \
+             (plain http only for localhost or 127.0.0.1)"
+        ));
+    }
+    let temperature: f32 = env.num("NVIDIA_TEMPERATURE", 0.3, errors);
+    if !(0.0..=2.0).contains(&temperature) {
+        errors.push(format!(
+            "NVIDIA_TEMPERATURE must be between 0 and 2 (got {temperature})"
+        ));
+    }
+    NvidiaConfig {
+        base_url,
+        api_key,
+        model: env
+            .get("NVIDIA_MODEL")
+            .unwrap_or_else(|| DEFAULT_NVIDIA_MODEL.into()),
+        max_tokens: env.num("LLM_MAX_TOKENS", 400, errors),
+        temperature,
+        enable_thinking: env.bool("NVIDIA_ENABLE_THINKING", false, errors),
+        tools: env.bool("NVIDIA_TOOLS", false, errors),
+    }
+}
+
+/// A model API base URL that an API key may be sent to: https with a plain host (no
+/// credentials, query or fragment), or http only for an exact local host.
+fn valid_api_base_url(url: &str) -> bool {
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or_default();
+    !host.is_empty()
+        && !url.contains(['@', '?', '#', ' ', '\\'])
+        && (scheme == "https" || is_local(&format!("http://{host}")))
 }
 
 /// Fills `{bot_name}` and `{lead_instructions}` in a system prompt template.
@@ -612,6 +777,148 @@ mod tests {
         ])
         .unwrap();
         assert!(c.lead_capture && c.system_prompt.contains("propose_lead"));
+    }
+
+    const NV_KEY: &str = "nvapi-test-key-do-not-log";
+
+    fn nvidia(extra: &[(&'static str, &'static str)]) -> Result<Config, ConfigError> {
+        let mut env = vec![
+            ("ALLOWED_ORIGINS", "https://a.example"),
+            ("LLM_PROVIDER", "nvidia"),
+            ("NVIDIA_API_KEY", NV_KEY),
+        ];
+        env.extend_from_slice(extra);
+        Config::from_pairs(&env)
+    }
+
+    #[test]
+    fn nvidia_defaults_are_text_only_nemotron_with_thinking_off() {
+        let c = nvidia(&[]).unwrap();
+        let LlmConfig::Nvidia(n) = &c.llm else {
+            panic!("{:?}", c.llm)
+        };
+        assert_eq!(n.base_url, "https://integrate.api.nvidia.com/v1");
+        assert_eq!(n.model, DEFAULT_NVIDIA_MODEL);
+        assert_eq!(n.model, "nvidia/nemotron-3-nano-30b-a3b");
+        assert_eq!(n.api_key, NV_KEY);
+        assert!(!n.enable_thinking && !n.tools);
+        assert_eq!(n.max_tokens, 400);
+        assert!((n.temperature - 0.3).abs() < f32::EPSILON);
+        assert!(
+            !c.llm.supports_tools(),
+            "text-only unless NVIDIA_TOOLS=true"
+        );
+        assert!(!c.system_prompt.contains("propose_lead"));
+    }
+
+    #[test]
+    fn nvidia_settings_can_be_overridden() {
+        let c = nvidia(&[
+            ("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct"),
+            ("NVIDIA_BASE_URL", "https://nim.internal.example/v1/"),
+            ("NVIDIA_ENABLE_THINKING", "true"),
+            ("NVIDIA_TOOLS", "true"),
+            ("NVIDIA_TEMPERATURE", "0.7"),
+            ("LLM_MAX_TOKENS", "256"),
+        ])
+        .unwrap();
+        let LlmConfig::Nvidia(n) = &c.llm else {
+            panic!()
+        };
+        assert_eq!(n.model, "meta/llama-3.3-70b-instruct");
+        assert_eq!(n.base_url, "https://nim.internal.example/v1");
+        assert!(n.enable_thinking && n.tools);
+        assert_eq!(n.max_tokens, 256);
+        assert!((n.temperature - 0.7).abs() < f32::EPSILON);
+        assert!(c.llm.supports_tools());
+    }
+
+    #[test]
+    fn nvidia_requires_its_own_key() {
+        let err = Config::from_pairs(&[
+            ("ALLOWED_ORIGINS", "https://a.example"),
+            ("LLM_PROVIDER", "nvidia"),
+            ("LLM_API_KEY", "an-openai-key"),
+        ])
+        .unwrap_err();
+        assert_eq!(err.0.len(), 1, "{err}");
+        assert!(err.0[0].contains("NVIDIA_API_KEY is required"), "{err}");
+    }
+
+    #[test]
+    fn nvidia_base_url_must_be_https_except_for_local_hosts() {
+        for bad in [
+            "http://integrate.api.nvidia.com/v1",
+            "http://localhost.evil.com/v1",
+            "ftp://integrate.api.nvidia.com/v1",
+            "integrate.api.nvidia.com/v1",
+            "https://",
+            "https://user:pw@evil.example/v1",
+            "https://nim.example/v1?x=1",
+        ] {
+            let err = nvidia(&[("NVIDIA_BASE_URL", bad)]).unwrap_err();
+            assert!(
+                err.0.iter().any(|e| e.contains("NVIDIA_BASE_URL")),
+                "{bad}: {err}"
+            );
+        }
+        for good in [
+            "http://localhost:8000/v1",
+            "http://127.0.0.1:9/v1",
+            "https://nim.internal.example:8443/v1",
+        ] {
+            assert!(nvidia(&[("NVIDIA_BASE_URL", good)]).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn nvidia_rejects_bad_numbers_and_flags() {
+        let err = nvidia(&[
+            ("NVIDIA_TEMPERATURE", "hot"),
+            ("NVIDIA_ENABLE_THINKING", "maybe"),
+            ("NVIDIA_TOOLS", "sure"),
+        ])
+        .unwrap_err();
+        assert_eq!(err.0.len(), 3, "{err}");
+        assert!(nvidia(&[("NVIDIA_TEMPERATURE", "3")]).is_err());
+        assert!(nvidia(&[("NVIDIA_TOOLS", "false")]).is_ok());
+    }
+
+    #[test]
+    fn unknown_llm_provider_is_rejected_not_silently_openai() {
+        let err = Config::from_pairs(&[
+            ("ALLOWED_ORIGINS", "https://a.example"),
+            ("LLM_PROVIDER", "nvidai"),
+            ("LLM_API_KEY", "k"),
+        ])
+        .unwrap_err();
+        assert!(err.0[0].contains("LLM_PROVIDER"), "{err}");
+        for ok in ["openai", "OpenAI", "nvidia"] {
+            assert!(
+                Config::from_pairs(&[
+                    ("ALLOWED_ORIGINS", "https://a.example"),
+                    ("LLM_PROVIDER", ok),
+                    ("LLM_API_KEY", "k"),
+                    ("NVIDIA_API_KEY", "k"),
+                ])
+                .is_ok(),
+                "{ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_output_never_contains_api_keys() {
+        let c = nvidia(&[]).unwrap();
+        let shown = format!("{c:?}");
+        assert!(!shown.contains(NV_KEY), "{shown}");
+        assert!(shown.contains("nemotron"), "{shown}");
+        let c = Config::from_pairs(&[
+            ("ALLOWED_ORIGINS", "https://a.example"),
+            ("LLM_API_KEY", "sk-secret-openai"),
+        ])
+        .unwrap();
+        assert!(!format!("{c:?}").contains("sk-secret-openai"));
     }
 
     #[test]

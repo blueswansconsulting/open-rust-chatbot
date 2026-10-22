@@ -56,9 +56,13 @@ Then add this to your website, just before `</body>`:
 | OpenRouter | `https://openrouter.ai/api/v1` | `openai/gpt-4o-mini` | `LLM_API_KEY` |
 | Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | `LLM_API_KEY` |
 | Ollama (local) | `http://localhost:11434/v1` | `llama3.1` | not needed |
+| NVIDIA (build.nvidia.com) | set `LLM_PROVIDER=nvidia` (`NVIDIA_BASE_URL` optional) | `nvidia/nemotron-3-nano-30b-a3b` (`NVIDIA_MODEL`) | `NVIDIA_API_KEY` |
 | OpenClaw bridge | set `LLM_PROVIDER=openclaw` | — | `OPENCLAW_BRIDGE_TOKEN` |
 
-Models must support tool calling for knowledge-base search and lead cards. With the OpenClaw bridge (text only), the server retrieves knowledge-base excerpts (and, for directory bots, matching listings) itself and offers the lead card when a visitor types an email address, or a phone number while asking to be called. **The bridge agent must have no tools**, because every visitor is untrusted.
+Models must support tool calling for knowledge-base search and lead cards. NVIDIA runs text only by
+default (set `NVIDIA_TOOLS=true` for a model you have checked handles tool calls), sends
+`chat_template_kwargs.enable_thinking=false`, and strips any `<think>…</think>` reasoning before it
+reaches visitors; see [docs/providers/nvidia.md](docs/providers/nvidia.md). With the OpenClaw bridge, or NVIDIA (text only), the server retrieves knowledge-base excerpts (and, for directory bots, matching listings) itself and offers the lead card when a visitor types an email address, or a phone number while asking to be called. **The bridge agent must have no tools**, because every visitor is untrusted.
 
 ### Deploying
 
