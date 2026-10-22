@@ -321,7 +321,11 @@ async fn openclaw_bridge_gets_kb_context_and_server_offers_lead_card() {
     .await
     .unwrap();
     let frames = until_done(&mut ws).await;
-    assert_eq!(text_of(&frames), "We open at 8am on weekdays.");
+    // With a card, the reply also points at it (#31).
+    assert_eq!(
+        text_of(&frames),
+        "We open at 8am on weekdays. Check the details below and press Confirm to send them to the team."
+    );
     let card = frames
         .iter()
         .find(|f| f["type"] == "card")
@@ -847,8 +851,9 @@ async fn text_only_model_requests_a_call_back_via_a_hidden_lead_line() {
     let frames = until_done(&mut ws).await;
     let visible = text_of(&frames);
     assert_eq!(
-        visible, "Thanks Jo, I'll get the team to call you after 5pm.",
-        "lead line hidden from the visitor"
+        visible,
+        "Thanks Jo, I'll get the team to call you after 5pm. Check the details below and press Confirm to send them to the team.",
+        "lead line hidden from the visitor, and the reply points at the card"
     );
     let card = frames
         .iter()

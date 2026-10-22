@@ -15,7 +15,7 @@ use crate::sites::{Site, SpendCaps};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 const HOUR: u64 = 3600;
 const DAY: u64 = 86_400;
@@ -25,6 +25,18 @@ const PER_VISITOR_SHARE: u32 = 10;
 const MIN_PER_VISITOR: u32 = 10;
 /// Visitors tracked per bot per day; beyond this new visitors share one bucket.
 const MAX_VISITORS_TRACKED: usize = 4096;
+/// One visitor using this share (percent) of a bot's hourly cap is logged as heavy use.
+const HEAVY_SHARE_PERCENT: u32 = 20;
+
+/// Whether a visitor may start another turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Admitted,
+    /// This visitor has used their own share for now; the bot still answers others.
+    VisitorLimit,
+    /// The bot (or its partner) is out of replies for everyone.
+    BotBusy,
+}
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +85,12 @@ struct BotWindow {
     day: u64,
     day_count: u32,
     visitors: HashMap<String, u32>,
+    /// Turns per visitor this hour.
+    visitors_hour: HashMap<String, u32>,
+    /// The hour a cap refusal was last logged, so a capped bot logs once an hour.
+    busy_logged: Option<u64>,
+    /// Visitors already logged as heavy users this hour.
+    heavy_logged: std::collections::HashSet<String>,
 }
 
 #[derive(Default)]
@@ -107,6 +125,8 @@ pub struct SeedBot {
 pub struct Meter {
     instance_id: String,
     reporting: bool,
+    /// Turns one visitor may start per bot per hour (`VISITOR_REPLIES_PER_HOUR`).
+    visitor_hourly: Option<u32>,
     state: Mutex<State>,
 }
 
@@ -115,6 +135,16 @@ pub fn hour_iso(hour_start: u64) -> String {
         .unwrap_or_default()
         .format("%Y-%m-%dT%H:00:00Z")
         .to_string()
+}
+
+/// A visitor key (an IP address or /64) for logs: a short keyed hash, never the address. The
+/// key is random per process, so the hash can't be reversed by hashing every address.
+fn visitor_hash(visitor: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    static KEY: LazyLock<String> = LazyLock::new(crate::random_token);
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(KEY.as_bytes()).expect("any key length");
+    mac.update(visitor.as_bytes());
+    hex::encode(&mac.finalize().into_bytes()[..6])
 }
 
 pub fn unix_now() -> u64 {
@@ -131,6 +161,8 @@ impl BotWindow {
         if now / HOUR > self.hour {
             self.hour = now / HOUR;
             self.hour_count = 0;
+            self.visitors_hour.clear();
+            self.heavy_logged.clear();
         }
         if now / DAY > self.day {
             self.day = now / DAY;
@@ -180,6 +212,7 @@ impl Meter {
             // Fresh on every boot, so batch ids from before a restart are never reused.
             instance_id: crate::random_token()[..16].to_owned(),
             reporting,
+            visitor_hourly: None,
             state: Mutex::default(),
         }
     }
@@ -192,59 +225,124 @@ impl Meter {
         })
     }
 
+    /// Limits each visitor to `cap` turns per bot per hour (0: no hourly limit), well below a
+    /// bot's hourly cap, so one visitor can't make the chat busy for everyone.
+    pub fn with_visitor_hourly_cap(mut self, cap: u32) -> Self {
+        self.visitor_hourly = (cap > 0).then_some(cap);
+        self
+    }
+
+    /// Like [`Meter::admit_turn`], as a yes or no.
+    pub fn admit(&self, site: &Site, visitor: &str, now: u64) -> bool {
+        self.admit_turn(site, visitor, now) == Admission::Admitted
+    }
+
     /// Checks the caps and, if this visitor may start another turn, counts it straight away
     /// (as one model call), before the model is asked. Counting up front means a visitor who
     /// disconnects mid-reply is still counted, and concurrent turns can't overshoot the caps.
-    pub fn admit(&self, site: &Site, visitor: &str, now: u64) -> bool {
+    /// A visitor over their own daily or hourly share gets `VisitorLimit` (even if the bot is
+    /// also capped, as their own limit is what they should be told about).
+    pub fn admit_turn(&self, site: &Site, visitor: &str, now: u64) -> Admission {
         if site.id.is_empty() {
-            return true;
+            return Admission::Admitted;
         }
         let caps = effective_caps(site);
-        let mut st = self.state.lock().unwrap();
-        let partner_ok = match (&site.partner_id, caps.partner_replies_per_day) {
-            (Some(p), Some(cap)) => partner_used(&st.partners, p, now) < cap,
-            _ => true,
-        };
-        let window = st.bots.entry(site.id.clone()).or_default();
-        window.roll(now);
-        let bot_ok = caps.replies_per_hour.is_none_or(|c| window.hour_count < c)
-            && caps.replies_per_day.is_none_or(|c| window.day_count < c);
-        let visitor_key = if window.visitors.len() < MAX_VISITORS_TRACKED
-            || window.visitors.contains_key(visitor)
-        {
-            visitor.to_owned()
-        } else {
-            String::from("~overflow")
-        };
-        let visitor_cap = caps
-            .replies_per_day
-            .map(|d| (d / PER_VISITOR_SHARE).max(MIN_PER_VISITOR));
-        let visitor_used = window.visitors.get(&visitor_key).copied().unwrap_or(0);
-        // The shared overflow bucket isn't limited, so it can't be used to lock out new visitors.
-        let visitor_ok = visitor_key == "~overflow" || visitor_cap.is_none_or(|c| visitor_used < c);
-        if !(bot_ok && partner_ok) {
-            if let Some(counts) = self.pending(&mut st, &site.id, now) {
-                counts.capped = true;
+        let mut logs = Vec::new();
+        let admission = {
+            let mut st = self.state.lock().unwrap();
+            let partner_ok = match (&site.partner_id, caps.partner_replies_per_day) {
+                (Some(p), Some(cap)) => partner_used(&st.partners, p, now) < cap,
+                _ => true,
+            };
+            let window = st.bots.entry(site.id.clone()).or_default();
+            window.roll(now);
+            let hour_ok = caps.replies_per_hour.is_none_or(|c| window.hour_count < c);
+            let day_ok = caps.replies_per_day.is_none_or(|c| window.day_count < c);
+            let visitor_key = if window.visitors.len() < MAX_VISITORS_TRACKED
+                || window.visitors.contains_key(visitor)
+            {
+                visitor.to_owned()
+            } else {
+                String::from("~overflow")
+            };
+            let visitor_cap = caps
+                .replies_per_day
+                .map(|d| (d / PER_VISITOR_SHARE).max(MIN_PER_VISITOR));
+            let visitor_used = window.visitors.get(&visitor_key).copied().unwrap_or(0);
+            let visitor_hour_used = window.visitors_hour.get(&visitor_key).copied().unwrap_or(0);
+            // The shared overflow bucket isn't limited, so it can't be used to lock out new
+            // visitors.
+            let visitor_ok = visitor_key == "~overflow"
+                || (visitor_cap.is_none_or(|c| visitor_used < c)
+                    && self.visitor_hourly.is_none_or(|c| visitor_hour_used < c));
+            if !visitor_ok {
+                Admission::VisitorLimit
+            } else if !(hour_ok && day_ok && partner_ok) {
+                if window.busy_logged != Some(now / HOUR) {
+                    window.busy_logged = Some(now / HOUR);
+                    let top = window.visitors_hour.values().copied().max().unwrap_or(0);
+                    let limit = if !partner_ok {
+                        "partner_day"
+                    } else if !day_ok {
+                        "day"
+                    } else {
+                        "hour"
+                    };
+                    logs.push((
+                        "bot_cap_reached",
+                        json!({
+                            "bot": site.id,
+                            "limit": limit,
+                            "hourCount": window.hour_count,
+                            "dayCount": window.day_count,
+                            "topVisitorHourCount": top,
+                        }),
+                    ));
+                }
+                if let Some(counts) = self.pending(&mut st, &site.id, now) {
+                    counts.capped = true;
+                }
+                Admission::BotBusy
+            } else {
+                window.hour_count = window.hour_count.saturating_add(1);
+                window.day_count = window.day_count.saturating_add(1);
+                *window.visitors.entry(visitor_key.clone()).or_default() += 1;
+                let used = window.visitors_hour.entry(visitor_key.clone()).or_default();
+                *used += 1;
+                let used = *used;
+                if let Some(cap) = caps.replies_per_hour.filter(|&c| c > 0) {
+                    if visitor_key != "~overflow"
+                        && used * 100 >= cap * HEAVY_SHARE_PERCENT
+                        && window.heavy_logged.insert(visitor_key.clone())
+                    {
+                        logs.push((
+                            "visitor_heavy_use",
+                            json!({
+                                "bot": site.id,
+                                "visitor": visitor_hash(&visitor_key),
+                                "hourCount": used,
+                                "botHourlyCap": cap,
+                            }),
+                        ));
+                    }
+                }
+                if let Some(partner) = &site.partner_id {
+                    let entry = st.partners.entry(partner.clone()).or_insert((now / DAY, 0));
+                    if now / DAY > entry.0 {
+                        *entry = (now / DAY, 0);
+                    }
+                    entry.1 = entry.1.saturating_add(1);
+                }
+                if let Some(counts) = self.pending(&mut st, &site.id, now) {
+                    counts.model_calls += 1;
+                }
+                Admission::Admitted
             }
-            return false;
+        };
+        for (event, fields) in logs {
+            log_event(event, fields);
         }
-        if !visitor_ok {
-            return false;
-        }
-        window.hour_count = window.hour_count.saturating_add(1);
-        window.day_count = window.day_count.saturating_add(1);
-        *window.visitors.entry(visitor_key).or_default() += 1;
-        if let Some(partner) = &site.partner_id {
-            let entry = st.partners.entry(partner.clone()).or_insert((now / DAY, 0));
-            if now / DAY > entry.0 {
-                *entry = (now / DAY, 0);
-            }
-            entry.1 = entry.1.saturating_add(1);
-        }
-        if let Some(counts) = self.pending(&mut st, &site.id, now) {
-            counts.model_calls += 1;
-        }
-        true
+        admission
     }
 
     /// True if the bot (or its partner) is out of replies for now; per-visitor limits don't count.
@@ -644,5 +742,52 @@ mod tests {
         m.next_batch(T0 + DAY);
         assert!(m.state.lock().unwrap().bots.is_empty());
         assert!(m.state.lock().unwrap().partners.is_empty());
+    }
+
+    #[test]
+    fn redteam_28_one_visitor_is_limited_per_hour_and_others_still_get_answers() {
+        let m = Meter::new(true).with_visitor_hourly_cap(15);
+        // The red-team bot: 60 replies an hour, 300 a day.
+        let s = site("ts-a", Some("ts"), SpendCaps::default());
+        let used = (0..60).filter(|_| turn(&m, &s, "attacker", T0)).count();
+        assert_eq!(used, 15);
+        assert_eq!(m.admit_turn(&s, "attacker", T0), Admission::VisitorLimit);
+        assert_eq!(m.admit_turn(&s, "real visitor", T0), Admission::Admitted);
+        assert!(!m.bot_capped(&s, T0));
+        // A new hour gives the visitor a new share (within the daily one).
+        assert_eq!(m.admit_turn(&s, "attacker", T0 + HOUR), Admission::Admitted);
+    }
+
+    #[test]
+    fn redteam_28_a_busy_bot_and_a_limited_visitor_are_told_apart() {
+        let m = Meter::new(true).with_visitor_hourly_cap(2);
+        let s = site("a", None, caps(Some(3), None, None));
+        assert!(turn(&m, &s, "v1", T0) && turn(&m, &s, "v1", T0));
+        assert_eq!(m.admit_turn(&s, "v1", T0), Admission::VisitorLimit);
+        assert!(turn(&m, &s, "v2", T0));
+        assert_eq!(m.admit_turn(&s, "v3", T0), Admission::BotBusy);
+        assert_eq!(
+            m.admit_turn(&s, "v1", T0),
+            Admission::VisitorLimit,
+            "a visitor over their own share is told so, even when the bot is busy"
+        );
+    }
+
+    #[test]
+    fn the_visitor_hourly_cap_is_off_at_zero_and_never_applies_to_the_single_site_bot() {
+        let m = Meter::new(true).with_visitor_hourly_cap(0);
+        let s = site("a", None, caps(None, Some(1000), None));
+        assert_eq!((0..50).filter(|_| turn(&m, &s, "v", T0)).count(), 50);
+        let m = Meter::new(true).with_visitor_hourly_cap(1);
+        let single = site("", None, SpendCaps::default());
+        assert!((0..5).all(|_| m.admit(&single, "v", T0)));
+    }
+
+    #[test]
+    fn visitors_are_logged_by_hash_never_by_address() {
+        let h = visitor_hash("2001:db8:1:2::/64");
+        assert_eq!(h.len(), 12);
+        assert!(!h.contains(':'));
+        assert_eq!(h, visitor_hash("2001:db8:1:2::/64"));
     }
 }

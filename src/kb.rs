@@ -14,6 +14,8 @@ pub struct KnowledgeBase {
     chunks: Vec<KnowledgeChunk>,
     /// Inverse document frequency per token: rare words (place names, "eicr") count for more.
     idf: std::collections::HashMap<String, f64>,
+    /// What the links and emails in the text allow a reply to carry (see `LinkPolicy::allowed_in`).
+    link_hosts: Vec<String>,
 }
 
 const DEFAULT_CHUNK_WORDS: usize = 512;
@@ -208,7 +210,20 @@ impl KnowledgeBase {
             .into_iter()
             .map(|(t, d)| (t, (1.0 + n / d as f64).ln()))
             .collect();
-        Self { chunks, idf }
+        let mut link_hosts =
+            crate::reply::LinkPolicy::allowed_in(chunks.iter().map(|c| c.text.as_str()));
+        link_hosts.sort();
+        link_hosts.dedup();
+        Self {
+            chunks,
+            idf,
+            link_hosts,
+        }
+    }
+
+    /// What the links and emails in the knowledge base allow (hosts, or pages on shared hosts).
+    pub fn link_hosts(&self) -> &[String] {
+        &self.link_hosts
     }
 
     pub fn from_markdown(markdown: &str) -> Self {

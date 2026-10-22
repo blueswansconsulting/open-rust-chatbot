@@ -22,6 +22,14 @@ All notable changes are documented here. This project follows [Semantic Versioni
   honest counts and an explicit "No listings within 25 km of …" note; follow-ups keep the postcode.
 
 ### Fixed
+- Red-team findings (#27-#31): lead fields (card, inquiry and webhook) are one line of plain text,
+  cut at any `LEAD:` marker, without JSON, links, emails or hosts, capped (name 80, best time 60,
+  message 300); names and times with markup or links are rejected. Replies are plain text
+  (Markdown links become `text: url`) and only carry links to the bot's own origins, its knowledge
+  base's hosts and its listings' pages. A per-visitor hourly cap (`VISITOR_REPLIES_PER_HOUR`,
+  default 15) stops one visitor making a bot busy for everyone; refusals are `visitor_limit` or
+  `bot_busy` (was `budget_exceeded`). A reply shown with a lead card points at the card instead of
+  asking for details again.
 - Text-only replies: a `LEAD: {…}` written on the same line as the reply (or pretty-printed, or
   in a code fence) is now parsed and never shown to the visitor. A parsed lead is the only card
   offered; the typed-number fallback card now takes the visitor's name ("I'm …", "my name is …",
