@@ -505,7 +505,8 @@ impl Offer {
     fn begin_turn(&mut self, text: &str) -> Option<String> {
         // A decline that still gives their own contact details is accepting ("No worries, Jo
         // 07700 900123"); "No thanks, I found someone on 07700 …" is not theirs.
-        let own_contact = || fallback_contact_checked(text, &|_| false, true).is_some();
+        // Judged as if no offer was made: an email, or a number they ask to be called on.
+        let own_contact = || fallback_contact_checked(text, &|_| false, false).is_some();
         if self.turns_left == 0 || (DECLINE.is_match(text) && !own_contact()) {
             self.clear();
             return None;
@@ -538,7 +539,7 @@ impl Offer {
 /// A name given on its own in reply to "can I take your name and number?": "Jo Bloggs 07700
 /// 900123" gives "Jo Bloggs". Read as if introduced ("I'm Jo Bloggs …"), so everyday words
 /// ("Sure, 07700 …", "Thanks") are not names.
-fn bare_name(text: &str) -> Option<String> {
+fn bare_name(text: &str, is_place: &dyn Fn(&str) -> bool) -> Option<String> {
     let text = text.trim_start();
     if !text.starts_with(char::is_uppercase) {
         return None;
@@ -548,16 +549,15 @@ fn bare_name(text: &str) -> Option<String> {
     // everyday or trade words ("Priya Patel"); never "Bolton", "EICR" or "Ok" alone.
     let words: Vec<String> = name.split_whitespace().map(str::to_lowercase).collect();
     const TITLES: [&str; 9] = ["mr", "mrs", "ms", "miss", "dr", "mr.", "mrs.", "ms.", "dr."];
-    const TRADE: [&str; 7] = [
-        "electrical",
-        "electrics",
-        "electric",
-        "ltd",
-        "services",
-        "eicr",
-        "ev",
-    ];
-    if words.iter().any(|w| TRADE.contains(&w.as_str())) {
+    const GREETINGS: [&str; 6] = ["hi", "hello", "hey", "hiya", "morning", "afternoon"];
+    let generic = words.iter().any(|w| {
+        crate::listings::generic_word(w) || is_place(w) || GREETINGS.contains(&w.as_str())
+    });
+    // Names are written "Jo", not "IV" or "EICR".
+    let shouted = name
+        .split_whitespace()
+        .any(|w| w.chars().count() > 1 && w.chars().all(|c| !c.is_lowercase()));
+    if generic || shouted {
         return None;
     }
     let titled = TITLES.contains(&words[0].as_str()) && words.len() > 1;
@@ -1428,8 +1428,14 @@ impl ChatSession {
             .flatten();
         if let Some((email, phone)) = fallback {
             let mut arguments = serde_json::Map::new();
-            let typed_name =
-                name_in_text(text).or_else(|| answering.then(|| bare_name(text)).flatten());
+            let typed_name = name_in_text(text).or_else(|| {
+                answering
+                    .then(|| {
+                        let listings = self.site.listings.as_deref();
+                        bare_name(text, &|w| listings.is_some_and(|l| l.is_place_word(w)))
+                    })
+                    .flatten()
+            });
             let mut message = lead_message(text);
             if let Some(context) = &lead_context {
                 // Their own words only add something beyond the name they just gave.
@@ -2466,6 +2472,10 @@ mod tests {
         }
     }
 
+    fn no_place(w: &str) -> bool {
+        ["bolton", "manchester", "inverness"].contains(&w)
+    }
+
     fn lookup(no_match: Option<&str>, recognised: bool) -> crate::listings::Lookup {
         crate::listings::Lookup {
             no_match: no_match.map(str::to_owned),
@@ -2562,10 +2572,10 @@ mod tests {
             "Hayvern 07700 900123",
             "Ok",
         ] {
-            assert_eq!(bare_name(t), None, "{t}");
+            assert_eq!(bare_name(t, &no_place), None, "{t}");
         }
         assert_eq!(
-            bare_name("Mrs Jo Bloggs 07700 900123").as_deref(),
+            bare_name("Mrs Jo Bloggs 07700 900123", &no_place).as_deref(),
             Some("Mrs Jo Bloggs")
         );
     }
@@ -2577,7 +2587,6 @@ mod tests {
             "No worries, Jo Bloggs 07700 900123",
             "No problem - Jo 07700 900123",
             "no, call me on 07700 900123",
-            "Nah it's fine, Jo 07700 900123",
             "Yes please, get it sorted, Jo 07700 900123",
             "I found a burning smell, Jo 07700 900123",
             "No. 5 High St, Jo 07700 900123",
@@ -2622,8 +2631,49 @@ mod tests {
             ("Rhys Jones 07700 900123", "Rhys Jones"),
             ("Oluwaseun Adeyemi 07700 900123", "Oluwaseun Adeyemi"),
         ] {
-            assert_eq!(bare_name(t).as_deref(), Some(n), "{t}");
+            assert_eq!(bare_name(t, &no_place).as_deref(), Some(n), "{t}");
         }
-        assert_eq!(bare_name("Hayvern Electrical 07700 900123"), None);
+        assert_eq!(
+            bare_name("Hayvern Electrical 07700 900123", &no_place),
+            None
+        );
+    }
+
+    #[test]
+    fn qa_p1_a_decline_with_someone_elses_number_ends_the_offer() {
+        let c = "Electrician near IV1 — no listing found";
+        for t in [
+            "No thanks, I'll ring Sparky Steve on 07700 900456",
+            "No thanks, my neighbour recommended 01463 222333",
+            "No thanks, my brother-in-law is a sparky, 07700 900456",
+            "No thanks, I've got one sorted, 07700 900456 is coming tomorrow",
+        ] {
+            let mut o = Offer::default();
+            o.set(Some(c.into()));
+            assert_eq!(o.begin_turn(t), None, "{t}");
+            assert_eq!(o.context, None, "{t}");
+        }
+        // Still accepting when they ask to be called.
+        let mut o = Offer::default();
+        o.set(Some(c.into()));
+        assert!(o.begin_turn("no, call me on 07700 900123").is_some());
+    }
+
+    #[test]
+    fn qa_p2_places_businesses_and_greetings_are_not_names() {
+        for t in [
+            "Inverness IV1 07700 900123",
+            "Bolton Plumbers 07700 900123",
+            "Manchester Solar 07700 900123",
+            "Hayvern Plumbing 07700 900123",
+            "Bolton Smith 07700 900123",
+            "Hi Jo 07700 900123",
+        ] {
+            assert_eq!(bare_name(t, &no_place), None, "{t}");
+        }
+        assert_eq!(
+            bare_name("Jo Bloggs 07700 900123", &no_place).as_deref(),
+            Some("Jo Bloggs")
+        );
     }
 }

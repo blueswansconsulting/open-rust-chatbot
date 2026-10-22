@@ -283,6 +283,11 @@ fn everyday_word(word: &str) -> bool {
     COMMON_NAMES.contains(word) || english_word(word)
 }
 
+/// A word that never identifies a person or business on its own ("plumbing", "solar", "ltd").
+pub(crate) fn generic_word(word: &str) -> bool {
+    GENERIC.contains(word)
+}
+
 pub(crate) fn first_name(word: &str) -> bool {
     FIRST_NAMES.contains(word)
 }
@@ -996,6 +1001,11 @@ impl Listings {
             name_starts,
             unlocated,
         })
+    }
+
+    /// True if `word` (lower case) is part of a place name in the dataset.
+    pub fn is_place_word(&self, word: &str) -> bool {
+        self.place_words.contains(word)
     }
 
     pub fn sha256(&self) -> &str {
