@@ -35,6 +35,8 @@ answer questions about rewires and EV chargers, or pass your details to the team
 
 - `preview.html` shows every avatar at 24–64px on light and dark backgrounds and in a mock widget.
   Serve the folder (`python3 -m http.server`) to see the launcher wave; `file://` shows static images.
+- `follow-cursor.html` is a MetaMask-style live version: Sparky's head turns to follow the mouse
+  or a finger, idles with a gentle bob, and blinks now and then. It stays still under reduced motion.
 - `wave.css` is an optional one-time launcher wave and occasional blink. Both only run under
   `prefers-reduced-motion: no-preference`, never loop, and need the SVG inlined (an `<img>` stays static).
 - `SPEC.md` covers placement and sizes, alt text, contrast, and rules for owner-uploaded avatars.
