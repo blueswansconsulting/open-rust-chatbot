@@ -263,6 +263,15 @@ fn fallback_contact_checked(
         if !(asked || next_to) {
             continue;
         }
+        // Only the offer makes it a call-back: a number that isn't theirs still doesn't count.
+        if offered
+            && !next_to
+            && !CALL_ME.is_match(text)
+            && !OWN_NUMBER.is_match(before)
+            && NOT_THEIRS.is_match(before)
+        {
+            continue;
+        }
         let rank = if CALL_BEFORE.is_match(before) || OWN_NUMBER.is_match(before) {
             0
         } else if next_to {
@@ -466,6 +475,61 @@ fn name_in_text(text: &str) -> Option<String> {
     introduced_name(text).map(|(name, _)| name)
 }
 
+/// How many visitor turns after a no-match offer a reply can still answer it.
+const OFFER_TURNS: u8 = 2;
+
+/// Turning down the offer to take their details: "no thanks", "I found someone", "sorted".
+static DECLINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^\W*(?:no|nah|nope)\b|\bno,?\s+thank|\bfound\s+(?:someone|somebody|one|an?\s)|\bnever\s?mind\b|\bdon'?t\s+bother\b|\bnot\s+(?:now|needed|necessary)\b|\bsorted\b").unwrap()
+});
+
+/// Before a number that is someone else's or not a phone at all, even in reply to the offer:
+/// "my old electrician was …", "the council number is …", "my ref is …".
+static NOT_THEIRS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:was|were|found|ref|reference|council|old|previous|their|his|her|its|landlord\w*|company|office|account|invoice|order)\b[^.?!\n]{0,30}$").unwrap()
+});
+
+/// A no-match offer ("I couldn't find a listed electrician near IV1; can I take your details?")
+/// and the search its lead carries ("Electrician near IV1 — no listing found").
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Offer {
+    context: Option<String>,
+    turns_left: u8,
+}
+
+impl Offer {
+    /// Starts a visitor turn: the context of an offer made on an earlier turn that this message
+    /// may answer. Offers expire after [`OFFER_TURNS`] turns, and a decline clears them.
+    fn begin_turn(&mut self, text: &str) -> Option<String> {
+        if self.turns_left == 0 || DECLINE.is_match(text) {
+            self.clear();
+            return None;
+        }
+        self.turns_left -= 1;
+        self.context.clone()
+    }
+
+    /// This turn's directory lookup: a recognised search replaces the offer (with nothing, if it
+    /// found listings), unless the message answers the earlier offer with contact details.
+    fn looked_up(&mut self, l: &crate::listings::Lookup, answering: bool) {
+        // The same unmatched search seen again (a vague follow-up inherits it) is not a new
+        // offer: it doesn't extend the old one's life.
+        if !l.recognised || (answering && l.no_match.is_some()) || l.no_match == self.context {
+            return;
+        }
+        self.set(l.no_match.clone());
+    }
+
+    fn set(&mut self, context: Option<String>) {
+        self.turns_left = if context.is_some() { OFFER_TURNS } else { 0 };
+        self.context = context;
+    }
+
+    fn clear(&mut self) {
+        self.set(None);
+    }
+}
+
 /// A name given on its own in reply to "can I take your name and number?": "Jo Bloggs 07700
 /// 900123" gives "Jo Bloggs". Read as if introduced ("I'm Jo Bloggs …"), so everyday words
 /// ("Sure, 07700 …", "Thanks") are not names.
@@ -474,7 +538,13 @@ fn bare_name(text: &str) -> Option<String> {
     if !text.starts_with(char::is_uppercase) {
         return None;
     }
-    name_in_text(&format!("I'm {text}"))
+    let name = name_in_text(&format!("I'm {text}"))?;
+    // Only a real first name ("Jo Bloggs", "Mrs Jo Bloggs"), never "Bolton", "EICR" or "Ok".
+    let first = name.split_whitespace().map(str::to_lowercase).find(|w| {
+        !["mr", "mrs", "ms", "miss", "dr", "mr.", "mrs.", "ms.", "dr."].contains(&w.as_str())
+    })?;
+    (crate::listings::first_name(&first) || WORD_FIRST_NAMES.split_whitespace().any(|n| n == first))
+        .then_some(name)
 }
 
 /// True if the visitor typed an email address or a phone number.
@@ -939,10 +1009,8 @@ pub struct ChatSession {
     pending_leads: HashMap<String, Lead>,
     /// The last postcode district the visitor gave, for later directory turns.
     last_outcode: Option<String>,
-    /// The search no listing matched ("Electrician near IV1 — no listing found"), after the
-    /// assistant offered to take their details: their lead carries it. Kept until a card is
-    /// offered or a later lookup recognises something else.
-    no_match: Option<String>,
+    /// The search no listing matched, after the assistant offered to take their details.
+    offer: Offer,
     turns: usize,
     /// Rate-limit key of the visitor (IP or /64), used by the availability breaker.
     client: String,
@@ -962,7 +1030,7 @@ impl ChatSession {
             history: vec![system],
             pending_leads: HashMap::new(),
             last_outcode: None,
-            no_match: None,
+            offer: Offer::default(),
             turns: 0,
             client: String::new(),
             resume_token: None,
@@ -1147,6 +1215,8 @@ impl ChatSession {
         if !self.shared.llm.supports_tools() {
             return self.run_text_only_turn(text, tx).await;
         }
+        // Tool-calling models: an offer only lives a couple of turns (searches renew it).
+        self.offer.begin_turn(text);
         let max_history = self.shared.config.limits.max_history_messages;
         for hop in 0..=MAX_TOOL_HOPS {
             let mut reply = String::new();
@@ -1199,6 +1269,8 @@ impl ChatSession {
         let max_history = self.shared.config.limits.max_history_messages;
         let mut messages = trim_history(&self.history, max_history);
         let previous = previous_question(&self.history, text);
+        // An offer made on an earlier turn, which this message may answer.
+        let earlier = self.offer.begin_turn(text);
         let excerpts: Vec<String> = self
             .site
             .kb
@@ -1217,15 +1289,10 @@ impl ChatSession {
             if let Some(listings) = &self.site.listings {
                 let l = listings.lookup_for(text, previous, self.last_outcode.as_deref());
                 system.content.push_str(&l.block);
-                self.last_outcode = l.keep;
+                self.last_outcode = l.keep.clone();
                 // A reply with contact details answers the last offer, whatever it looks like.
-                let pending = self.no_match.take();
-                let answering = pending.is_some() && gives_contact(text);
-                self.no_match = if answering || !l.recognised {
-                    pending
-                } else {
-                    l.no_match
-                };
+                self.offer
+                    .looked_up(&l, earlier.is_some() && gives_contact(text));
             }
             if self.site.lead_capture {
                 system.content.push_str(TEXT_ONLY_LEAD_INSTRUCTIONS);
@@ -1289,7 +1356,14 @@ impl ChatSession {
                 None
             }
         });
-        let lead_context = self.no_match.clone();
+        // Still the earlier offer: the visitor is answering it. Otherwise only a search this
+        // turn gives the lead its context, and a number alone is not a call-back request.
+        let answering = earlier.is_some() && self.offer.context == earlier;
+        let lead_context = if answering {
+            earlier
+        } else {
+            self.offer.context.clone()
+        };
         if let Some(mut arguments) = lead_args.filter(|_| self.site.lead_capture) {
             if let Some(context) = &lead_context {
                 let message =
@@ -1311,8 +1385,9 @@ impl ChatSession {
             };
             if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, None, &call) {
                 // The model's lead is the card: no second card from the fallback below.
-                self.offer_lead(lead, tx);
-                self.no_match = None;
+                if self.offer_lead(lead, tx) {
+                    self.offer.clear();
+                }
                 send(tx, json!({ "type": "done" }));
                 log_event(
                     "turn_complete",
@@ -1328,12 +1403,12 @@ impl ChatSession {
         let fallback = self
             .site
             .lead_capture
-            .then(|| fallback_contact_checked(text, &is_business, lead_context.is_some()))
+            .then(|| fallback_contact_checked(text, &is_business, answering))
             .flatten();
         if let Some((email, phone)) = fallback {
             let mut arguments = serde_json::Map::new();
             let typed_name =
-                name_in_text(text).or_else(|| lead_context.as_ref().and_then(|_| bare_name(text)));
+                name_in_text(text).or_else(|| answering.then(|| bare_name(text)).flatten());
             let mut message = lead_message(text);
             if let Some(context) = &lead_context {
                 // Their own words only add something beyond the name they just gave.
@@ -1360,8 +1435,9 @@ impl ChatSession {
                 arguments,
             };
             if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, None, &call) {
-                self.offer_lead(lead, tx);
-                self.no_match = None;
+                if self.offer_lead(lead, tx) {
+                    self.offer.clear();
+                }
             }
         }
         send(tx, json!({ "type": "done" }));
@@ -1401,15 +1477,13 @@ impl ChatSession {
                 if let Some(listings) = self.site.listings.as_deref() {
                     let query = call.arguments.get("query").and_then(Value::as_str);
                     let l = listings.lookup_for(query.unwrap_or_default(), "", None);
-                    if l.recognised {
-                        self.no_match = l.no_match;
-                    }
+                    self.offer.looked_up(&l, false);
                 }
             }
             let mut outcome = tools::execute(&self.site.kb, self.site.listings.as_deref(), call);
             if let ToolOutcome::LeadProposed(lead) = &mut outcome {
-                if let Some(context) = self.no_match.take() {
-                    let message = with_context(&context, lead.message.as_deref());
+                if let Some(context) = &self.offer.context {
+                    let message = with_context(context, lead.message.as_deref());
                     lead.message = Some(
                         message
                             .chars()
@@ -1426,7 +1500,10 @@ impl ChatSession {
             ToolOutcome::Result(v) => v,
             // The model never learns it can confirm; only the visitor's button can.
             ToolOutcome::LeadProposed(lead) => match self.offer_lead(lead, tx) {
-                true => json!({ "status": "awaiting_visitor_confirmation" }),
+                true => {
+                    self.offer.clear();
+                    json!({ "status": "awaiting_visitor_confirmation" })
+                }
                 false => {
                     json!({ "status": "too_many_pending", "message": "Ask the visitor to confirm the card already shown." })
                 }
@@ -2366,5 +2443,109 @@ mod tests {
         for text in ["call 07700 900123 please", "call 07700 900123 thanks"] {
             assert_eq!(lead_message(text), "Asked to be called back", "{text}");
         }
+    }
+
+    fn lookup(no_match: Option<&str>, recognised: bool) -> crate::listings::Lookup {
+        crate::listings::Lookup {
+            no_match: no_match.map(str::to_owned),
+            recognised,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn qa_an_offer_lives_two_turns_and_a_decline_or_a_found_search_ends_it() {
+        let c = "Electrician near IV1 — no listing found";
+        let mut o = Offer::default();
+        assert_eq!(o.begin_turn("Any electricians in Inverness IV1?"), None);
+        o.looked_up(&lookup(Some(c), true), false);
+        // Two turns to answer ("Jo Bloggs", then "07700 900123"), then it expires.
+        assert_eq!(o.begin_turn("Jo Bloggs").as_deref(), Some(c));
+        o.looked_up(&lookup(None, false), false);
+        assert_eq!(o.begin_turn("07700 900123").as_deref(), Some(c));
+        o.looked_up(&lookup(None, false), false);
+        assert_eq!(
+            o.begin_turn("can I get listed? call me on 07700 900123"),
+            None
+        );
+        // A follow-up that inherits the same search doesn't keep the offer alive.
+        o.set(Some(c.into()));
+        o.begin_turn("how does the directory work?");
+        o.looked_up(&lookup(Some(c), true), false);
+        o.begin_turn("what are your opening hours?");
+        o.looked_up(&lookup(None, false), false);
+        assert_eq!(o.begin_turn("call me on 07700 900123"), None);
+        // A decline ends it.
+        o.set(Some(c.into()));
+        assert_eq!(
+            o.begin_turn("No thanks, I found someone on 07700 900456"),
+            None
+        );
+        assert_eq!(o.context, None);
+        // A recognised search that found listings ends it, even with contact details.
+        o.set(Some(c.into()));
+        assert!(o
+            .begin_turn("any electricians in Bolton? call me on 07700 900123")
+            .is_some());
+        o.looked_up(&lookup(None, true), true);
+        assert_eq!(o.context, None);
+        // A contact reply that looks like a new no-match (a name) keeps the earlier offer.
+        o.set(Some(c.into()));
+        o.begin_turn("Jo Bloggs Plastering 07700 900123");
+        o.looked_up(
+            &lookup(Some("Wants Jo Bloggs Plastering — not listed"), true),
+            true,
+        );
+        assert_eq!(o.context.as_deref(), Some(c));
+    }
+
+    #[test]
+    fn qa_declines_are_recognised() {
+        for t in [
+            "no thanks",
+            "No, thank you",
+            "nah",
+            "I found someone",
+            "never mind",
+            "all sorted now",
+        ] {
+            assert!(DECLINE.is_match(t), "{t}");
+        }
+        for t in [
+            "Jo Bloggs 07700 900123",
+            "Noel Smith 07700 900123",
+            "know anyone?",
+        ] {
+            assert!(!DECLINE.is_match(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn qa_m1_after_an_offer_numbers_that_are_not_theirs_still_do_not_count() {
+        let none = |_: &str| false;
+        for t in [
+            "My old electrician was 01463 222333 but he retired",
+            "The Inverness council number is 01463 702000",
+            "My ref is 0146 322 2333",
+        ] {
+            assert_eq!(fallback_contact_checked(t, &none, true), None, "{t}");
+        }
+        assert!(fallback_contact_checked("my number is 07700 900123", &none, true).is_some());
+    }
+
+    #[test]
+    fn qa_m4_a_bare_name_must_start_with_a_first_name() {
+        for t in [
+            "Bolton 07700 900123",
+            "EICR 07700 900123",
+            "Hayvern 07700 900123",
+            "Ok",
+        ] {
+            assert_eq!(bare_name(t), None, "{t}");
+        }
+        assert_eq!(
+            bare_name("Mrs Jo Bloggs 07700 900123").as_deref(),
+            Some("Mrs Jo Bloggs")
+        );
     }
 }

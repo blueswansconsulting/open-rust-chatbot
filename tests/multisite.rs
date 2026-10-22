@@ -2019,3 +2019,59 @@ async fn a_listed_business_number_is_never_the_visitors_even_after_an_offer() {
     // Hayvern's listed number (from the fixture) is not the visitor's.
     assert!(cards(&turn(&mut ws, "is 01204 579975 any good?").await).is_empty());
 }
+
+#[tokio::test]
+async fn qa_m1_declining_the_offer_never_turns_a_number_into_a_card() {
+    for reply in [
+        "No thanks, I found someone on 07700 900456",
+        "My old electrician was 01463 222333 but he retired",
+        "The Inverness council number is 01463 702000",
+    ] {
+        let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+        turn(&mut ws, "Any electricians in Inverness IV1?").await;
+        assert!(cards(&turn(&mut ws, reply).await).is_empty(), "{reply}");
+    }
+}
+
+#[tokio::test]
+async fn qa_m2_a_number_in_the_search_message_itself_is_not_an_answer_to_an_offer() {
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    let frames = turn(
+        &mut ws,
+        "Any electricians near IV1? my current one is 01463 222333 but he's away",
+    )
+    .await;
+    assert!(cards(&frames).is_empty(), "{frames:?}");
+}
+
+#[tokio::test]
+async fn qa_m3_a_new_found_search_or_a_later_topic_drops_the_old_context() {
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    turn(&mut ws, "Any electricians in Inverness IV1?").await;
+    let frames = turn(
+        &mut ws,
+        "Actually, any electricians in Bolton? call me on 07700 900123",
+    )
+    .await;
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1);
+    let message = cards[0]["card"]["lead"]["message"].as_str().unwrap();
+    assert!(!message.contains("IV1"), "{message}");
+
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    turn(&mut ws, "Any electricians in Inverness IV1?").await;
+    turn(&mut ws, "how does the directory work?").await;
+    turn(&mut ws, "what are your opening hours?").await;
+    let frames = turn(&mut ws, "can I get listed? please call me on 07700 900123").await;
+    let message = frames
+        .iter()
+        .find(|f| f["type"] == "card")
+        .map(|c| {
+            c["card"]["lead"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .unwrap_or_default();
+    assert!(!message.contains("IV1"), "{message}");
+}
