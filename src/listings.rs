@@ -322,8 +322,17 @@ const GENERIC_ASK_WORDS: [&str; 16] = [
 ];
 
 /// Words that point back at the service already asked about.
-const BACK_REFERENCES: [&str; 8] = [
-    "else", "too", "also", "that", "those", "same", "them", "well",
+const BACK_REFERENCES: [&str; 10] = [
+    " else ",
+    " too ",
+    " also ",
+    " does that ",
+    " do that ",
+    " that too ",
+    " the same ",
+    " as well ",
+    " those too ",
+    " same again ",
 ];
 
 /// How a no-match lead names what the visitor wanted when they gave no service.
@@ -1184,7 +1193,10 @@ impl Listings {
                         && words
                             .iter()
                             .any(|w| GENERIC_ASK_WORDS.contains(&w.as_str()))
-                        && !words.iter().any(|w| BACK_REFERENCES.contains(&w.as_str()));
+                        && {
+                            let padded = format!(" {} ", words.join(" "));
+                            !BACK_REFERENCES.iter().any(|r| padded.contains(r))
+                        };
                     if f.services.is_empty() && !p.services.is_empty() && !fresh {
                         f.services = p.services;
                         f.inherited = true;
@@ -3730,5 +3742,19 @@ mod tests {
         assert!(!b.contains("No match to offer"), "{b}");
         let b = DEMO.block("Do you list Sparky Steve's Electrics?", "");
         assert!(!b.contains("as alternatives"), "{b}");
+    }
+
+    #[test]
+    fn qa_n3_a_relative_that_or_a_leading_well_still_resets_the_service() {
+        let prev = "emergency electrician in Bolton";
+        for q in [
+            "Any electricians in Oldham that you'd recommend?",
+            "Are there any electricians near IV1 that are open now?",
+            "Well, any electricians in Oldham?",
+            "any electricians in Oldham? that would be great",
+        ] {
+            let m = DEMO.lookup(q, prev);
+            assert!(m.services.is_empty(), "{q}: {m:?}");
+        }
     }
 }

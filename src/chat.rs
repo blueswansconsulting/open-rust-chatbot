@@ -478,15 +478,17 @@ fn name_in_text(text: &str) -> Option<String> {
 /// How many visitor turns after a no-match offer a reply can still answer it.
 const OFFER_TURNS: u8 = 2;
 
-/// Turning down the offer to take their details: "no thanks", "I found someone", "sorted".
+/// Turning down the offer to take their details: "no thanks", "I found someone", "all sorted".
+/// A reply that gives the visitor's own contact details is never a decline.
 static DECLINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\W*(?:no|nah|nope)\b|\bno,?\s+thank|\bfound\s+(?:someone|somebody|one|an?\s)|\bnever\s?mind\b|\bdon'?t\s+bother\b|\bnot\s+(?:now|needed|necessary)\b|\bsorted\b").unwrap()
+    Regex::new(r"(?i)^\W*(?:no|nah|nope)\W*$|\bno,?\s+(?:thanks|thank\s+you|need)\b|\bnah\b.*\b(?:ok|okay|fine|good|alright)\b|\b(?:i'?ve|i\s+have|i|we'?ve|we)\s+(?:already\s+)?found\s+(?:someone|somebody|one)\b|\bnever\s?mind\b|\bdon'?t\s+bother\b|\bnot\s+(?:needed|necessary)\b|\b(?:all|it'?s|i'?m)\s+sorted\b").unwrap()
 });
 
 /// Before a number that is someone else's or not a phone at all, even in reply to the offer:
-/// "my old electrician was …", "the council number is …", "my ref is …".
+/// "my old electrician was …", "the council number is …", "my ref is …". Only right before
+/// the number, so "my number was changed, it's 07700 …" is still theirs.
 static NOT_THEIRS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:was|were|found|ref|reference|council|old|previous|their|his|her|its|landlord\w*|company|office|account|invoice|order)\b[^.?!\n]{0,30}$").unwrap()
+    Regex::new(r"(?i)(?:\b(?:old|previous|former)\s+[\w']+\s+(?:was|is|number\s+(?:was|is))|\b(?:council|office|company|landlord\w*|electrician|sparky|plumber|builder)(?:['\u{2019}]s)?\s+(?:number\s+|no\.?\s+|phone\s+|tel\s+)?(?:is|was|:)|\b(?:ref|reference|account|invoice|order|job)\s*(?:no\.?|number)?\s*(?:is|:)?|\bfound\s+(?:someone|somebody|one|him|her|them)\s+(?:on|at)|\b(?:their|his|her)\s+(?:number|no|phone|mobile)\s*(?:is|was)?)\s*[:-]?\s*$").unwrap()
 });
 
 /// A no-match offer ("I couldn't find a listed electrician near IV1; can I take your details?")
@@ -501,7 +503,10 @@ impl Offer {
     /// Starts a visitor turn: the context of an offer made on an earlier turn that this message
     /// may answer. Offers expire after [`OFFER_TURNS`] turns, and a decline clears them.
     fn begin_turn(&mut self, text: &str) -> Option<String> {
-        if self.turns_left == 0 || DECLINE.is_match(text) {
+        // A decline that still gives their own contact details is accepting ("No worries, Jo
+        // 07700 900123"); "No thanks, I found someone on 07700 …" is not theirs.
+        let own_contact = || fallback_contact_checked(text, &|_| false, true).is_some();
+        if self.turns_left == 0 || (DECLINE.is_match(text) && !own_contact()) {
             self.clear();
             return None;
         }
@@ -539,12 +544,28 @@ fn bare_name(text: &str) -> Option<String> {
         return None;
     }
     let name = name_in_text(&format!("I'm {text}"))?;
-    // Only a real first name ("Jo Bloggs", "Mrs Jo Bloggs"), never "Bolton", "EICR" or "Ok".
-    let first = name.split_whitespace().map(str::to_lowercase).find(|w| {
-        !["mr", "mrs", "ms", "miss", "dr", "mr.", "mrs.", "ms.", "dr."].contains(&w.as_str())
-    })?;
-    (crate::listings::first_name(&first) || WORD_FIRST_NAMES.split_whitespace().any(|n| n == first))
-        .then_some(name)
+    // A known first name ("Jo Bloggs"), a title ("Mr Smith"), or two words that are not
+    // everyday or trade words ("Priya Patel"); never "Bolton", "EICR" or "Ok" alone.
+    let words: Vec<String> = name.split_whitespace().map(str::to_lowercase).collect();
+    const TITLES: [&str; 9] = ["mr", "mrs", "ms", "miss", "dr", "mr.", "mrs.", "ms.", "dr."];
+    const TRADE: [&str; 7] = [
+        "electrical",
+        "electrics",
+        "electric",
+        "ltd",
+        "services",
+        "eicr",
+        "ev",
+    ];
+    if words.iter().any(|w| TRADE.contains(&w.as_str())) {
+        return None;
+    }
+    let titled = TITLES.contains(&words[0].as_str()) && words.len() > 1;
+    let first = words.iter().find(|w| !TITLES.contains(&w.as_str()))?;
+    let known = crate::listings::first_name(first)
+        || WORD_FIRST_NAMES.split_whitespace().any(|n| n == first);
+    let two_names = words.len() >= 2 && !crate::listings::english_word(first);
+    (titled || known || two_names).then_some(name)
 }
 
 /// True if the visitor typed an email address or a phone number.
@@ -2547,5 +2568,62 @@ mod tests {
             bare_name("Mrs Jo Bloggs 07700 900123").as_deref(),
             Some("Mrs Jo Bloggs")
         );
+    }
+
+    #[test]
+    fn qa_n1_accepting_replies_are_never_declines() {
+        let c = "Electrician near IV1 — no listing found";
+        for t in [
+            "No worries, Jo Bloggs 07700 900123",
+            "No problem - Jo 07700 900123",
+            "no, call me on 07700 900123",
+            "Nah it's fine, Jo 07700 900123",
+            "Yes please, get it sorted, Jo 07700 900123",
+            "I found a burning smell, Jo 07700 900123",
+            "No. 5 High St, Jo 07700 900123",
+            "not now, after 5pm tomorrow: Jo 07700 900123",
+        ] {
+            let mut o = Offer::default();
+            o.set(Some(c.into()));
+            assert_eq!(o.begin_turn(t).as_deref(), Some(c), "{t}");
+        }
+        for t in [
+            "get it sorted please",
+            "I found a burning smell",
+            "No problem",
+        ] {
+            assert!(!DECLINE.is_match(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn qa_n2_the_visitors_own_number_still_counts_after_an_offer() {
+        let none = |_: &str| false;
+        for t in [
+            "my number was changed, it's 07700 900123",
+            "my old number is gone, use 07700 900123",
+            "That was quick, Jo Bloggs 07700 900123",
+            "Jo Bloggs, office hours best, 07700 900123",
+            "it's for my landlord's flat, Jo 07700 900123",
+            "Yes please, Jo, my old electrician retired, 07700 900123",
+        ] {
+            assert!(fallback_contact_checked(t, &none, true).is_some(), "{t}");
+        }
+        assert_eq!(
+            fallback_contact_checked("No thanks, I found someone on 07700 900456", &none, true),
+            None
+        );
+    }
+
+    #[test]
+    fn qa_n4_uncommon_names_with_a_surname_or_title_are_kept() {
+        for (t, n) in [
+            ("Priya Patel 07700 900123", "Priya Patel"),
+            ("Rhys Jones 07700 900123", "Rhys Jones"),
+            ("Oluwaseun Adeyemi 07700 900123", "Oluwaseun Adeyemi"),
+        ] {
+            assert_eq!(bare_name(t).as_deref(), Some(n), "{t}");
+        }
+        assert_eq!(bare_name("Hayvern Electrical 07700 900123"), None);
     }
 }
