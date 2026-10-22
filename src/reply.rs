@@ -2,8 +2,9 @@
 //!
 //! - Replies are plain text: Markdown links become `text: url`, and bold, headings, bullets
 //!   and code marks are dropped (the widget shows text as typed).
-//! - Replies only carry links to hosts the bot knows: its own origins, hosts in its knowledge
-//!   base, and its listings' pages. Any other link, a `javascript:`/`data:` URL, a link with
+//! - Replies only carry links the bot knows: its own origins, and the hosts of links in its
+//!   knowledge base and listings (on shared hosts such as bit.ly or docs.google.com, only those
+//!   pages). Any other link, a `javascript:`/`data:` URL, a link with
 //!   userinfo or an IP host becomes "[link removed]".
 //! - Lead fields carry no links, markup, injected `LEAD:` lines or JSON at all.
 
@@ -16,8 +17,8 @@ pub const LINK_REMOVED: &str = "[link removed]";
 /// Top-level domains a bare host ("evil-pay.co.uk", "www.example.com") is recognised by. A
 /// short list, so prose like "e.g." or "approx." is never taken for a link.
 const TLDS: &str = "com|net|org|info|biz|io|co|uk|me|app|dev|xyz|site|online|shop|store|top|\
-click|link|live|life|tech|ai|gov|edu|eu|us|ca|au|nz|ie|de|fr|es|it|nl|ru|cn|tk|ml|ga|cf|gq|pw|cc|\
-tv|ly|gg|je|im|win|bid|loan|work|website|space|pro|club|vip|icu|cyou|sbs|zip|mov|page|cloud|\
+click|link|live|life|tech|ai|gov|edu|eu|us|ca|au|nz|ie|de|fr|es|nl|ru|cn|tk|ml|ga|cf|gq|pw|cc|\
+tv|ly|gg|je|im|win|bid|loan|work|website|space|pro|club|vip|icu|cyou|sbs|page|cloud|\
 services|support|help|email|today|news|ltd|plc|scot|wales|london";
 
 /// Shared suffixes that are never a whole allowed host (so "co.uk" in the knowledge base can't
@@ -26,6 +27,117 @@ const PUBLIC_SUFFIXES: [&str; 14] = [
     "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "gov.uk", "ac.uk", "sch.uk",
     "nhs.uk", "com.au", "co.nz", "co.za", "com.br",
 ];
+
+/// Hosts where anyone can have a page (link shorteners, forms, payment links, social sites,
+/// webmail, free site hosts). A link to one in the knowledge base or listings allows only that
+/// page (and pages under it), never the whole host.
+const SHARED_HOSTS: &[&str] = &[
+    "bit.ly",
+    "tinyurl.com",
+    "t.co",
+    "goo.gl",
+    "ow.ly",
+    "buff.ly",
+    "rebrand.ly",
+    "cutt.ly",
+    "is.gd",
+    "shorturl.at",
+    "tiny.cc",
+    "linktr.ee",
+    "google.com",
+    "google.co.uk",
+    "forms.gle",
+    "g.page",
+    "g.co",
+    "maps.app.goo.gl",
+    "paypal.me",
+    "paypal.com",
+    "stripe.com",
+    "square.site",
+    "sumup.com",
+    "monzo.me",
+    "revolut.me",
+    "gofundme.com",
+    "wa.me",
+    "whatsapp.com",
+    "t.me",
+    "calendly.com",
+    "facebook.com",
+    "fb.com",
+    "fb.me",
+    "m.me",
+    "instagram.com",
+    "linkedin.com",
+    "twitter.com",
+    "x.com",
+    "youtube.com",
+    "youtu.be",
+    "tiktok.com",
+    "pinterest.com",
+    "reddit.com",
+    "github.com",
+    "github.io",
+    "gitlab.io",
+    "netlify.app",
+    "vercel.app",
+    "pages.dev",
+    "workers.dev",
+    "herokuapp.com",
+    "web.app",
+    "firebaseapp.com",
+    "glitch.me",
+    "replit.app",
+    "azurewebsites.net",
+    "amazonaws.com",
+    "cloudfront.net",
+    "wixsite.com",
+    "squarespace.com",
+    "weebly.com",
+    "wordpress.com",
+    "blogspot.com",
+    "carrd.co",
+    "notion.site",
+    "notion.so",
+    "typeform.com",
+    "jotform.com",
+    "surveymonkey.com",
+    "eventbrite.com",
+    "dropbox.com",
+    "1drv.ms",
+    "live.com",
+    "office.com",
+    "sharepoint.com",
+    "box.com",
+    "wetransfer.com",
+    "trustpilot.com",
+    "checkatrade.com",
+    "mybuilder.com",
+    "ratedpeople.com",
+    "yell.com",
+    "bark.com",
+    "nextdoor.com",
+    "gmail.com",
+    "googlemail.com",
+    "outlook.com",
+    "hotmail.com",
+    "hotmail.co.uk",
+    "live.co.uk",
+    "yahoo.com",
+    "yahoo.co.uk",
+    "icloud.com",
+    "me.com",
+    "aol.com",
+    "btinternet.com",
+    "sky.com",
+    "proton.me",
+    "protonmail.com",
+];
+
+fn shared_host(host: &str) -> bool {
+    SHARED_HOSTS
+        .iter()
+        .any(|s| host == *s || host.strip_suffix(s).is_some_and(|p| p.ends_with('.')))
+}
 
 /// Anything that can be a link: a URL with a scheme (any scheme, so `xhttps://` and
 /// `HTTPS://` count), a script-like scheme without slashes, an email address, or a bare host
@@ -75,10 +187,13 @@ pub fn is_invisible(c: char) -> bool {
     )
 }
 
-/// Which link hosts a reply may carry.
+/// Which links a reply may carry.
 #[derive(Clone, Debug, Default)]
 pub struct LinkPolicy {
+    /// Hosts allowed with all their pages and subdomains.
     hosts: Arc<HashSet<String>>,
+    /// Pages on shared hosts, as `host/path`: allowed with the pages under them.
+    pages: Arc<Vec<String>>,
     /// Email addresses the visitor typed, which a reply may repeat back to them.
     emails: HashSet<String>,
 }
@@ -89,9 +204,10 @@ fn normal_host(host: &str) -> String {
     host.strip_prefix("www.").map(str::to_owned).unwrap_or(host)
 }
 
-/// The host of a matched link, if it has one that may be allowed (http(s) URLs without
-/// userinfo or an IP address, emails and bare hosts). None means the link is never allowed.
-fn link_host(caps: &Captures) -> Option<String> {
+/// Where a matched link goes, if it can be allowed at all: (host, path without a trailing
+/// `/`), for http(s) URLs without userinfo or an IP address, emails (no path) and bare hosts.
+/// None means the link is never allowed.
+fn link_target(caps: &Captures) -> Option<(String, String)> {
     if let Some(url) = caps.name("url") {
         let raw = trim_trailing_punctuation(url.as_str());
         let parsed = reqwest::Url::parse(raw).ok()?;
@@ -102,15 +218,27 @@ fn link_host(caps: &Captures) -> Option<String> {
             return None;
         }
         // `domain()` is None for IP addresses.
-        return parsed.domain().map(normal_host);
+        let host = normal_host(parsed.domain()?);
+        return Some((host, parsed.path().trim_end_matches('/').to_owned()));
     }
     if let Some(domain) = caps.name("edomain") {
-        return Some(normal_host(domain.as_str()));
+        return Some((normal_host(domain.as_str()), String::new()));
     }
     if let Some(host) = caps.name("host") {
-        let host = host.as_str();
-        let end = host.find(['/', ':', '?', '#']).unwrap_or(host.len());
-        return Some(normal_host(&host[..end]));
+        let text = trim_trailing_punctuation(host.as_str());
+        // A URL inside a bare host's path ("good.example/x?https://evil.example") is a link of
+        // its own to the widget: never allowed.
+        if text.to_ascii_lowercase().contains("://") {
+            return None;
+        }
+        let end = text.find(['/', ':', '?', '#']).unwrap_or(text.len());
+        let path_end = text.find(['?', '#']).unwrap_or(text.len()).max(end);
+        let path = if text[end..].starts_with('/') {
+            text[end..path_end].trim_end_matches('/')
+        } else {
+            ""
+        };
+        return Some((normal_host(&text[..end]), path.to_owned()));
     }
     None
 }
@@ -121,42 +249,69 @@ fn trim_trailing_punctuation(s: &str) -> &str {
 }
 
 impl LinkPolicy {
-    /// Allows `hosts` (as hosts or origins) and their subdomains.
-    pub fn new<I, S>(hosts: I) -> Self
+    /// Allows each of `allowed`: an origin or URL (`https://example.com`) or a host
+    /// (`example.com`) with all its pages and subdomains, or a `host/path` page (from
+    /// [`LinkPolicy::allowed_in`]) with the pages under it.
+    pub fn new<I, S>(allowed: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let hosts = hosts
-            .into_iter()
-            .filter_map(|h| {
-                let h = h.as_ref().trim();
-                // An origin or URL gives its host; a bare host is taken as it is.
-                let host = if h.contains("://") {
-                    reqwest::Url::parse(h).ok()?.domain()?.to_owned()
-                } else {
-                    h.to_owned()
-                };
-                let host = normal_host(&host);
-                (host.contains('.') && !PUBLIC_SUFFIXES.contains(&host.as_str())).then_some(host)
-            })
-            .collect();
+        let mut hosts = HashSet::new();
+        let mut pages = Vec::new();
+        for entry in allowed {
+            let entry = entry.as_ref().trim();
+            if entry.contains("://") {
+                if let Some(d) = reqwest::Url::parse(entry)
+                    .ok()
+                    .and_then(|u| u.domain().map(normal_host))
+                {
+                    hosts.insert(d);
+                }
+            } else if let Some((host, path)) = entry.split_once('/') {
+                let path = path.trim_end_matches('/');
+                if !path.is_empty() {
+                    pages.push(format!("{}/{path}", normal_host(host)));
+                }
+            } else {
+                hosts.insert(normal_host(entry));
+            }
+        }
+        hosts.retain(|h| h.contains('.') && !PUBLIC_SUFFIXES.contains(&h.as_str()));
+        pages.sort();
+        pages.dedup();
         Self {
             hosts: Arc::new(hosts),
+            pages: Arc::new(pages),
             emails: HashSet::new(),
         }
     }
 
-    /// Every link host in `texts` (http(s) URLs, emails and bare hosts).
-    pub fn hosts_in<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    /// What the links in `texts` allow (for [`LinkPolicy::new`]): the host of each http(s) URL,
+    /// email and `www.` host, or on a shared host ([`SHARED_HOSTS`]) only that page. Bare hosts
+    /// without `www.` ("prices.zip") are prose more often than links, so they allow nothing.
+    pub fn allowed_in<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
         let mut out = Vec::new();
         for text in texts {
             for caps in LINK.captures_iter(text) {
-                if let Some(host) = link_host(&caps) {
+                if caps
+                    .name("host")
+                    .is_some_and(|h| !h.as_str().to_ascii_lowercase().starts_with("www."))
+                {
+                    continue;
+                }
+                let Some((host, path)) = link_target(&caps) else {
+                    continue;
+                };
+                if !shared_host(&host) {
                     out.push(host);
+                } else if caps.name("email").is_none() && !path.is_empty() {
+                    out.push(format!("{host}{path}"));
                 }
             }
         }
+        out.sort();
+        out.dedup();
         out
     }
 
@@ -186,7 +341,19 @@ impl LinkPolicy {
         {
             return true;
         }
-        link_host(caps).is_some_and(|h| self.allows_host(&h))
+        let Some((host, path)) = link_target(caps) else {
+            return false;
+        };
+        if self.allows_host(&host) {
+            return true;
+        }
+        let page = format!("{host}{path}");
+        self.pages.iter().any(|p| {
+            page == *p
+                || page
+                    .strip_prefix(p.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
     }
 }
 
@@ -218,14 +385,17 @@ pub fn filter_links(text: &str, policy: &LinkPolicy) -> String {
     out
 }
 
+/// True if `c` stays in a reply: not invisible, not a code mark, and no control character but
+/// a line break or tab.
+fn kept_in_reply(c: char) -> bool {
+    !is_invisible(c) && c != '`' && (!c.is_control() || c == '\n' || c == '\t')
+}
+
 /// A reply as plain text: Markdown links become `text: url`, and headings, bold, bullets and
 /// code marks are dropped. `at_line_start` says whether `text` starts a line (it may be a
 /// piece of a streamed reply).
 pub fn plain_text(text: &str, at_line_start: bool) -> String {
-    let text: String = text
-        .chars()
-        .filter(|&c| !is_invisible(c) && c != '`' && (!c.is_control() || c == '\n' || c == '\t'))
-        .collect();
+    let text: String = text.chars().filter(|&c| kept_in_reply(c)).collect();
     let text = MD_LINK.replace_all(&text, |c: &Captures| {
         let label = c[1].trim().trim_matches('*').trim();
         let url = c[2].trim();
@@ -259,7 +429,12 @@ pub fn plain_text(text: &str, at_line_start: bool) -> String {
             }
             let before = i.checked_sub(1).map(|j| chars[j]);
             let after = chars.get(i + 1).copied();
-            before.is_none_or(char::is_whitespace) && after.is_none_or(char::is_whitespace)
+            // "5*3" and "5 * 3" keep theirs.
+            let digit_or_space =
+                |c: Option<char>| c.is_none_or(|c| c.is_whitespace() || c.is_ascii_digit());
+            (before.is_none_or(char::is_whitespace) && after.is_none_or(char::is_whitespace))
+                || (before.is_some_and(|c| c.is_ascii_digit()) && digit_or_space(after))
+                || (after.is_some_and(|c| c.is_ascii_digit()) && digit_or_space(before))
         })
         .map(|(_, c)| *c)
         .collect()
@@ -290,7 +465,10 @@ impl<'a> ReplyFilter<'a> {
 
     /// Adds streamed text; returns what can be shown now (may be empty).
     pub fn push(&mut self, chunk: &str) -> String {
-        self.pending.push_str(chunk);
+        // Characters cleaning drops go first, so text is only ever cut at whitespace that is
+        // still there when shown (a dropped "\r" would let two pieces join into one link).
+        self.pending
+            .extend(chunk.chars().filter(|&c| kept_in_reply(c)));
         let cut = self.safe_cut();
         if cut == 0 {
             return String::new();
@@ -347,12 +525,7 @@ fn drop_json(text: &str) -> String {
     let mut rest = text;
     while let Some(i) = rest.find(['{', '[']) {
         let after = rest[i + 1..].trim_start();
-        let json_like = rest[i..].starts_with('{')
-            || after.starts_with(['{', '[', '"', ']', '-'])
-            || after.starts_with(|c: char| c.is_ascii_digit())
-            || ["true", "false", "null"]
-                .iter()
-                .any(|w| after.starts_with(w));
+        let json_like = rest[i..].starts_with('{') || after.starts_with(['{', '[', '"', ']']);
         if !json_like {
             out.push_str(&rest[..i + 1]);
             rest = &rest[i + 1..];
@@ -508,7 +681,7 @@ mod tests {
 
     #[test]
     fn redteam_30_hosts_come_from_texts_but_never_a_bare_public_suffix() {
-        let hosts = LinkPolicy::hosts_in([
+        let hosts = LinkPolicy::allowed_in([
             "See [our page](https://www.example-electric.co.uk/eicr) or email jo@sparks.example.org.",
             "Any .co.uk address, or co.uk alone, or http://10.0.0.1/",
         ]);
@@ -645,6 +818,92 @@ mod tests {
         assert_eq!(
             clean_reply("https://evil\u{200B}.example.com", &site_policy(), true),
             "[link removed]"
+        );
+    }
+
+    #[test]
+    fn qa_h1_an_allowed_bare_host_never_carries_another_url() {
+        let p = site_policy();
+        for input in [
+            "electriciansranked.co.uk/x?https://evil.pl/pay",
+            "d.example.com:https://evil.com",
+            "www.electriciansranked.co.uk#https://evil.com",
+            "electriciansranked.co.uk/HTTPS://evil.com",
+        ] {
+            assert_eq!(filter_links(input, &p), LINK_REMOVED, "{input}");
+        }
+        assert_eq!(
+            filter_links("electriciansranked.co.uk/bolton", &p),
+            "electriciansranked.co.uk/bolton"
+        );
+    }
+
+    #[test]
+    fn qa_h2_text_is_never_cut_at_whitespace_that_cleaning_drops() {
+        for chunks in [
+            ["see https://electriciansranked.co.uk\r", ".evil.pl/pay now"],
+            [
+                "see https://electriciansranked.co.uk\u{0B}.evil.pl/pay",
+                " now",
+            ],
+            [
+                "see https://electriciansranked.co.uk\u{85}",
+                ".evil.pl/pay now",
+            ],
+            [
+                "see https://electriciansranked.co.uk\u{0C}",
+                ".evil.pl/pay now",
+            ],
+        ] {
+            let out = stream(&chunks);
+            assert!(!out.contains("evil"), "{chunks:?} -> {out}");
+        }
+    }
+
+    #[test]
+    fn qa_m1_a_page_on_a_shared_host_allows_only_that_page() {
+        let allowed = LinkPolicy::allowed_in([
+            "Pay at https://paypal.me/biz, book at https://calendly.com/sparks/visit, \
+             short link https://bit.ly/abc, form https://docs.google.com/forms/d/X/viewform, \
+             or email sparks@gmail.com. Find us on https://facebook.com",
+        ]);
+        let p = LinkPolicy::new(allowed);
+        for ok in [
+            "https://paypal.me/biz",
+            "https://paypal.me/biz/10",
+            "https://calendly.com/sparks/visit",
+            "https://bit.ly/abc",
+            "https://docs.google.com/forms/d/X/viewform",
+        ] {
+            assert_eq!(filter_links(ok, &p), ok);
+        }
+        for bad in [
+            "https://paypal.me/attacker",
+            "https://paypal.me/bizattacker",
+            "https://bit.ly/evil",
+            "https://docs.google.com/forms/d/EVIL/viewform",
+            "https://facebook.com/evil",
+            "https://gmail.com",
+            "https://calendly.com/attacker",
+        ] {
+            assert_eq!(filter_links(bad, &p), LINK_REMOVED, "{bad}");
+        }
+    }
+
+    #[test]
+    fn qa_l1_l2_prose_is_left_alone_and_never_allows_hosts() {
+        let p = site_policy();
+        for prose in ["5*3 = 15", "Done.It works", "the file.zip", "e.g. 2.5mm"] {
+            assert_eq!(clean_reply(prose, &p, true), prose);
+        }
+        assert_eq!(
+            lead_text("rewire [2 bed] house", 300),
+            "rewire [2 bed] house"
+        );
+        assert!(LinkPolicy::allowed_in(["prices.zip and example.org"]).is_empty());
+        assert_eq!(
+            LinkPolicy::allowed_in(["see www.example.org/x"]),
+            vec!["example.org".to_owned()]
         );
     }
 }

@@ -488,7 +488,7 @@ pub struct Listings {
     name_starts: HashMap<Box<str>, Vec<u32>>,
     /// Listings with neither an outcode nor a located place: never in a postcode list.
     unlocated: u32,
-    /// Hosts of the profile and hub pages, the links a reply may carry.
+    /// What the profile and hub pages allow a reply to carry (see `LinkPolicy::allowed_in`).
     link_hosts: Vec<String>,
 }
 
@@ -990,7 +990,7 @@ impl Listings {
         }
         name_starts.shrink_to_fit();
         place_phrases.shrink_to_fit();
-        let mut link_hosts = crate::reply::LinkPolicy::hosts_in(
+        let mut link_hosts = crate::reply::LinkPolicy::allowed_in(
             listings
                 .iter()
                 .filter_map(|l| l.profile_url.as_deref())
@@ -1014,7 +1014,7 @@ impl Listings {
         })
     }
 
-    /// Hosts of the listings' profile and hub pages.
+    /// What the listings' profile and hub pages allow (hosts, or pages on shared hosts).
     pub fn link_hosts(&self) -> &[String] {
         &self.link_hosts
     }

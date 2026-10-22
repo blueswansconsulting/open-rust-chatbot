@@ -14,7 +14,7 @@ pub struct KnowledgeBase {
     chunks: Vec<KnowledgeChunk>,
     /// Inverse document frequency per token: rare words (place names, "eicr") count for more.
     idf: std::collections::HashMap<String, f64>,
-    /// Hosts of the links and emails in the text, the links a reply may carry.
+    /// What the links and emails in the text allow a reply to carry (see `LinkPolicy::allowed_in`).
     link_hosts: Vec<String>,
 }
 
@@ -211,7 +211,7 @@ impl KnowledgeBase {
             .map(|(t, d)| (t, (1.0 + n / d as f64).ln()))
             .collect();
         let mut link_hosts =
-            crate::reply::LinkPolicy::hosts_in(chunks.iter().map(|c| c.text.as_str()));
+            crate::reply::LinkPolicy::allowed_in(chunks.iter().map(|c| c.text.as_str()));
         link_hosts.sort();
         link_hosts.dedup();
         Self {
@@ -221,7 +221,7 @@ impl KnowledgeBase {
         }
     }
 
-    /// Hosts of the links and emails in the knowledge base.
+    /// What the links and emails in the knowledge base allow (hosts, or pages on shared hosts).
     pub fn link_hosts(&self) -> &[String] {
         &self.link_hosts
     }

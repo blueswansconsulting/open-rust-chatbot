@@ -816,23 +816,33 @@ fn lead_message(text: &str) -> String {
 /// Added to a reply when the server shows a lead card with it.
 pub const CARD_NOTE: &str = "Check the details below and press Confirm to send them to the team.";
 
-/// A question asking for contact details the card already has ("What's your name?", "Can I take
-/// a number to call you on?").
-static ASKS_FOR_DETAILS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:name|number|phone|mobile|e-?mail|contact|details|best time|reach you|call you|ring you|get back to you|get in touch)\b").unwrap()
+/// A sentence about the visitor's contact details ("What's your name?", "Can I take a number
+/// to call you on?"), not "the number of bedrooms".
+static ABOUT_DETAILS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:your|a|an)\s+(?:full\s+|first\s+|contact\s+|phone\s+|mobile\s+|best\s+)?(?:name|number|phone|mobile|e-?mail|email address|contact details|details)\b|\b(?:reach|call|ring|text|contact|email)\s+you\b|\bbest time\b|\bget back to you\b").unwrap()
+});
+/// A sentence that asks for something without a question mark ("Please give me your name").
+static ASKS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:give|send|share|tell|provide|leave|type|need|let me (?:know|have)|i'?ll need|can i (?:get|take|have)|could i (?:get|take|have)|may i (?:get|take|have))\b").unwrap()
 });
 
 /// The reply shown with a lead card: without questions asking for details the card already
 /// has, and ending with [`CARD_NOTE`] (unless it already points at the card).
 fn with_card_note(reply: &str) -> String {
-    static SENTENCE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"[^.!?\n]*(?:[.!?]+[\s]*|\n+|$)").unwrap());
-    let kept: String = SENTENCE
-        .find_iter(reply)
-        .map(|m| m.as_str())
+    // Sentences end at . ! ? followed by whitespace or the end ("5.30pm" is one word).
+    static END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[.!?]+(?:\s+|$)|\n+").unwrap());
+    let mut sentences = Vec::new();
+    let mut from = 0;
+    for m in END.find_iter(reply) {
+        sentences.push(&reply[from..m.end()]);
+        from = m.end();
+    }
+    sentences.push(&reply[from..]);
+    let kept: String = sentences
+        .into_iter()
         .filter(|s| {
             let s = s.trim();
-            !(s.ends_with('?') && ASKS_FOR_DETAILS.is_match(s))
+            !(ABOUT_DETAILS.is_match(s) && (s.ends_with('?') || ASKS.is_match(s)))
         })
         .collect();
     let kept = kept.trim();
@@ -1316,7 +1326,8 @@ impl ChatSession {
             let mut rest = filter.finish();
             // The widget joins every hop's text into one message: end this hop's text with a
             // line break so it can never run into the next hop's (and form a new link).
-            if !calls.is_empty() && !rest.is_empty() && !rest.ends_with(char::is_whitespace) {
+            let last = rest.chars().last().or_else(|| reply.chars().last());
+            if !calls.is_empty() && last.is_some_and(|c| !c.is_whitespace()) {
                 rest.push('\n');
             }
             if !rest.is_empty() {
@@ -1395,6 +1406,11 @@ impl ChatSession {
                 raw.push_str(&value);
             }
         }
+        // Invisible characters go first, so they can't hide a lead marker ("LE\u{200B}AD:").
+        let raw: String = raw
+            .chars()
+            .filter(|&c| !crate::reply::is_invisible(c))
+            .collect();
         let (reply, lead_args) = split_lead_line(&raw);
         let reply = crate::reply::clean_reply(&reply, &self.link_policy(text), true);
 
@@ -2796,5 +2812,26 @@ mod tests {
             lead.message.as_deref(),
             Some("Please call me back about a new socket in Bolton.")
         );
+    }
+
+    #[test]
+    fn qa_m3_card_note_keeps_times_and_other_questions_and_drops_requests() {
+        for (reply, want) in [
+            ("Is 5.30pm a good time to call you?", CARD_NOTE.to_owned()),
+            (
+                "Got it. What's the number of bedrooms?",
+                format!("Got it. What's the number of bedrooms? {CARD_NOTE}"),
+            ),
+            (
+                "Please give me your name and number so I can pass it on.",
+                CARD_NOTE.to_owned(),
+            ),
+            (
+                "A rewire costs about £3.5k. What's your name?",
+                format!("A rewire costs about £3.5k. {CARD_NOTE}"),
+            ),
+        ] {
+            assert_eq!(with_card_note(reply), want, "{reply}");
+        }
     }
 }

@@ -2180,3 +2180,15 @@ async fn redteam_28_one_visitor_hits_their_own_limit_and_the_bot_stays_available
         "the bot is still available to everyone else"
     );
 }
+
+#[tokio::test]
+async fn qa_l4_a_lead_marker_hidden_by_zero_width_characters_is_still_hidden() {
+    let (h, _prompts) = start_text_only(
+        "Sure.\nLE\u{200B}AD: {\"name\":\"Sam\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Rewire\"}",
+    )
+    .await;
+    let frames = ask_frames(&h.addr, LIVE_QUESTION).await;
+    let text = text_of(&frames);
+    assert!(!text.contains("LEAD") && !text.contains('{'), "{text}");
+    assert_eq!(cards(&frames).len(), 1);
+}

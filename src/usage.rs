@@ -15,7 +15,7 @@ use crate::sites::{Site, SpendCaps};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 const HOUR: u64 = 3600;
 const DAY: u64 = 86_400;
@@ -137,10 +137,14 @@ pub fn hour_iso(hour_start: u64) -> String {
         .to_string()
 }
 
-/// A visitor key (an IP address or /64) for logs: a short one-way hash, never the address.
+/// A visitor key (an IP address or /64) for logs: a short keyed hash, never the address. The
+/// key is random per process, so the hash can't be reversed by hashing every address.
 fn visitor_hash(visitor: &str) -> String {
-    use sha2::Digest;
-    hex::encode(&sha2::Sha256::digest(visitor.as_bytes())[..6])
+    use hmac::{Hmac, KeyInit, Mac};
+    static KEY: LazyLock<String> = LazyLock::new(crate::random_token);
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(KEY.as_bytes()).expect("any key length");
+    mac.update(visitor.as_bytes());
+    hex::encode(&mac.finalize().into_bytes()[..6])
 }
 
 pub fn unix_now() -> u64 {
