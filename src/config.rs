@@ -384,7 +384,8 @@ impl Config {
                     errors.push(format!(
                         "LLM_PROVIDER {other:?} is not supported (use openai, nvidia or openclaw)"
                     ));
-                    openai_config(&env, &mut errors)
+                    // Startup fails anyway; don't add the generic provider's errors to it.
+                    openai_config(&env, &mut Vec::new())
                 }
             }
         };
@@ -572,7 +573,9 @@ fn valid_api_base_url(url: &str) -> bool {
     };
     let host = rest.split('/').next().unwrap_or_default();
     !host.is_empty()
-        && !url.contains(['@', '?', '#', ' ', '\\'])
+        && !host.starts_with(':')
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+        && !url.contains(['@', '?', '#', '\\'])
         && (scheme == "https" || is_local(&format!("http://{host}")))
 }
 
@@ -855,6 +858,8 @@ mod tests {
             "https://",
             "https://user:pw@evil.example/v1",
             "https://nim.example/v1?x=1",
+            "https://:443/v1",
+            "https://nim.example/v\t1",
         ] {
             let err = nvidia(&[("NVIDIA_BASE_URL", bad)]).unwrap_err();
             assert!(
@@ -892,7 +897,16 @@ mod tests {
             ("LLM_API_KEY", "k"),
         ])
         .unwrap_err();
+        assert_eq!(err.0.len(), 1, "{err}");
         assert!(err.0[0].contains("LLM_PROVIDER"), "{err}");
+        assert!(Config::from_pairs(&[
+            ("ALLOWED_ORIGINS", "https://a.example"),
+            ("LLM_PROVIDER", "nvidai"),
+        ])
+        .unwrap_err()
+        .0
+        .iter()
+        .all(|e| !e.contains("LLM_API_KEY")));
         for ok in ["openai", "OpenAI", "nvidia"] {
             assert!(
                 Config::from_pairs(&[

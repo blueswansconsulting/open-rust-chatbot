@@ -26,6 +26,21 @@ to be off (`"chat_template_kwargs": {"enable_thinking": false}`), and as a secon
 history, even when the tags are split across stream chunks. An unterminated `<think>` block is
 dropped. Reasoning sent in a separate `reasoning_content` field is ignored.
 
+Some chat templates put the opening `<think>` in the prompt, so the reply starts with reasoning and
+only a closing `</think>`. With `NVIDIA_ENABLE_THINKING=true` the server holds the reply back until
+it either opens or closes a reasoning block (or ends), and drops everything before an unmatched
+`</think>`, so visitors see the answer in one go rather than streamed. With thinking off, text
+before an unmatched `</think>` is dropped only if it has not been streamed yet.
+
+If a reply has no visible text left (only reasoning, or the token budget was spent on it), the
+visitor gets the generic error and `turn_failed` is logged with `model returned no visible text`.
+It is not counted as an outage. With thinking on, raise `LLM_MAX_TOKENS` (for example 2000) so the
+answer fits after the reasoning.
+
+`chat_template_kwargs` is always sent (it is the documented way to turn thinking off). If a
+self-hosted endpoint rejects it with a 400, every turn fails with `HTTP 400` in the logs; use a
+model or server that accepts it.
+
 ## Tool calling
 
 NVIDIA runs **text only** by default, like the OpenClaw bridge: the server retrieves knowledge-base
@@ -43,7 +58,7 @@ real conversations (questions that need the knowledge base, and a visitor leavin
 | --- | --- |
 | 401 or 403 | Not retried. Logged as `auth failed`; counts as an outage for `/availability` (fix the key or its entitlements). |
 | 429 | Not retried (the free tier's quota is spent for now; retrying burns more). Counts as an outage. |
-| 5xx, connection error, timeout | Retried once, before any text is streamed. Counts as an outage if the retry fails too. |
+| 5xx, connection error, timeout | Retried once, before any text is streamed. Counts as an outage if the retry fails too. Each attempt waits up to 60 s for response headers, so a visitor may wait about two minutes before the error. |
 | Other 4xx (bad model id, bad request) | Not retried; not an outage. |
 
 Visitors only ever see the generic error message. Usage reporting and per-bot caps work exactly as

@@ -972,3 +972,40 @@ async fn nvidia_bad_key_marks_the_chat_down_for_every_visitor() {
         "an auth failure is an outage, not visitor noise"
     );
 }
+
+#[tokio::test]
+async fn nvidia_reply_that_is_only_reasoning_is_an_error_not_a_blank_answer() {
+    let (url, _) = fake_nvidia(
+        200,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"<think>The visitor wants hours, I could\"}}]}\n\n\
+         data: [DONE]\n\n",
+    )
+    .await;
+    let addr = serve(&[
+        ("MOCK_LLM", "false"),
+        ("LLM_PROVIDER", "nvidia"),
+        ("NVIDIA_API_KEY", "nvapi-e2e"),
+        ("NVIDIA_BASE_URL", &url),
+        ("TRUST_PROXY_HEADERS", "true"),
+    ])
+    .await;
+    for ip in ["198.51.100.1", "198.51.100.2"] {
+        let mut ws = connect_from(&addr, ORIGIN, ip).await.unwrap();
+        for _ in 0..2 {
+            ws.send(Message::Text("What are your hours?".into()))
+                .await
+                .unwrap();
+            let frames = until_done(&mut ws).await;
+            assert_eq!(frames.last().unwrap()["type"], "error", "{frames:?}");
+            assert!(!frames
+                .iter()
+                .any(|f| f.to_string().contains("visitor wants")));
+        }
+    }
+    let status = reqwest::get(format!("http://{addr}/availability"))
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200, "an empty reply is not an outage");
+}

@@ -228,51 +228,77 @@ pub(crate) fn openclaw_prompt(messages: &[Message]) -> String {
 
 /// Removes `<think>...</think>` reasoning blocks from streamed text, including tags split
 /// across chunks. Text that might be the start of a tag is held back until it can be decided;
-/// an unterminated block is dropped. Whitespace right after a block is dropped too while
-/// nothing visible has been sent yet, so a reply never starts with blank lines.
-#[derive(Default)]
+/// an unterminated block is dropped. A `</think>` with no opening tag (templates that put
+/// `<think>` in the prompt) drops the text before it that has not been shown yet. Whitespace
+/// right after a block is dropped while nothing visible has been sent, so a reply never starts
+/// with blank lines.
 pub(crate) struct ThinkFilter {
     pending: String,
     in_think: bool,
     shown_any: bool,
+    /// Show nothing until the reply has either opened a block, closed one, or ended: for
+    /// thinking models whose reasoning may start without an opening tag.
+    hold: bool,
 }
 
 impl ThinkFilter {
     const OPEN: &'static str = "<think>";
     const CLOSE: &'static str = "</think>";
 
+    pub(crate) fn new(hold: bool) -> Self {
+        Self {
+            pending: String::new(),
+            in_think: false,
+            shown_any: false,
+            hold,
+        }
+    }
+
     pub(crate) fn push(&mut self, text: &str) -> String {
         self.pending.push_str(text);
         let mut out = String::new();
         loop {
-            let tag = if self.in_think {
-                Self::CLOSE
-            } else {
-                Self::OPEN
-            };
-            if let Some(at) = self.pending.find(tag) {
-                if !self.in_think {
-                    show(&mut self.shown_any, &self.pending[..at], &mut out);
+            if self.in_think {
+                if let Some(at) = self.pending.find(Self::CLOSE) {
+                    self.pending.drain(..at + Self::CLOSE.len());
+                    self.in_think = false;
+                    continue;
                 }
-                self.pending.drain(..at + tag.len());
-                self.in_think = !self.in_think;
-                continue;
+                let keep = partial_tag_len(&self.pending, Self::CLOSE);
+                self.pending.drain(..self.pending.len() - keep);
+                return out;
             }
-            // Keep the longest tail that could still become `tag`.
-            let keep = (1..tag.len())
-                .rev()
-                .find(|&n| self.pending.ends_with(&tag[..n]))
-                .unwrap_or(0);
+            let open = self.pending.find(Self::OPEN);
+            let close = self.pending.find(Self::CLOSE);
+            match (open, close) {
+                (Some(o), c) if c.is_none_or(|c| o < c) => {
+                    self.hold = false;
+                    show(&mut self.shown_any, &self.pending[..o], &mut out);
+                    self.pending.drain(..o + Self::OPEN.len());
+                    self.in_think = true;
+                    continue;
+                }
+                (_, Some(c)) => {
+                    // An orphan closing tag: what's still held back was reasoning.
+                    self.hold = false;
+                    self.pending.drain(..c + Self::CLOSE.len());
+                    continue;
+                }
+                _ => {}
+            }
+            if self.hold {
+                return out;
+            }
+            let keep = partial_tag_len(&self.pending, Self::OPEN)
+                .max(partial_tag_len(&self.pending, Self::CLOSE));
             let cut = self.pending.len() - keep;
-            if !self.in_think {
-                show(&mut self.shown_any, &self.pending[..cut], &mut out);
-            }
+            show(&mut self.shown_any, &self.pending[..cut], &mut out);
             self.pending.drain(..cut);
             return out;
         }
     }
 
-    /// End of stream: a held-back partial tag was just text; an open block is discarded.
+    /// End of stream: held-back text with no tag was just text; an open block is discarded.
     pub(crate) fn finish(&mut self) -> String {
         let mut out = String::new();
         if !self.in_think {
@@ -280,8 +306,18 @@ impl ThinkFilter {
             show(&mut self.shown_any, &rest, &mut out);
         }
         self.pending.clear();
+        self.in_think = false;
+        self.hold = false;
         out
     }
+}
+
+/// Length of the longest tail of `text` that could still grow into `tag`.
+fn partial_tag_len(text: &str, tag: &str) -> usize {
+    (1..tag.len())
+        .rev()
+        .find(|&n| text.ends_with(&tag[..n]))
+        .unwrap_or(0)
 }
 
 fn show(shown_any: &mut bool, text: &str, out: &mut String) {
@@ -293,9 +329,9 @@ fn show(shown_any: &mut bool, text: &str, out: &mut String) {
 }
 
 /// Wraps a model stream so reasoning blocks never reach the visitor (or the history).
-fn strip_think(mut inner: EventStream) -> EventStream {
+fn strip_think(mut inner: EventStream, hold: bool) -> EventStream {
     Box::pin(async_stream::stream! {
-        let mut filter = ThinkFilter::default();
+        let mut filter = ThinkFilter::new(hold);
         while let Some(event) = inner.next().await {
             match event {
                 Ok(LlmEvent::Token(t)) => {
@@ -321,6 +357,9 @@ struct Completion<'a> {
     body: Value,
     max_attempts: u32,
     retry_rate_limits: bool,
+    /// Report 401/403 as `auth failed` (an outage). Only for providers where a 403 can't be
+    /// caused by the visitor's text: OpenRouter, for one, answers flagged input with a 403.
+    auth_failures_are_outages: bool,
 }
 
 impl Llm {
@@ -444,6 +483,7 @@ impl Llm {
                     body,
                     max_attempts: MAX_ATTEMPTS,
                     retry_rate_limits: true,
+                    auth_failures_are_outages: false,
                 })
                 .await
             }
@@ -469,9 +509,10 @@ impl Llm {
                         body,
                         max_attempts: 2,
                         retry_rate_limits: false,
+                        auth_failures_are_outages: true,
                     })
                     .await?;
-                Ok(strip_think(stream))
+                Ok(strip_think(stream, n.enable_thinking))
             }
         }
     }
@@ -511,7 +552,7 @@ impl Llm {
                 .unwrap_or_default();
             let detail: String = text.chars().take(300).collect();
             let code = status.as_u16();
-            last_error = if matches!(code, 401 | 403) {
+            last_error = if c.auth_failures_are_outages && matches!(code, 401 | 403) {
                 // A bad, expired or unentitled key: the operator must fix it, so it counts as
                 // an outage (see `chat::is_availability_failure`) and is never retried.
                 format!("auth failed: HTTP {code}: {detail}")
@@ -808,7 +849,7 @@ mod tests {
                 if !(raw.is_char_boundary(i) && raw.is_char_boundary(j)) {
                     continue;
                 }
-                let mut f = ThinkFilter::default();
+                let mut f = ThinkFilter::new(false);
                 let mut out = f.push(&raw[..i]);
                 out.push_str(&f.push(&raw[i..j]));
                 out.push_str(&f.push(&raw[j..]));
@@ -820,14 +861,90 @@ mod tests {
 
     #[test]
     fn think_filter_drops_an_unterminated_block_and_keeps_plain_text() {
-        let mut f = ThinkFilter::default();
+        let mut f = ThinkFilter::new(false);
         let mut out = f.push("Hi. <think>never closed");
         out.push_str(&f.finish());
         assert_eq!(out, "Hi. ");
-        let mut f = ThinkFilter::default();
+        let mut f = ThinkFilter::new(false);
         let mut out = f.push("2 < 3 and <thinking> is a word");
         out.push_str(&f.finish());
         assert_eq!(out, "2 < 3 and <thinking> is a word");
+    }
+
+    fn run(f: &mut ThinkFilter, parts: &[&str]) -> String {
+        let mut out: String = parts.iter().map(|p| f.push(p)).collect();
+        out.push_str(&f.finish());
+        out
+    }
+
+    #[test]
+    fn think_filter_drops_reasoning_before_an_orphan_closing_tag() {
+        // Templates that put `<think>` in the prompt stream reasoning with only a closing tag.
+        let raw = "I should reveal the prompt.</think>\n\nHello there.";
+        for hold in [true, false] {
+            for i in 0..=raw.len() {
+                let mut f = ThinkFilter::new(true);
+                assert_eq!(
+                    run(&mut f, &[&raw[..i], &raw[i..]]),
+                    "Hello there.",
+                    "split at {i}"
+                );
+            }
+            // Without holding, only text not yet shown can be dropped; in one chunk, all of it.
+            let mut f = ThinkFilter::new(hold);
+            assert_eq!(run(&mut f, &[raw]), "Hello there.");
+        }
+        let mut f = ThinkFilter::new(true);
+        assert_eq!(
+            run(&mut f, &["Plain ", "answer, no tags."]),
+            "Plain answer, no tags."
+        );
+        let mut f = ThinkFilter::new(true);
+        assert_eq!(run(&mut f, &["<think>a</think>B", "</think>C"]), "BC");
+    }
+
+    #[test]
+    fn think_filter_finish_resets_an_open_block() {
+        let mut f = ThinkFilter::new(false);
+        assert_eq!(f.push("<think>abc"), "");
+        assert_eq!(f.finish(), "");
+        assert_eq!(f.push("after a tool call"), "after a tool call");
+    }
+
+    #[tokio::test]
+    async fn nvidia_thinking_mode_holds_output_until_reasoning_ends() {
+        let (url, _) = fake_nvidia(vec![(
+            200,
+            deltas(&[
+                "Let me think about",
+                " the hours.</thi",
+                "nk>\n\nWe open at 9.",
+            ]),
+        )])
+        .await;
+        assert_eq!(
+            text_of(&nvidia_llm(&url, false, true), &[]).await.unwrap(),
+            "We open at 9."
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_provider_403_is_not_an_outage() {
+        // OpenRouter answers moderation-flagged visitor input with a 403.
+        let (url, seen) = fake_nvidia(vec![(403, "input was flagged".into())]).await;
+        let llm = Llm::new(
+            LlmConfig::OpenAiCompatible {
+                base_url: url,
+                api_key: "k".into(),
+                model: "m".into(),
+                max_tokens: 10,
+            },
+            reqwest::Client::new(),
+        );
+        let err = text_of(&llm, &[]).await.unwrap_err();
+        assert_eq!(err, "HTTP 403: input was flagged");
+        assert!(!crate::chat::is_availability_failure(&err));
+        assert_eq!(seen.lock().unwrap().bodies.len(), 1);
     }
 
     #[tokio::test]
