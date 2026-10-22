@@ -9,6 +9,7 @@ pub mod llm;
 pub mod log;
 pub mod postcodes;
 pub mod rate_limit;
+pub mod reply;
 pub mod sites;
 pub mod tools;
 pub mod usage;
@@ -241,7 +242,8 @@ pub fn build_state(config: Config) -> std::io::Result<Arc<Shared>> {
                 .sites
                 .as_ref()
                 .is_some_and(|s| s.usage_url.is_some() && s.usage_token.is_some()),
-        ),
+        )
+        .with_visitor_hourly_cap(config.limits.visitor_replies_per_hour),
         http,
         config,
     });

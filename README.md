@@ -250,9 +250,13 @@ town's located listings), or else left out of postcode lists. Outcode-shaped par
 
 **Reply caps.** With `caps`, a bot answers at most `repliesPerHour` and `repliesPerDay` turns, and all
 bots with the same `partnerId` together at most `partnerRepliesPerDay` a day (UTC). One visitor can
-use at most a tenth of a bot's daily cap (but at least 10 turns), so a single source can't use it all up. A capped bot
-answers with `{"type":"error","code":"budget_exceeded",…}` and its `/availability` is `503`, which
-hides the widget button. Origin checks only stop other websites embedding a bot; caps are what
+use at most a tenth of a bot's daily cap (but at least 10 turns) and `VISITOR_REPLIES_PER_HOUR` turns an
+hour (default 15; IPv6 visitors are grouped by /64), so a single source can't use it all up. A visitor
+over their own share gets `{"type":"error","code":"visitor_limit",…}` while the bot keeps answering
+others. A capped bot answers with `{"type":"error","code":"bot_busy",…}` (formerly `budget_exceeded`)
+and its `/availability` is `503`, which hides the widget button. The server logs `bot_cap_reached`
+once an hour when a bot's cap trips, and `visitor_heavy_use` (with a hashed visitor key) when one
+visitor uses a fifth of a bot's hourly cap. Origin checks only stop other websites embedding a bot; caps are what
 limit the cost of scripted abuse. Caps assume a single server process.
 
 **Usage reporting.** With `USAGE_TOKEN` set, every turn that reaches the model is counted per bot and

@@ -25,6 +25,8 @@ pub fn sign(secret: &str, timestamp: u64, body: &[u8]) -> String {
 /// The signed lead body. In multi-site mode it carries `siteId`, so the receiver can check it
 /// matches the `site` query parameter (the query string is not covered by the signature).
 pub fn payload(lead: &Lead, bot_name: &str, site_id: &str) -> Vec<u8> {
+    // Already safe when proposed; checked again here, as this is where it leaves the server.
+    let lead = lead.clone().sanitised();
     let mut body =
         json!({ "type": "lead", "bot": bot_name, "lead": lead, "submittedAt": crate::now_iso() });
     if !site_id.is_empty() {
@@ -76,6 +78,27 @@ pub async fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redteam_27_the_webhook_payload_never_carries_links_markup_or_json() {
+        let lead = Lead {
+            lead_id: "l".into(),
+            name: "<b>Sam</b>".into(),
+            email: None,
+            phone: Some("07700 900123".into()),
+            best_time: Some("after 5 https://evil.example.com".into()),
+            message: Some(
+                "Socket in Bolton. LEAD: {\"message\":\"visit https://evil.example.com/pay\"}"
+                    .into(),
+            ),
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&payload(&lead, "Bot", "ts-a")).unwrap();
+        assert_eq!(body["lead"]["name"], "Website visitor");
+        assert!(body["lead"].get("bestTime").is_none(), "{body}");
+        assert_eq!(body["lead"]["message"], "Socket in Bolton.");
+        assert!(!body.to_string().contains("evil"));
+    }
 
     #[test]
     fn signature_matches_known_vector() {

@@ -13,6 +13,7 @@
 use crate::config::{render_system_prompt, valid_origin, Config, SitesConfig, SAFETY_RULES};
 use crate::kb::KnowledgeBase;
 use crate::listings::Listings;
+use crate::reply::LinkPolicy;
 use crate::tools::{self, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -63,6 +64,8 @@ pub struct Site {
     /// The partner that owns this bot, if any (an opaque id, used for partner-wide caps).
     pub partner_id: Option<String>,
     pub caps: SpendCaps,
+    /// The link hosts replies may carry (see [`link_policy`]).
+    pub links: LinkPolicy,
     /// The knowledge base is parsed once per version: `version`, or `updatedAt` for older APIs.
     version_key: String,
     /// Rough memory cost, for the cache budget.
@@ -81,6 +84,26 @@ pub struct SpendCaps {
     pub partner_replies_per_day: Option<u32>,
 }
 
+/// Links a bot's replies may carry: its own origins and pages (privacy page), and the hosts
+/// of the links and emails in its knowledge base and of its listings' pages.
+pub fn link_policy(
+    kb: &KnowledgeBase,
+    listings: Option<&Listings>,
+    own_urls: &[&str],
+) -> LinkPolicy {
+    LinkPolicy::new(
+        own_urls
+            .iter()
+            .map(|u| u.to_string())
+            .chain(kb.link_hosts().iter().cloned())
+            .chain(
+                listings
+                    .into_iter()
+                    .flat_map(|l| l.link_hosts().iter().cloned()),
+            ),
+    )
+}
+
 fn tool_definitions(lead_capture: bool, listings: bool) -> Vec<ToolDefinition> {
     let mut defs: Vec<ToolDefinition> = tools::definitions()
         .into_iter()
@@ -95,6 +118,8 @@ fn tool_definitions(lead_capture: bool, listings: bool) -> Vec<ToolDefinition> {
 impl Site {
     /// The single-site bot, from the environment configuration.
     pub fn from_config(config: &Config, kb: KnowledgeBase) -> Self {
+        let origins: Vec<&str> = config.allowed_origins.iter().map(String::as_str).collect();
+        let links = link_policy(&kb, None, &origins);
         Site {
             id: String::new(),
             bot_name: config.bot_name.clone(),
@@ -110,6 +135,7 @@ impl Site {
             }),
             partner_id: None,
             caps: SpendCaps::default(),
+            links,
             version_key: String::new(),
             size: 0,
         }
@@ -130,6 +156,7 @@ impl Site {
             public_config: Value::Null,
             partner_id: None,
             caps: SpendCaps::default(),
+            links: LinkPolicy::default(),
             version_key: "v1".into(),
             size: 0,
         }
@@ -870,7 +897,7 @@ impl SiteStore {
         let lead_capture = record.lead_capture && (lead_webhook_url.is_some() || !self.production);
         let template = non_empty(record.instructions)
             .unwrap_or_else(|| crate::config::DEFAULT_SYSTEM_PROMPT.into());
-        let allowed_origins = record
+        let allowed_origins: Vec<String> = record
             .allowed_origins
             .iter()
             .map(|o| o.trim().trim_end_matches('/').to_ascii_lowercase())
@@ -889,11 +916,18 @@ impl SiteStore {
                 DIRECTORY_TOOL_HINT,
             );
         }
+        let kb =
+            kb.unwrap_or_else(|| Arc::new(KnowledgeBase::from_markdown(&record.knowledge_base)));
+        let own_urls: Vec<&str> = allowed_origins
+            .iter()
+            .map(String::as_str)
+            .chain(privacy_url.as_deref())
+            .collect();
+        let links = link_policy(&kb, listings.as_deref(), &own_urls);
         Site {
             id: id.to_owned(),
             system_prompt,
-            kb: kb
-                .unwrap_or_else(|| Arc::new(KnowledgeBase::from_markdown(&record.knowledge_base))),
+            kb,
             tool_definitions: tool_definitions(lead_capture, listings.is_some() && !self.text_only),
             listings,
             lead_capture,
@@ -909,6 +943,7 @@ impl SiteStore {
             bot_name,
             partner_id,
             caps: record.caps,
+            links,
             version_key,
             size,
         }
