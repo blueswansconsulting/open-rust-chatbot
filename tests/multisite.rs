@@ -1855,3 +1855,223 @@ async fn a_bare_call_request_offers_a_card_with_the_time_in_best_time() {
     assert_eq!(lead["bestTime"], "after 4pm");
     assert_eq!(lead["message"], "Ring about an EICR");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Issue #25 and no-match follow-ups, over the WebSocket.
+
+/// The listings block of a prompt (from its heading to the lead instructions after it).
+fn listings_block(p: &str) -> &str {
+    let start = p
+        .find("Directory listings matching")
+        .unwrap_or_else(|| panic!("{p}"));
+    let end = p[start..]
+        .find("Call-back requests")
+        .map_or(p.len(), |e| start + e);
+    &p[start..end]
+}
+
+async fn turn(ws: &mut Ws, text: &str) -> Vec<Value> {
+    ws.send(Message::Text(text.into())).await.unwrap();
+    until_done(ws).await
+}
+
+#[tokio::test]
+async fn issue_25_a_general_question_about_a_new_postcode_drops_the_last_service() {
+    let (h, prompts) = start_text_only("Sure.").await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    let mut ws = connect(&h.addr, "dir", ALPHA_ORIGIN).await.unwrap();
+    turn(&mut ws, "I need an EICR near BL6").await;
+    assert!(listings_block(&last_prompt(&prompts)).contains("within 25 km of BL6"));
+    turn(&mut ws, "what about emergency ones?").await;
+    let p = last_prompt(&prompts);
+    assert!(
+        listings_block(&p).contains("Emergency electricians within 25 km of BL6"),
+        "{p}"
+    );
+    turn(&mut ws, "Any electricians in Inverness IV1?").await;
+    let p = last_prompt(&prompts);
+    let block = listings_block(&p);
+    assert!(block.contains("within 25 km of IV1"), "{block}");
+    assert!(!block.to_lowercase().contains("emergency"), "{block}");
+}
+
+async fn directory_chat(reply: &'static str) -> (Harness, Prompts, Ws) {
+    let (h, prompts) = start_text_only(reply).await;
+    let sha = h.sites.set_dataset("dir", LISTINGS.as_bytes());
+    h.sites.set("dir", directory_bot("dir", 1, Some(&sha)));
+    let ws = connect(&h.addr, "dir", ALPHA_ORIGIN).await.unwrap();
+    (h, prompts, ws)
+}
+
+#[tokio::test]
+async fn no_listings_near_a_postcode_offers_to_take_details_and_the_card_carries_the_search() {
+    let (_h, prompts, mut ws) = directory_chat("Sure.").await;
+    let frames = turn(&mut ws, "Any electricians in Inverness IV1?").await;
+    assert!(cards(&frames).is_empty());
+    let p = last_prompt(&prompts);
+    let block = listings_block(&p);
+    assert!(
+        block.contains("couldn't find a listed Electrician near IV1"),
+        "{block}"
+    );
+    assert!(
+        block.contains("name and best phone number (or email)"),
+        "{block}"
+    );
+    assert!(block.contains("directory team"), "{block}");
+    assert!(
+        block.contains("\"Electrician near IV1 — no listing found\""),
+        "{block}"
+    );
+    let frames = turn(&mut ws, "Jo Bloggs 07700 900123").await;
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1, "{frames:?}");
+    let lead = &cards[0]["card"]["lead"];
+    assert_eq!(lead["phone"], "07700 900123");
+    assert_eq!(lead["name"], "Jo Bloggs");
+    let message = lead["message"].as_str().unwrap();
+    assert!(
+        message.contains("IV1") && message.contains("Electrician"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_no_match_for_a_service_puts_the_service_in_the_card() {
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    turn(&mut ws, "I need an EICR near IV1").await;
+    let frames = turn(&mut ws, "Jo Bloggs 07700 900123").await;
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1, "{frames:?}");
+    let message = cards[0]["card"]["lead"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("EICR") && message.contains("IV1"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_name_then_a_number_on_separate_turns_still_carries_the_search() {
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    turn(&mut ws, "EV chargers in Wigan?").await;
+    assert!(cards(&turn(&mut ws, "Jo Bloggs").await).is_empty());
+    let frames = turn(&mut ws, "07700 900123").await;
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1, "{frames:?}");
+    let message = cards[0]["card"]["lead"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("EV charger installation in Wigan"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_vague_lead_line_after_a_no_match_gets_the_search_context() {
+    let (_h, _prompts, mut ws) = directory_chat(
+        "Thanks Jo, the directory team will be in touch.\nLEAD: {\"name\":\"Jo Bloggs\",\"phone\":\"07700 900123\",\"email\":null,\"best_time\":null,\"message\":\"Call back please\"}",
+    )
+    .await;
+    // The lead line on the offer turn has no visitor number yet, so it is dropped.
+    assert!(cards(&turn(&mut ws, "Any electricians in Inverness IV1?").await).is_empty());
+    let frames = turn(&mut ws, "Jo Bloggs 07700 900123").await;
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1, "{frames:?}");
+    let message = cards[0]["card"]["lead"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("Electrician near IV1 — no listing found")
+            && message.contains("Call back please"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_business_offers_details_and_the_card_names_it() {
+    let (_h, prompts, mut ws) = directory_chat("Sure.").await;
+    turn(&mut ws, "Do you list Sparky Steve's Electrics?").await;
+    let p = last_prompt(&prompts);
+    assert!(
+        listings_block(&p).contains("\"Wants Sparky Steve's Electrics — not listed\""),
+        "{p}"
+    );
+    let frames = turn(&mut ws, "Jo Bloggs, jo@example.com").await;
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1, "{frames:?}");
+    assert_eq!(
+        cards[0]["card"]["lead"]["message"],
+        "Wants Sparky Steve's Electrics — not listed"
+    );
+}
+
+#[tokio::test]
+async fn a_found_search_after_a_no_match_drops_the_offer() {
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    turn(&mut ws, "Any electricians in Inverness IV1?").await;
+    turn(&mut ws, "ok, rewiring in Bolton then").await;
+    // A bare number is not a call-back request without the offer.
+    assert!(cards(&turn(&mut ws, "Jo Bloggs 07700 900123").await).is_empty());
+}
+
+#[tokio::test]
+async fn a_listed_business_number_is_never_the_visitors_even_after_an_offer() {
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    turn(&mut ws, "Any electricians in Inverness IV1?").await;
+    // Hayvern's listed number (from the fixture) is not the visitor's.
+    assert!(cards(&turn(&mut ws, "is 01204 579975 any good?").await).is_empty());
+}
+
+#[tokio::test]
+async fn qa_m1_declining_the_offer_never_turns_a_number_into_a_card() {
+    for reply in [
+        "No thanks, I found someone on 07700 900456",
+        "My old electrician was 01463 222333 but he retired",
+        "The Inverness council number is 01463 702000",
+    ] {
+        let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+        turn(&mut ws, "Any electricians in Inverness IV1?").await;
+        assert!(cards(&turn(&mut ws, reply).await).is_empty(), "{reply}");
+    }
+}
+
+#[tokio::test]
+async fn qa_m2_a_number_in_the_search_message_itself_is_not_an_answer_to_an_offer() {
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    let frames = turn(
+        &mut ws,
+        "Any electricians near IV1? my current one is 01463 222333 but he's away",
+    )
+    .await;
+    assert!(cards(&frames).is_empty(), "{frames:?}");
+}
+
+#[tokio::test]
+async fn qa_m3_a_new_found_search_or_a_later_topic_drops_the_old_context() {
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    turn(&mut ws, "Any electricians in Inverness IV1?").await;
+    let frames = turn(
+        &mut ws,
+        "Actually, any electricians in Bolton? call me on 07700 900123",
+    )
+    .await;
+    let cards = cards(&frames);
+    assert_eq!(cards.len(), 1);
+    let message = cards[0]["card"]["lead"]["message"].as_str().unwrap();
+    assert!(!message.contains("IV1"), "{message}");
+
+    let (_h, _prompts, mut ws) = directory_chat("Sure.").await;
+    turn(&mut ws, "Any electricians in Inverness IV1?").await;
+    turn(&mut ws, "how does the directory work?").await;
+    turn(&mut ws, "what are your opening hours?").await;
+    let frames = turn(&mut ws, "can I get listed? please call me on 07700 900123").await;
+    let message = frames
+        .iter()
+        .find(|f| f["type"] == "card")
+        .map(|c| {
+            c["card"]["lead"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .unwrap_or_default();
+    assert!(!message.contains("IV1"), "{message}");
+}
