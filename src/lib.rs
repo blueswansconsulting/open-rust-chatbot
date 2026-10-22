@@ -1,6 +1,7 @@
 //! open-rust-chatbot: a self-hosted AI chat widget server.
 #![forbid(unsafe_code)]
 
+pub mod avatars;
 pub mod chat;
 pub mod config;
 pub mod kb;
@@ -320,6 +321,7 @@ pub fn app(state: Arc<Shared>) -> Router {
             "/widget.css",
             get(|| async { asset("text/css; charset=utf-8", WIDGET_CSS) }),
         )
+        .route("/avatars/{file}", get(avatar))
         .layer(CompressionLayer::new());
     let mut router = Router::new()
         .route("/health", get(|| async { Json(json!({ "ok": true })) }))
@@ -455,6 +457,22 @@ async fn bot_config(State(shared): State<Arc<Shared>>, Path(id): Path<String>) -
     match load_site(&shared, &id).await {
         Ok(site) => public_config(&site),
         Err(r) => r.into_response(),
+    }
+}
+
+/// A bundled mascot (`/avatars/<name>.svg`). Readable from any site: the widget fetches it to
+/// animate the launcher.
+async fn avatar(Path(file): Path<String>) -> Response {
+    match file.strip_suffix(".svg").and_then(avatars::svg) {
+        Some(svg) => {
+            let mut res = asset("image/svg+xml", svg);
+            res.headers_mut().insert(
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static("*"),
+            );
+            res
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

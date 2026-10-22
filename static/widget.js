@@ -2,10 +2,13 @@
  *
  * Embed:  <script src="https://chat.example.com/widget.js" defer></script>
  * Optional config, set before the script tag:
- *   window.openRustChatbot = { title, subtitle, greeting, placeholder, serverUrl, turnstileToken };
+ *   window.openRustChatbot = { title, subtitle, greeting, placeholder, serverUrl, turnstileToken,
+ *                              avatar, avatarMotion };
  * serverUrl may include a path when the server is behind a sub-path, e.g. https://example.com/chat
  * Any of title, subtitle, greeting, placeholder and privacyUrl left out are read once from
  * <base>/config when the server provides it (multi-site mode); options set here always win.
+ * avatar names one of the bundled mascots (see /avatars/, e.g. 'electrician') for the launcher and
+ * header; avatarMotion is 'still', 'wave' (once, after load) or 'follow' (turns toward the pointer).
  * turnstileToken may be a string or a function returning a fresh token (or a Promise of one);
  * Turnstile tokens are single-use, so use a function if the visitor may reconnect.
  *
@@ -52,6 +55,10 @@
     disclosure: options.disclosure || "You're chatting with an AI assistant. It can make mistakes, so please check anything important.",
   };
   var privacyOption = options.privacyUrl;
+  var AVATAR_NAME = /^[a-z]{2,20}$/;
+  var MOTIONS = ['still', 'wave', 'follow'];
+  // Bundled mascots live at the server root, also for bots served from /b/<id>/.
+  var avatarBase = serverBase.replace(/\/b\/[a-z0-9-]+$/, '') + '/avatars/';
 
   // Settings the host page left out may come from the server. The widget mounts straight away
   // with the defaults and updates its texts when (and if) the reply arrives; any failure,
@@ -67,12 +74,19 @@
     TEXT.greeting = pick('greeting');
     TEXT.placeholder = pick('placeholder');
     if (!privacyOption && typeof remote.privacyUrl === 'string') privacyOption = remote.privacyUrl;
+    // The host page may pick a mascot, or turn the bot's off with avatar: false or 'none'.
+    var avatar = options.avatar !== undefined ? options.avatar : remote.avatar;
+    TEXT.avatar = typeof avatar === 'string' && avatar !== 'none' && AVATAR_NAME.test(avatar) ? avatar : null;
+    var motion = options.avatarMotion || remote.avatarMotion;
+    TEXT.avatarMotion = MOTIONS.indexOf(motion) >= 0 ? motion : 'still';
   }
 
   function loadSettings() {
-    var missing = CONFIG_KEYS.some(function (k) {
-      return !options[k];
-    });
+    var missing =
+      options.avatar === undefined ||
+      CONFIG_KEYS.some(function (k) {
+        return !options[k];
+      });
     if (!missing || typeof fetch !== 'function') return Promise.resolve(null);
     return fetch(serverBase + '/config', { credentials: 'omit' })
       .then(function (r) {
@@ -167,6 +181,123 @@
     return svg;
   }
 
+  // The mascot as inline SVG, so its parts can move. Only the bundled files from our own server
+  // are fetched, and only plain shapes and their drawing attributes are copied into the page.
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  var SVG_TAGS = ['svg', 'g', 'path', 'circle', 'ellipse', 'rect', 'line', 'polygon', 'polyline'];
+  var SVG_ATTRS = [
+    'viewBox', 'width', 'height', 'class', 'transform', 'opacity', 'fill', 'fill-opacity', 'fill-rule',
+    'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin', 'stroke-opacity',
+    'd', 'cx', 'cy', 'r', 'rx', 'ry', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'points',
+  ];
+
+  function cleanSvg(node) {
+    if (node.namespaceURI !== SVG_NS || SVG_TAGS.indexOf(node.localName) < 0) return null;
+    var copy = document.createElementNS(SVG_NS, node.localName);
+    SVG_ATTRS.forEach(function (name) {
+      var value = node.getAttribute(name);
+      if (value !== null && !/url\s*\(/i.test(value)) copy.setAttribute(name, value);
+    });
+    [].slice.call(node.children).forEach(function (child) {
+      var clean = cleanSvg(child);
+      if (clean) copy.appendChild(clean);
+    });
+    return copy;
+  }
+
+  function inlineAvatar(name) {
+    if (typeof fetch !== 'function' || typeof DOMParser !== 'function') return Promise.resolve(null);
+    return fetch(avatarBase + name + '.svg', { credentials: 'omit' })
+      .then(function (r) {
+        return r.ok ? r.text() : null;
+      })
+      .then(function (text) {
+        if (!text) return null;
+        var doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+        if (doc.getElementsByTagName('parsererror').length) return null;
+        var svg = doc.documentElement && doc.documentElement.localName === 'svg' ? cleanSvg(doc.documentElement) : null;
+        if (!svg) return null;
+        svg.setAttribute('aria-hidden', 'true');
+        svg.setAttribute('focusable', 'false');
+        return svg;
+      })
+      .catch(function () {
+        return null;
+      });
+  }
+
+  function avatarImg(name, onError) {
+    var img = el('img');
+    img.alt = '';
+    img.src = avatarBase + name + '.svg';
+    img.addEventListener('error', onError);
+    return img;
+  }
+
+  // Head turns toward the pointer: it shifts and tilts a little and the face shifts a bit more
+  // than the hat, which fakes a 3D turn. Frames run only while the head is moving; at rest the
+  // gentle bob and blinks are CSS. Visitors who ask for reduced motion get a still mascot.
+  function followPointer(svg) {
+    var head = svg.querySelector('.orc-head');
+    var face = svg.querySelector('.orc-face');
+    var hat = svg.querySelector('.orc-hat');
+    if (!head || !face || !hat || !window.requestAnimationFrame) return;
+    var reduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : { matches: false };
+    var target = { x: 0, y: 0 };
+    var cur = { x: 0, y: 0 };
+    var lastMove = 0;
+    var running = false;
+    var rect = null;
+    function clear() {
+      [head, face, hat].forEach(function (n) {
+        n.removeAttribute('transform');
+      });
+      cur.x = cur.y = 0;
+    }
+    function aim(x, y) {
+      if (reduce.matches) return;
+      // One layout read per frame, however many pointer events arrive.
+      if (!rect) rect = svg.getBoundingClientRect();
+      var clamp = function (v) {
+        return Math.max(-1, Math.min(1, v));
+      };
+      target.x = clamp((x - (rect.left + rect.width / 2)) / (window.innerWidth / 2));
+      target.y = clamp((y - (rect.top + rect.height / 2)) / (window.innerHeight / 2));
+      lastMove = Date.now();
+      if (!running) {
+        running = true;
+        requestAnimationFrame(frame);
+      }
+    }
+    function frame() {
+      rect = null;
+      if (reduce.matches || !svg.isConnected) {
+        running = false;
+        return clear();
+      }
+      var idle = Date.now() - lastMove > 2500;
+      if (idle) target.x = target.y = 0;
+      cur.x += (target.x - cur.x) * 0.12;
+      cur.y += (target.y - cur.y) * 0.12;
+      if (idle && Math.abs(cur.x) < 0.005 && Math.abs(cur.y) < 0.005) {
+        running = false;
+        return clear();
+      }
+      var x = cur.x;
+      var y = cur.y;
+      head.setAttribute('transform', 'translate(' + (x * 1.6).toFixed(2) + ' ' + (y * 1.2).toFixed(2) + ') rotate(' + (x * 6).toFixed(2) + ' 32 37)');
+      face.setAttribute('transform', 'translate(' + (x * 3.2).toFixed(2) + ' ' + (y * 2.6).toFixed(2) + ')');
+      hat.setAttribute('transform', 'translate(' + (x * 1.2).toFixed(2) + ' ' + (y * 0.8).toFixed(2) + ')');
+      requestAnimationFrame(frame);
+    }
+    window.addEventListener('pointermove', function (e) {
+      aim(e.clientX, e.clientY);
+    }, { passive: true });
+    window.addEventListener('touchmove', function (e) {
+      if (e.touches[0]) aim(e.touches[0].clientX, e.touches[0].clientY);
+    }, { passive: true });
+  }
+
   function mount() {
     if (!document.querySelector('link[data-orc-stylesheet]')) {
       var link = document.createElement('link');
@@ -194,6 +325,49 @@
     var subtitleNode = el('div', 'orc-header-subtitle', TEXT.subtitle);
     headerText.appendChild(titleNode);
     headerText.appendChild(subtitleNode);
+    var avatarShown = false;
+    // Shows the bot's mascot once its name is known; any failure keeps the plain chat icon.
+    function showAvatar() {
+      var name = TEXT.avatar;
+      if (!name || avatarShown) return;
+      avatarShown = true;
+      var restore = function () {
+        bubble.classList.remove('orc-bubble-avatar');
+        bubble.textContent = '';
+        bubble.appendChild(chatIcon());
+        headerAvatar.remove();
+      };
+      var headerAvatar = el('div', 'orc-header-avatar');
+      headerAvatar.appendChild(avatarImg(name, function () {
+        headerAvatar.remove();
+      }));
+      header.insertBefore(headerAvatar, headerText);
+      var motion = TEXT.avatarMotion;
+      var still = function () {
+        bubble.textContent = '';
+        bubble.classList.add('orc-bubble-avatar');
+        bubble.appendChild(avatarImg(name, restore));
+      };
+      if (motion === 'still') return still();
+      inlineAvatar(name).then(function (svg) {
+        if (!svg) return still();
+        bubble.textContent = '';
+        bubble.classList.add('orc-bubble-avatar');
+        bubble.appendChild(svg);
+        if (motion === 'follow') {
+          root.classList.add('orc-follow');
+          return followPointer(svg);
+        }
+        // Wave once per tab, not on every page, and never again when the button reappears.
+        var hand = svg.querySelector('.orc-hand');
+        if (store.get('waved') || !hand) return;
+        hand.addEventListener('animationend', function () {
+          store.set('waved', '1');
+          root.classList.remove('orc-wave-go');
+        });
+        root.classList.add('orc-wave-go');
+      });
+    }
     var closeBtn = el('button', 'orc-close', '×');
     closeBtn.type = 'button';
     closeBtn.setAttribute('aria-label', 'Close chat');
@@ -732,6 +906,7 @@
       if (!input.disabled) input.placeholder = TEXT.placeholder;
       input.setAttribute('aria-label', TEXT.placeholder);
       showPrivacyLink();
+      showAvatar();
       if (greetingNode && greetingNode.textContent === oldGreeting && messages.lastChild === greetingNode) {
         greetingNode.textContent = TEXT.greeting;
         saveTranscript();

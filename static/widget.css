@@ -41,8 +41,9 @@
   padding: 0.875rem 1rem; background: #0A2540; color: #FFFFFF;
   display: flex; align-items: center; gap: 0.75rem;
 }
+/* 40px of mascot inside a 2px white ring, so its badge stays legible. */
 .orc-header-avatar {
-  width: 40px; height: 40px; border-radius: 50%; background: #FFFFFF;
+  width: 44px; height: 44px; border-radius: 50%; background: #FFFFFF;
   flex-shrink: 0; padding: 2px; display: flex; align-items: center; justify-content: center;
 }
 .orc-header-avatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
@@ -156,6 +157,38 @@
 
 .orc-bubble { color: #0A2540; }
 .orc-bubble svg { width: 28px; height: 28px; display: block; }
+
+/* Mascot avatar (the bot's "avatar" setting): fills the launcher and sits in the header. */
+.orc-bubble.orc-bubble-avatar svg, .orc-bubble.orc-bubble-avatar img { width: 56px; height: 56px; overflow: visible; }
+.orc-header-avatar svg { width: 100%; height: 100%; display: block; }
+.orc-hand { opacity: 0; transform-box: view-box; transform-origin: 55px 45px; }
+.orc-eyes { transform-box: fill-box; transform-origin: center; }
+@media (prefers-reduced-motion: no-preference) {
+  /* One wave a little after load (once per tab), then two gentle blinks. */
+  .orc-wave-go .orc-hand { animation: orc-wave 1.8s ease-in-out 2.5s 1 both; }
+  .orc-wave-go .orc-eyes { animation: orc-blink 1.5s ease-in-out 2.6s 1 both; }
+  /* Follow mode at rest: a slow bob of the whole picture and a couple of blinks, all in CSS. */
+  .orc-follow .orc-bubble-avatar svg { animation: orc-bob 5s ease-in-out infinite; }
+  .orc-follow .orc-eyes { animation: orc-blink 7s ease-in-out 3s 2 both; }
+}
+@keyframes orc-bob {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-1.5px); }
+}
+@keyframes orc-wave {
+  0%   { opacity: 0; transform: rotate(0); }
+  12%  { opacity: 1; transform: rotate(0); }
+  28%  { transform: rotate(24deg); }
+  44%  { transform: rotate(-14deg); }
+  60%  { transform: rotate(22deg); }
+  76%  { transform: rotate(-8deg); opacity: 1; }
+  88%  { transform: rotate(0); opacity: 1; }
+  100% { opacity: 0; transform: rotate(0); }
+}
+@keyframes orc-blink {
+  0%, 94%, 100% { transform: scaleY(1); }
+  97%           { transform: scaleY(.1); }
+}
 .orc-bubble:focus-visible, .orc-close:focus-visible, .orc-send:focus-visible, .orc-card-action:focus-visible {
   outline: 2px solid #116149; outline-offset: 2px;
 }

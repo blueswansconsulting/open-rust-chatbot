@@ -76,7 +76,8 @@ embed `https://your-domain.com/chat/widget.js` and the widget uses `/chat/ws` an
 If your site sends a Content-Security-Policy, allow the chatbot's origin in `script-src` and `style-src`,
 and in `connect-src` as **both** `https://chat.your-domain.com` (the widget checks `/availability` before
 showing its button) and `wss://chat.your-domain.com`. If `connect-src` blocks the check, the button
-never appears and the browser console says why.
+never appears and the browser console says why. A mascot avatar also needs the chatbot's origin in
+`img-src`; if it is blocked, the widget falls back to its plain chat icon.
 
 The chat button only appears while the chat can answer: the widget checks `/availability`, which
 reports down after repeated model outages seen by more than one visitor. `/health` is a plain liveness
@@ -96,12 +97,18 @@ can tell visitors apart; otherwise every visitor shares the proxy's IP and the b
     // disclosure: 'You are chatting with an AI assistant…', // optional wording; a notice is always shown
     // serverUrl: 'https://your-domain.com/chat',  // only if the script is served from elsewhere (may include a path)
     // turnstileToken: () => getFreshTurnstileToken(), // if TURNSTILE_SECRET_KEY is set (tokens are single-use)
+    // avatar: 'electrician',    // a bundled mascot (see below); 'none' turns off one set for the bot
+    // avatarMotion: 'follow',   // 'still', 'wave' (once per visit) or 'follow' (looks towards the pointer)
   };
 </script>
 <script src="https://chat.your-domain.com/widget.js" defer></script>
 ```
 
-Example mascot avatars (a friendly character with trade hats, as SVGs) are in [examples/avatars](examples/avatars/).
+Mascot avatars (a friendly character with trade hats) are bundled and served at `/avatars/<name>.svg`:
+`default`, `electrician`, `plumber`, `heating`, `roofer`, `solar`, `builder`, `locksmith`, `gardener`,
+`cleaner` and `directory`. In multi-site mode a bot's `avatar` and `avatarMotion` come from its record.
+Only these names are accepted, and visitors who ask for reduced motion always see a still picture. The
+source art and a moving demo are in [examples/avatars](examples/avatars/).
 
 ## Knowledge base
 
