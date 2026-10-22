@@ -133,6 +133,23 @@ const SHARED_HOSTS: &[&str] = &[
     "protonmail.com",
 ];
 
+/// Redirect pages on shared hosts ("google.com/url?q=…"): a link to one allows nothing, as
+/// it could lead anywhere.
+const REDIRECT_PATHS: [&str; 9] = [
+    "/url",
+    "/l.php",
+    "/l",
+    "/redirect",
+    "/redir",
+    "/out",
+    "/away",
+    "/link",
+    "/r",
+];
+
+/// How [`LinkPolicy::allowed_in`] marks an exact email address on a shared host.
+const EMAIL_ENTRY: &str = "email:";
+
 fn shared_host(host: &str) -> bool {
     SHARED_HOSTS
         .iter()
@@ -194,7 +211,8 @@ pub struct LinkPolicy {
     hosts: Arc<HashSet<String>>,
     /// Pages on shared hosts, as `host/path`: allowed with the pages under them.
     pages: Arc<Vec<String>>,
-    /// Email addresses the visitor typed, which a reply may repeat back to them.
+    /// Exact email addresses a reply may carry: the visitor's own, and the business's own
+    /// webmail addresses from the knowledge base.
     emails: HashSet<String>,
 }
 
@@ -259,9 +277,12 @@ impl LinkPolicy {
     {
         let mut hosts = HashSet::new();
         let mut pages = Vec::new();
+        let mut emails = HashSet::new();
         for entry in allowed {
             let entry = entry.as_ref().trim();
-            if entry.contains("://") {
+            if let Some(email) = entry.strip_prefix(EMAIL_ENTRY) {
+                emails.insert(email.to_ascii_lowercase());
+            } else if entry.contains("://") {
                 if let Some(d) = reqwest::Url::parse(entry)
                     .ok()
                     .and_then(|u| u.domain().map(normal_host))
@@ -283,7 +304,7 @@ impl LinkPolicy {
         Self {
             hosts: Arc::new(hosts),
             pages: Arc::new(pages),
-            emails: HashSet::new(),
+            emails,
         }
     }
 
@@ -305,7 +326,13 @@ impl LinkPolicy {
                 };
                 if !shared_host(&host) {
                     out.push(host);
-                } else if caps.name("email").is_none() && !path.is_empty() {
+                } else if let Some(email) = caps.name("email") {
+                    // The business's own webmail address, exactly.
+                    out.push(format!(
+                        "{EMAIL_ENTRY}{}",
+                        email.as_str().to_ascii_lowercase()
+                    ));
+                } else if !path.is_empty() && !REDIRECT_PATHS.contains(&path.as_str()) {
                     out.push(format!("{host}{path}"));
                 }
             }
@@ -904,6 +931,29 @@ mod tests {
         assert_eq!(
             LinkPolicy::allowed_in(["see www.example.org/x"]),
             vec!["example.org".to_owned()]
+        );
+    }
+
+    #[test]
+    fn qa_r2_the_businesss_own_webmail_survives_and_redirectors_allow_nothing() {
+        let p = LinkPolicy::new(LinkPolicy::allowed_in([
+            "Email us at jo.sparks@gmail.com or jo@btinternet.com. \
+             Old link https://www.google.com/url?q=https://example.org",
+        ]));
+        assert_eq!(
+            filter_links(
+                "You can email jo.sparks@gmail.com or JO@btinternet.com.",
+                &p
+            ),
+            "You can email jo.sparks@gmail.com or JO@btinternet.com."
+        );
+        assert_eq!(
+            filter_links("Or other@gmail.com, or https://gmail.com", &p),
+            "Or [link removed], or [link removed]"
+        );
+        assert_eq!(
+            filter_links("https://www.google.com/url?q=https://evil.pl/pay", &p),
+            LINK_REMOVED
         );
     }
 }
