@@ -298,6 +298,7 @@ Please read [SECURITY.md](SECURITY.md) for the threat model and how to report a 
 - Visitor text is treated as untrusted. The model has two narrow tools (read-only search and a lead *proposal*) and cannot trigger anything a visitor hasn't confirmed.
 - Conversation state lives on the WebSocket connection, so one visitor can never see or act on another visitor's data.
 - Logs contain events, not chat content, and email addresses and phone numbers are redacted.
+- It is red-team tested against prompt injection, jailbreaks, fake system messages, binding-price tricks, misinformation, unsafe advice, phishing links, lead-form injection and cost abuse (OWASP Top 10 for LLM apps). See [docs/security-testing.md](docs/security-testing.md) for the results and how to re-run the tests against your own bot.
 
 ## How it compares
 

@@ -9,6 +9,10 @@ high-severity issues within 30 days. We're happy to credit you in the advisory.
 
 Only the latest release is supported with security fixes.
 
+## Adversarial testing
+
+The bot is red-team tested against the OWASP Top 10 for LLM Applications and known real-world chatbot failures. The latest results, fixes, known limits and the re-runnable test suite are in [docs/security-testing.md](docs/security-testing.md).
+
 ## Threat model
 
 open-rust-chatbot runs on your server and is embedded on websites you list in `ALLOWED_ORIGINS`.
