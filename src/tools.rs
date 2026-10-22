@@ -47,7 +47,7 @@ pub enum ToolOutcome {
 }
 
 const MAX_FIELD_CHARS: usize = 200;
-const MAX_LEAD_MESSAGE_CHARS: usize = 1000;
+pub const MAX_LEAD_MESSAGE_CHARS: usize = 1000;
 
 static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}$").unwrap()

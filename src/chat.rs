@@ -203,7 +203,7 @@ const TEXT_ONLY_DIRECTORY_LEADS: &str = " This site is a directory: a call-back 
 /// Contact details a visitor typed: an email, or a phone number when they ask to be called.
 #[cfg(test)]
 fn fallback_contact(text: &str) -> Option<(Option<String>, Option<String>)> {
-    fallback_contact_checked(text, &|_| false)
+    fallback_contact_checked(text, &|_| false, false)
 }
 
 /// True if "call"/"ring" sits right before or after the number at `range`.
@@ -244,13 +244,15 @@ fn call_after(text: &str, range: &std::ops::Range<usize>) -> bool {
 /// on …", "their number is …") or one they already tried ("tried to call …"), and
 /// `is_business` (a listed business's, the knowledge base's or the assistant's number) is false.
 /// A number next to the request ("call me on …", "my mobile is …") is preferred to one that is
-/// merely in the same message.
+/// merely in the same message. `offered` is true when the assistant has just offered to take
+/// their details (no listing matched): a number given in reply is a call-back request.
 fn fallback_contact_checked(
     text: &str,
     is_business: &dyn Fn(&str) -> bool,
+    offered: bool,
 ) -> Option<(Option<String>, Option<String>)> {
     let email = EMAIL_IN_TEXT.find(text).map(|m| m.as_str().to_owned());
-    let asked = CALL_ME.is_match(text);
+    let asked = offered || CALL_ME.is_match(text);
     let mut best: Option<(u8, std::ops::Range<usize>, String)> = None;
     for (range, digits) in typed_phone_spans(text) {
         let before = &text[..range.start];
@@ -462,6 +464,32 @@ fn introduced_name(text: &str) -> Option<(String, std::ops::Range<usize>)> {
 
 fn name_in_text(text: &str) -> Option<String> {
     introduced_name(text).map(|(name, _)| name)
+}
+
+/// A name given on its own in reply to "can I take your name and number?": "Jo Bloggs 07700
+/// 900123" gives "Jo Bloggs". Read as if introduced ("I'm Jo Bloggs …"), so everyday words
+/// ("Sure, 07700 …", "Thanks") are not names.
+fn bare_name(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    if !text.starts_with(char::is_uppercase) {
+        return None;
+    }
+    name_in_text(&format!("I'm {text}"))
+}
+
+/// True if the visitor typed an email address or a phone number.
+fn gives_contact(text: &str) -> bool {
+    EMAIL_IN_TEXT.is_match(text) || !typed_phones(text).is_empty()
+}
+
+/// A lead's message with the search it follows up ("Electrician near IV1 — no listing found"),
+/// whatever the visitor or the model wrote.
+fn with_context(context: &str, message: Option<&str>) -> String {
+    match message.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m) if m.contains(context) => m.to_owned(),
+        Some(m) => format!("{context}. {m}"),
+        None => context.to_owned(),
+    }
 }
 
 /// `text` with each phone number in it replaced by '#'s (same length, so offsets still hold):
@@ -911,6 +939,10 @@ pub struct ChatSession {
     pending_leads: HashMap<String, Lead>,
     /// The last postcode district the visitor gave, for later directory turns.
     last_outcode: Option<String>,
+    /// The search no listing matched ("Electrician near IV1 — no listing found"), after the
+    /// assistant offered to take their details: their lead carries it. Kept until a card is
+    /// offered or a later lookup recognises something else.
+    no_match: Option<String>,
     turns: usize,
     /// Rate-limit key of the visitor (IP or /64), used by the availability breaker.
     client: String,
@@ -930,6 +962,7 @@ impl ChatSession {
             history: vec![system],
             pending_leads: HashMap::new(),
             last_outcode: None,
+            no_match: None,
             turns: 0,
             client: String::new(),
             resume_token: None,
@@ -1182,10 +1215,17 @@ impl ChatSession {
             system.content.push_str(&excerpts.join("\n"));
             // Directory bots: the matching listings, looked up in code (no tools here).
             if let Some(listings) = &self.site.listings {
-                let (block, keep) =
-                    listings.block_for(text, previous, self.last_outcode.as_deref());
-                system.content.push_str(&block);
-                self.last_outcode = keep;
+                let l = listings.lookup_for(text, previous, self.last_outcode.as_deref());
+                system.content.push_str(&l.block);
+                self.last_outcode = l.keep;
+                // A reply with contact details answers the last offer, whatever it looks like.
+                let pending = self.no_match.take();
+                let answering = pending.is_some() && gives_contact(text);
+                self.no_match = if answering || !l.recognised {
+                    pending
+                } else {
+                    l.no_match
+                };
             }
             if self.site.lead_capture {
                 system.content.push_str(TEXT_ONLY_LEAD_INSTRUCTIONS);
@@ -1249,7 +1289,13 @@ impl ChatSession {
                 None
             }
         });
+        let lead_context = self.no_match.clone();
         if let Some(mut arguments) = lead_args.filter(|_| self.site.lead_capture) {
+            if let Some(context) = &lead_context {
+                let message =
+                    with_context(context, arguments.get("message").and_then(Value::as_str));
+                arguments.insert("message".into(), json!(message));
+            }
             // A phone number or email is enough; the name is optional for text-only models.
             let named = arguments
                 .get("name")
@@ -1266,6 +1312,7 @@ impl ChatSession {
             if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, None, &call) {
                 // The model's lead is the card: no second card from the fallback below.
                 self.offer_lead(lead, tx);
+                self.no_match = None;
                 send(tx, json!({ "type": "done" }));
                 log_event(
                     "turn_complete",
@@ -1281,11 +1328,24 @@ impl ChatSession {
         let fallback = self
             .site
             .lead_capture
-            .then(|| fallback_contact_checked(text, &is_business))
+            .then(|| fallback_contact_checked(text, &is_business, lead_context.is_some()))
             .flatten();
         if let Some((email, phone)) = fallback {
             let mut arguments = serde_json::Map::new();
-            let name = name_in_text(text).unwrap_or_else(|| "Website visitor".into());
+            let typed_name =
+                name_in_text(text).or_else(|| lead_context.as_ref().and_then(|_| bare_name(text)));
+            let mut message = lead_message(text);
+            if let Some(context) = &lead_context {
+                // Their own words only add something beyond the name they just gave.
+                let rest = typed_name
+                    .as_deref()
+                    .and_then(|n| message.strip_prefix(n))
+                    .unwrap_or(&message)
+                    .trim_matches(|c: char| c.is_whitespace() || ",.".contains(c));
+                let rest = (rest.split_whitespace().count() >= 3).then_some(rest);
+                message = with_context(context, rest);
+            }
+            let name = typed_name.unwrap_or_else(|| "Website visitor".into());
             arguments.insert("name".into(), json!(name));
             arguments.insert("email".into(), email.map_or(Value::Null, |e| json!(e)));
             arguments.insert("phone".into(), phone.map_or(Value::Null, |p| json!(p)));
@@ -1293,7 +1353,7 @@ impl ChatSession {
                 "best_time".into(),
                 best_time(text).map_or(Value::Null, |t| json!(t)),
             );
-            arguments.insert("message".into(), json!(lead_message(text)));
+            arguments.insert("message".into(), json!(message));
             let call = ToolCall {
                 id: "server-lead".into(),
                 name: "propose_lead".into(),
@@ -1301,6 +1361,7 @@ impl ChatSession {
             };
             if let ToolOutcome::LeadProposed(lead) = tools::execute(&self.site.kb, None, &call) {
                 self.offer_lead(lead, tx);
+                self.no_match = None;
             }
         }
         send(tx, json!({ "type": "done" }));
@@ -1336,7 +1397,28 @@ impl ChatSession {
             .iter()
             .any(|t| t.name == call.name);
         let outcome = if offered {
-            tools::execute(&self.site.kb, self.site.listings.as_deref(), call)
+            if call.name == tools::LISTINGS_TOOL {
+                if let Some(listings) = self.site.listings.as_deref() {
+                    let query = call.arguments.get("query").and_then(Value::as_str);
+                    let l = listings.lookup_for(query.unwrap_or_default(), "", None);
+                    if l.recognised {
+                        self.no_match = l.no_match;
+                    }
+                }
+            }
+            let mut outcome = tools::execute(&self.site.kb, self.site.listings.as_deref(), call);
+            if let ToolOutcome::LeadProposed(lead) = &mut outcome {
+                if let Some(context) = self.no_match.take() {
+                    let message = with_context(&context, lead.message.as_deref());
+                    lead.message = Some(
+                        message
+                            .chars()
+                            .take(tools::MAX_LEAD_MESSAGE_CHARS)
+                            .collect(),
+                    );
+                }
+            }
+            outcome
         } else {
             ToolOutcome::Result(json!({ "error": format!("unknown tool {}", call.name) }))
         };
@@ -1899,13 +1981,14 @@ mod tests {
         // A listed business's (or the KB's) number never becomes the visitor's.
         let business = |d: &str| d == "01204579975";
         assert_eq!(
-            fallback_contact_checked("can you call 01204 579975 for me?", &business),
+            fallback_contact_checked("can you call 01204 579975 for me?", &business, false),
             None
         );
         assert_eq!(
             fallback_contact_checked(
                 "Can Hayvern call me? Their number is 01204 579975",
-                &business
+                &business,
+                false
             ),
             None
         );
@@ -1913,7 +1996,8 @@ mod tests {
         assert_eq!(
             fallback_contact_checked(
                 "Hayvern is 01204 579975, please call me on 07700 900123",
-                &business
+                &business,
+                false
             )
             .and_then(|(_, p)| p)
             .and_then(|p| phone_digits(&p))
