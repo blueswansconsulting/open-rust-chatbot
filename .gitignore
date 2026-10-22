@@ -3,3 +3,6 @@
 .env.*
 !.env.example
 .DS_Store
+
+# Adversarial test output
+tests/redteam/results.jsonl
