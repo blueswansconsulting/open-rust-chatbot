@@ -295,6 +295,8 @@ const demoBot = {
   id: 'demo-bot',
   status: 'active',
   name: 'Demo Co',
+  avatar: 'directory',
+  avatarMotion: 'wave',
   botName: 'Demo Bot',
   title: 'Demo Co Chat',
   subtitle: 'Demo subtitle',
@@ -342,6 +344,10 @@ await run('multi-site: widget from /b/<id>/widget.js applies the bot settings an
     assert.equal(await page.textContent('.orc-header-subtitle'), 'Demo subtitle');
     assert.equal(await page.getAttribute('.orc-input', 'placeholder'), 'Ask Demo Co...');
     assert.equal(await page.getAttribute('.orc-disclosure-link', 'href'), 'https://demo.example/privacy');
+    // The bot's mascot comes from the server root, not from /b/<id>/.
+    await page.waitForSelector('[data-testid=orc-bubble] svg .orc-hand', { timeout: 5000 });
+    assert.equal(await page.getAttribute('.orc-header-avatar img', 'src'), BASE + '/avatars/directory.svg');
+    assert.equal(await page.locator('.orc-root.orc-wave-go').count(), 1);
     await page.waitForFunction(() => document.body.textContent.includes('Hello from the demo bot!'), null, { timeout: 5000 });
     await page.fill('.orc-input', 'What are your opening hours?');
     await page.press('.orc-input', 'Enter');
@@ -388,6 +394,144 @@ await run('multi-site: a slow /config never holds the widget back; texts update 
     await page.waitForFunction(() => document.querySelector('.orc-header-title').textContent === 'Demo Co Chat', null, { timeout: 5000 });
     await page.waitForFunction(() => document.body.textContent.includes('Hello from the demo bot!'), null, { timeout: 5000 });
     assert.equal(await page.locator('.orc-msg-assistant').count(), 1, 'greeting replaced, not duplicated');
+  } finally {
+    sites.close();
+  }
+});
+
+await run('mascot avatar fills the launcher and follows the pointer', async (page) => {
+  await startServer();
+  await page.addInitScript(() => {
+    window.openRustChatbot = { avatar: 'electrician', avatarMotion: 'follow' };
+  });
+  await page.goto(BASE + '/');
+  await page.waitForSelector('[data-testid=orc-bubble] svg .orc-head', { timeout: 5000 });
+  assert.equal(await page.locator('[data-testid=orc-bubble] script').count(), 0);
+  await page.mouse.move(5, 5);
+  await page.waitForTimeout(400);
+  const turned = await page.getAttribute('[data-testid=orc-bubble] .orc-head', 'transform');
+  assert.match(turned || '', /rotate\(-/, 'head turns toward a pointer on the left');
+  assert.equal(await page.getAttribute('.orc-header-avatar img', 'src'), BASE + '/avatars/electrician.svg');
+  assert.equal(await page.getAttribute('[data-testid=orc-bubble]', 'aria-label'), 'Open chat');
+});
+
+await run('reduced motion keeps the mascot still', async (page) => {
+  await startServer();
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.addInitScript(() => {
+    window.openRustChatbot = { avatar: 'electrician', avatarMotion: 'follow' };
+  });
+  await page.goto(BASE + '/');
+  await page.waitForSelector('[data-testid=orc-bubble] svg .orc-head', { timeout: 5000 });
+  await page.mouse.move(5, 5);
+  await page.waitForTimeout(400);
+  assert.equal(await page.getAttribute('[data-testid=orc-bubble] .orc-head', 'transform'), null);
+});
+
+await run('an avatar name that is not a bundled mascot keeps the chat icon', async (page) => {
+  await startServer();
+  await page.addInitScript(() => {
+    window.openRustChatbot = { avatar: '../widget', avatarMotion: 'follow' };
+  });
+  await page.goto(BASE + '/');
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+  await page.waitForTimeout(500);
+  assert.equal(await page.locator('[data-testid=orc-bubble].orc-bubble-avatar').count(), 0);
+  assert.equal(await page.locator('.orc-header-avatar').count(), 0);
+});
+
+await run('an unknown bundled name falls back to the chat icon', async (page) => {
+  await startServer();
+  await page.addInitScript(() => {
+    window.openRustChatbot = { avatar: 'nobody', avatarMotion: 'still' };
+  });
+  await page.goto(BASE + '/');
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+  await page.waitForFunction(() => !document.querySelector('.orc-bubble-avatar'), null, { timeout: 5000 });
+  assert.equal(await page.locator('[data-testid=orc-bubble] svg path').count(), 1);
+});
+
+await run('follow mode stops touching the page once the head is at rest', async (page) => {
+  await startServer();
+  await page.addInitScript(() => {
+    window.openRustChatbot = { avatar: 'electrician', avatarMotion: 'follow' };
+  });
+  await page.goto(BASE + '/');
+  await page.waitForSelector('[data-testid=orc-bubble] svg .orc-head', { timeout: 5000 });
+  await page.mouse.move(5, 5);
+  await page.waitForTimeout(300);
+  assert.match((await page.getAttribute('[data-testid=orc-bubble] .orc-head', 'transform')) || '', /rotate/);
+  // 2.5s idle, then it eases back to centre and stops.
+  await page.waitForTimeout(4500);
+  const changes = await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        let n = 0;
+        const obs = new MutationObserver((m) => (n += m.length));
+        obs.observe(document.querySelector('[data-testid=orc-bubble]'), { attributes: true, subtree: true });
+        setTimeout(() => (obs.disconnect(), resolve(n)), 1000);
+      }),
+  );
+  assert.equal(changes, 0, 'no per-frame work while idle');
+  assert.equal(await page.getAttribute('[data-testid=orc-bubble] .orc-head', 'transform'), null);
+});
+
+await run('the inline mascot keeps only plain shapes, whatever the SVG holds', async (page) => {
+  await startServer();
+  await page.route('**/avatars/electrician.svg', (route) =>
+    route.fulfill({
+      contentType: 'image/svg+xml',
+      body:
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" onload="window.pwned=1">' +
+        '<style>body{display:none}</style><script>window.pwned=2</script>' +
+        '<g class="orc-head"><circle r="3" fill="url(https://evil.test/x)" style="x"/>' +
+        '<g class="orc-face"/><g class="orc-hat"/></g>' +
+        '<foreignObject><iframe xmlns="http://www.w3.org/1999/xhtml" srcdoc="&lt;script&gt;parent.pwned=3&lt;/script&gt;"/></foreignObject>' +
+        '<a href="javascript:alert(1)"><path d="M0 0"/></a><set attributeName="href" to="javascript:1"/>' +
+        '<iframe xmlns="http://www.w3.org/1999/xhtml" srcdoc="x"/></svg>',
+    }),
+  );
+  await page.addInitScript(() => {
+    window.openRustChatbot = { avatar: 'electrician', avatarMotion: 'follow' };
+  });
+  await page.goto(BASE + '/');
+  await page.waitForSelector('[data-testid=orc-bubble] svg .orc-head', { timeout: 5000 });
+  await page.waitForTimeout(300);
+  const html = await page.innerHTML('[data-testid=orc-bubble]');
+  for (const bad of ['onload', 'style', 'script', 'iframe', 'foreignObject', 'href', '<set', 'url(', '<a']) {
+    assert.ok(!html.includes(bad), `${bad} was stripped: ${html}`);
+  }
+  assert.equal(await page.evaluate(() => window.pwned), undefined);
+  assert.equal(await page.isVisible('body'), true);
+});
+
+await run('the wave plays once per tab, not on the next page', async (page) => {
+  await startServer();
+  await page.addInitScript(() => {
+    window.openRustChatbot = { avatar: 'solar', avatarMotion: 'wave' };
+  });
+  await page.goto(BASE + '/');
+  await page.waitForSelector('.orc-root.orc-wave-go .orc-hand', { timeout: 5000 });
+  // 2.5s delay + 1.8s wave, then the class goes so a reappearing button doesn't wave again.
+  await page.waitForSelector('.orc-root:not(.orc-wave-go) [data-testid=orc-bubble] svg', { timeout: 8000 });
+  await page.reload();
+  await page.waitForSelector('[data-testid=orc-bubble] svg .orc-hand', { timeout: 5000 });
+  await page.waitForTimeout(300);
+  assert.equal(await page.locator('.orc-root.orc-wave-go').count(), 0);
+});
+
+await run('a host page can turn the bot avatar off', async (page) => {
+  const sites = await startSites();
+  try {
+    await startServer(5, multiSiteEnv);
+    await page.addInitScript(() => {
+      window.openRustChatbot = { avatar: 'none' };
+    });
+    await page.goto(HOST + '/host');
+    await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+    await page.click('[data-testid=orc-bubble]');
+    await page.waitForFunction(() => document.body.textContent.includes('Hello from the demo bot!'), null, { timeout: 5000 });
+    assert.equal(await page.locator('.orc-bubble-avatar, .orc-header-avatar').count(), 0);
   } finally {
     sites.close();
   }

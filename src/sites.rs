@@ -132,6 +132,7 @@ impl Site {
             allowed_origins: config.allowed_origins.clone(),
             public_config: json!({
                 "title": null, "subtitle": null, "greeting": null, "placeholder": null, "privacyUrl": null,
+                "avatar": null, "avatarMotion": null,
             }),
             partner_id: None,
             caps: SpendCaps::default(),
@@ -209,6 +210,10 @@ struct BotRecord {
     placeholder: Option<String>,
     #[serde(default)]
     privacy_url: Option<String>,
+    #[serde(default)]
+    avatar: Option<String>,
+    #[serde(default)]
+    avatar_motion: Option<String>,
     #[serde(default)]
     allowed_origins: Vec<String>,
     #[serde(default)]
@@ -916,6 +921,8 @@ impl SiteStore {
                 DIRECTORY_TOOL_HINT,
             );
         }
+        let avatar = crate::avatars::preset(record.avatar.as_deref());
+        let avatar_motion = avatar.map(|_| crate::avatars::motion(record.avatar_motion.as_deref()));
         let kb =
             kb.unwrap_or_else(|| Arc::new(KnowledgeBase::from_markdown(&record.knowledge_base)));
         let own_urls: Vec<&str> = allowed_origins
@@ -939,6 +946,8 @@ impl SiteStore {
                 "greeting": non_empty(record.greeting),
                 "placeholder": non_empty(record.placeholder),
                 "privacyUrl": privacy_url,
+                "avatar": avatar,
+                "avatarMotion": avatar_motion,
             }),
             bot_name,
             partner_id,

@@ -406,6 +406,8 @@ async fn config_is_public_cacheable_json() {
             "greeting": "Hello from Alpha",
             "placeholder": "Ask Alpha...",
             "privacyUrl": null,
+            "avatar": null,
+            "avatarMotion": null,
         })
     );
     let avail = reqwest::get(format!("http://{}/b/alpha/availability", h.addr))
@@ -418,6 +420,76 @@ async fn config_is_public_cacheable_json() {
         .unwrap();
     assert_eq!(js.status(), 200);
     assert!(js.text().await.unwrap().contains("openRustChatbot"));
+}
+
+#[tokio::test]
+async fn avatar_settings_are_limited_to_the_bundled_mascots() {
+    let h = start(&[]).await;
+    let config = |id: &'static str| {
+        let url = format!("http://{}/b/{id}/config", h.addr);
+        async move {
+            reqwest::get(url)
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let mut b = bot("av-good", ALPHA_ORIGIN, "# x\n\ny", "Good");
+    b["avatar"] = json!("electrician");
+    b["avatarMotion"] = json!("follow");
+    h.sites.set("av-good", b);
+    let v = config("av-good").await;
+    assert_eq!(
+        (&v["avatar"], &v["avatarMotion"]),
+        (&json!("electrician"), &json!("follow"))
+    );
+
+    // Unknown motion falls back to still; an avatar that isn't bundled is dropped with its motion.
+    let mut b = bot("av-still", ALPHA_ORIGIN, "# x\n\ny", "Still");
+    b["avatar"] = json!("directory");
+    b["avatarMotion"] = json!("spin");
+    h.sites.set("av-still", b);
+    assert_eq!(config("av-still").await["avatarMotion"], "still");
+    for (id, bad) in [
+        ("av-url", "https://evil.test/x.svg"),
+        ("av-path", "../widget"),
+    ] {
+        let mut b = bot(id, ALPHA_ORIGIN, "# x\n\ny", "Bad");
+        b["avatar"] = json!(bad);
+        b["avatarMotion"] = json!("follow");
+        h.sites.set(id, b);
+        let v = config(id).await;
+        assert_eq!(
+            (&v["avatar"], &v["avatarMotion"]),
+            (&Value::Null, &Value::Null),
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bundled_avatars_are_served_to_any_site() {
+    let h = start(&[]).await;
+    let res = reqwest::get(format!("http://{}/avatars/electrician.svg", h.addr))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["content-type"], "image/svg+xml");
+    assert_eq!(res.headers()["access-control-allow-origin"], "*");
+    assert!(res.text().await.unwrap().contains("orc-head"));
+    for path in [
+        "avatars/electrician",
+        "avatars/nope.svg",
+        "avatars/..%2Fwidget.js.svg",
+    ] {
+        assert_eq!(
+            status(format!("http://{}/{path}", h.addr)).await,
+            404,
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -860,7 +932,15 @@ async fn partner_details_never_reach_the_public_config() {
     keys.sort();
     assert_eq!(
         keys,
-        ["greeting", "placeholder", "privacyUrl", "subtitle", "title"]
+        [
+            "avatar",
+            "avatarMotion",
+            "greeting",
+            "placeholder",
+            "privacyUrl",
+            "subtitle",
+            "title"
+        ]
     );
     assert!(!v.to_string().contains("tradesites"));
 }
