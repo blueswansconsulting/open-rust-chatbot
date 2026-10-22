@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Avatars v2 preview</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="wave.css">
+<style>
+body{margin:0;font:14px/1.45 -apple-system,system-ui,sans-serif;color:#1A2540}
+h1,h2{margin:0 0 12px}
+section{padding:24px}
+.light{background:#fff}.dark{background:#111827;color:#E5E7EB}
+.grid{display:grid;grid-template-columns:110px repeat(4,1fr) 60px;gap:10px 14px;align-items:center}
+.grid b{font-weight:600}
+.cell{display:flex;align-items:center;gap:8px}
+.cell img{display:block}
+.mock{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
+.panel{width:340px;border:1px solid #E3E8EF;border-radius:16px;overflow:hidden;background:#fff;color:#1A2540;box-shadow:0 20px 50px rgba(10,37,64,.25)}
+.hdr{background:#0A2540;color:#fff;padding:14px 16px;display:flex;gap:12px;align-items:center}
+.hav{width:40px;height:40px;border-radius:50%;background:#fff;padding:2px;flex:none}
+.hav img{width:100%;height:100%;display:block;border-radius:50%}
+.t{font-weight:600;font-size:15px;line-height:1.2}.s{font-size:12px;opacity:.85;margin-top:2px}
+.disc{padding:6px 16px;font-size:12px;color:#374151;background:#F5F8FB;border-bottom:1px solid #E3E8EF}
+.msgs{padding:16px;display:flex;flex-direction:column;gap:10px;min-height:150px}
+.row{display:flex;align-items:flex-end;gap:8px}
+.row img{width:24px;height:24px;flex:none}
+.bub{background:#F5F8FB;border:1px solid #E3E8EF;padding:10px 14px;border-radius:14px;border-bottom-left-radius:4px;max-width:78%}
+.user{align-self:flex-end;background:#0A2540;color:#fff;padding:10px 14px;border-radius:14px;border-bottom-right-radius:4px}
+.launch{position:relative;width:64px;height:64px;border-radius:50%;background:#fff;border:0;padding:4px;box-shadow:0 8px 24px rgba(10,37,64,.22);cursor:pointer}
+.launch svg,.launch img{width:100%;height:100%;display:block}
+.page{padding:20px;border-radius:12px;display:flex;flex-direction:column;gap:10px;align-items:center}
+.page.l{background:#F3F4F6;color:#1A2540}.page.d{background:#0B1220;color:#E5E7EB}
+button.play{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid #0A2540;background:#0A2540;color:#fff;cursor:pointer}
+</style></head><body>
+<script>
+var N=['default','electrician','plumber','heating','roofer','solar','builder','locksmith','gardener','cleaner','directory'];
+function grid(cls){
+ var h='<div class="grid"><b>name</b><b>24 (sm)</b><b>40</b><b>56</b><b>64</b><b>24 (full, avoid)</b>';
+ N.forEach(function(n){h+='<span>'+n+'</span>'+
+  '<span class="cell"><img src="'+n+'-sm.svg" width="24" height="24" alt=""><img src="'+n+'-sm.svg" width="32" height="32" alt=""></span>'+
+  '<span class="cell"><img src="'+n+'.svg" width="40" height="40" alt=""></span>'+
+  '<span class="cell"><img src="'+n+'.svg" width="56" height="56" alt=""></span>'+
+  '<span class="cell"><img src="'+n+'.svg" width="64" height="64" alt=""></span>'+
+  '<span class="cell"><img src="'+n+'.svg" width="24" height="24" alt=""></span>';});
+ return h+'</div>';
+}
+document.write('<section class="light"><h2>Light page</h2>'+grid()+'</section><section class="dark"><h2>Dark page</h2>'+grid()+'</section>');
+</script>
+
+<section class="light"><h2>Mock widget (Sparky, electrician)</h2>
+<div class="mock">
+ <div class="panel">
+  <div class="hdr"><div class="hav"><img src="electrician.svg" alt=""></div><div><div class="t">Brightwire Electrical</div><div class="s">Sparky, AI assistant</div></div></div>
+  <div class="disc">You are chatting with an AI assistant.</div>
+  <div class="msgs">
+   <div class="row"><img src="electrician-sm.svg" alt=""><div class="bub">Hi, I'm Sparky, Brightwire Electrical's AI assistant. How can I help?</div></div>
+   <div class="user">Can you rewire a kitchen?</div>
+   <div class="row"><img src="electrician-sm.svg" alt=""><div class="bub">Yes. What area are you in?</div></div>
+  </div>
+ </div>
+ <div class="panel" style="width:300px">
+  <div class="hdr"><div class="hav"><img src="directory.svg" alt=""></div><div><div class="t">Ranky</div><div class="s">AI assistant, Leeds Trades</div></div></div>
+  <div class="msgs"><div class="row"><img src="directory-sm.svg" alt=""><div class="bub">Hi, I'm Ranky, Leeds Trades' AI assistant. Looking for a local pro?</div></div></div>
+ </div>
+</div></section>
+
+<section class="light"><h2>Launcher with wave (inline SVG, plays once per session)</h2>
+<p><button class="play" id="play">Play wave (replay)</button> Reduced-motion: toggle your OS setting; wave and blink stay off.</p>
+<div class="mock">
+ <div class="page l"><div class="launch orc-wave-go" id="L1"></div>light page</div>
+ <div class="page d"><div class="launch orc-wave-go" id="L2"></div>dark page</div>
+ <div class="page l"><div class="launch" id="L3"></div>static idle (64px)</div>
+</div></section>
+
+<script>
+var HAND='<g class="orc-hand" opacity="0"><path d="M55 45V34" stroke="#FFC24B" stroke-width="4.5" stroke-linecap="round"/><circle cx="50.8" cy="31.8" r="2.2" fill="#fff" stroke="#0A2540" stroke-width="1.2"/><circle cx="55" cy="30" r="4.6" fill="#fff" stroke="#0A2540" stroke-width="1.5"/><circle cx="55" cy="30" r="3.8" fill="#fff"/></g>';
+fetch&&0;
+var X=new XMLHttpRequest();
+function load(cb){X.open('GET','electrician.svg');X.onload=function(){cb(X.responseText)};X.onerror=function(){cb(null)};X.send();}
+function put(txt){
+ ['L1','L2','L3'].forEach(function(id){document.getElementById(id).innerHTML=txt.replace('</svg>',HAND+'</svg>');});
+}
+// file:// can block XHR; fall back to <img> (no wave) with a note
+load(function(t){ if(t){put(t);} else {['L1','L2','L3'].forEach(function(id){document.getElementById(id).innerHTML='<img src="electrician.svg" alt="">';});
+ document.getElementById('play').insertAdjacentText('afterend',' (XHR blocked on file://: serve via `python3 -m http.server` to see the wave)');}});
+document.getElementById('play').onclick=function(){
+ ['L1','L2'].forEach(function(id){var e=document.getElementById(id);e.classList.remove('orc-wave-go');void e.offsetWidth;e.classList.add('orc-wave-go');});
+};
+</script>
+</body></html>

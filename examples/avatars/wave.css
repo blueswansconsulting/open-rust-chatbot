@@ -1,0 +1,32 @@
+/* Launcher wave + blink. Requires the INLINE avatar SVG (CSS cannot reach inside <img>).
+   Hand element (insert as last child of the full-size avatar svg, never in -sm):
+   <g class="orc-hand" opacity="0"><path d="M55 45V34" stroke="#FFC24B" stroke-width="4.5" stroke-linecap="round"/><circle cx="55" cy="30" r="4.6" fill="#fff" stroke="#0A2540" stroke-width="1.5"/><circle cx="50.8" cy="31.8" r="2" fill="#fff" stroke="#0A2540" stroke-width="1.2"/><circle cx="55" cy="30" r="3.9" fill="#fff"/></g>
+   JS (once per session): see SPEC.md section 9. Widget adds .orc-wave-go to the launcher root. */
+
+.orc-hand { opacity: 0; transform-box: view-box; transform-origin: 55px 45px; }
+.orc-eyes { transform-box: fill-box; transform-origin: center; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .orc-wave-go .orc-hand {
+    animation: orc-wave 1.8s ease-in-out 2.5s 1 both;   /* 2.5s after load, ONE run */
+  }
+  .orc-wave-go .orc-eyes {
+    animation: orc-blink 9s ease-in-out 8s 2 both;      /* 2 gentle blinks total, then still */
+  }
+}
+
+@keyframes orc-wave {
+  0%   { opacity: 0; transform: rotate(0); }
+  12%  { opacity: 1; transform: rotate(0); }
+  28%  { transform: rotate(24deg); }
+  44%  { transform: rotate(-14deg); }
+  60%  { transform: rotate(22deg); }
+  76%  { transform: rotate(-8deg); opacity: 1; }
+  88%  { transform: rotate(0); opacity: 1; }
+  100% { opacity: 0; transform: rotate(0); }
+}
+
+@keyframes orc-blink {
+  0%, 94%, 100% { transform: scaleY(1); }
+  97%           { transform: scaleY(.1); }
+}
