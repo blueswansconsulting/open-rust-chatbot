@@ -97,6 +97,8 @@ can tell visitors apart; otherwise every visitor shares the proxy's IP and the b
 <script src="https://chat.your-domain.com/widget.js" defer></script>
 ```
 
+Example mascot avatars (a friendly character with trade hats, as SVGs) are in [examples/avatars](examples/avatars/).
+
 ## Knowledge base
 
 Point `KNOWLEDGE_BASE_PATH` at a Markdown file. Each heading starts a section; long sections are split into overlapping chunks. See [`examples/knowledge-base.md`](examples/knowledge-base.md). Restart the server after editing it.
