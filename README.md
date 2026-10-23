@@ -107,7 +107,15 @@ can tell visitors apart; otherwise every visitor shares the proxy's IP and the b
 Mascot avatars (a friendly character with trade hats) are bundled and served at `/avatars/<name>.svg`:
 `default`, `electrician`, `plumber`, `heating`, `roofer`, `solar`, `builder`, `locksmith`, `gardener`,
 `cleaner` and `directory`. In multi-site mode a bot's `avatar` and `avatarMotion` come from its record.
-Only these names are accepted, and visitors who ask for reduced motion always see a still picture. The
+Only these names are accepted, and visitors who ask for reduced motion always see a still picture.
+
+`attention` (`teaser`, `label` or `both`) gets the chat noticed: a one-line `teaser` beside the button
+(`{town}` and `{service}` come from the page's schema.org data, else `teaserFallback`), or a short `label`
+the button shows for 5 seconds. Each shows at most once per tab, never on privacy, terms, cookie or contact
+pages, never moves focus, and stays away from a site's own fixed bottom bar; lift the whole chat above such
+a bar with the CSS variable `--orc-offset-bottom`. The widget remembers two preferences in localStorage, both
+plain expiry times with no identifiers: `orc-teaser-closed` (a visitor closed the teaser: 7 days) and
+`orc-lead-sent` (they sent their details: 30 days). The
 source art and a moving demo are in [examples/avatars](examples/avatars/).
 
 ## Knowledge base

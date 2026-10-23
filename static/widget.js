@@ -3,12 +3,15 @@
  * Embed:  <script src="https://chat.example.com/widget.js" defer></script>
  * Optional config, set before the script tag:
  *   window.openRustChatbot = { title, subtitle, greeting, placeholder, serverUrl, turnstileToken,
- *                              avatar, avatarMotion };
+ *                              avatar, avatarMotion, attention, teaser, teaserFallback, label };
  * serverUrl may include a path when the server is behind a sub-path, e.g. https://example.com/chat
  * Any of title, subtitle, greeting, placeholder and privacyUrl left out are read once from
  * <base>/config when the server provides it (multi-site mode); options set here always win.
  * avatar names one of the bundled mascots (see /avatars/, e.g. 'electrician') for the launcher and
  * header; avatarMotion is 'still', 'wave' (once, after load) or 'follow' (turns toward the pointer).
+ * attention is 'off' (default), 'teaser' (a one-line bubble beside the button), 'label' (the button
+ * briefly widens to show `label`) or 'both'. teaser may use {town} and {service}, read from the
+ * page's schema.org data; teaserFallback is used when the page has neither.
  * turnstileToken may be a string or a function returning a fresh token (or a Promise of one);
  * Turnstile tokens are single-use, so use a function if the visitor may reconnect.
  *
@@ -57,6 +60,7 @@
   var privacyOption = options.privacyUrl;
   var AVATAR_NAME = /^[a-z]{2,20}$/;
   var MOTIONS = ['still', 'wave', 'follow'];
+  var ATTENTION = ['off', 'teaser', 'label', 'both'];
   // Bundled mascots live at the server root, also for bots served from /b/<id>/.
   var avatarBase = serverBase.replace(/\/b\/[a-z0-9-]+$/, '') + '/avatars/';
 
@@ -79,6 +83,14 @@
     TEXT.avatar = typeof avatar === 'string' && avatar !== 'none' && AVATAR_NAME.test(avatar) ? avatar : null;
     var motion = options.avatarMotion || remote.avatarMotion;
     TEXT.avatarMotion = MOTIONS.indexOf(motion) >= 0 ? motion : 'still';
+    var attention = options.attention || remote.attention;
+    TEXT.attention = ATTENTION.indexOf(attention) >= 0 ? attention : 'off';
+    [['teaser', 120], ['teaserFallback', 120], ['label', 30]].forEach(function (entry) {
+      var value = options[entry[0]] || remote[entry[0]];
+      // Whole characters only, so an emoji is never cut in half.
+      var chars = typeof value === 'string' ? Array.from(value.trim()) : [];
+      TEXT[entry[0]] = chars.length ? chars.slice(0, entry[1]).join('') : null;
+    });
   }
 
   function loadSettings() {
@@ -104,6 +116,81 @@
     } catch (e) {
       return null;
     }
+  }
+
+  // Remembers only that this visitor closed the teaser or already sent their details, so they
+  // aren't prompted again (a preference, never used for tracking); never required to work.
+  var memory = {
+    until: function (key) {
+      try {
+        var t = Number(localStorage.getItem('orc-' + key));
+        return t > Date.now();
+      } catch (e) {
+        return false;
+      }
+    },
+    hold: function (key, days) {
+      try {
+        localStorage.setItem('orc-' + key, String(Date.now() + days * 864e5));
+      } catch (e) {}
+    },
+  };
+
+  // The town and service a page is about, from its schema.org data. A page's own node (a
+  // Service, or a WebPage/CollectionPage `about` place) wins over a business-wide areaServed,
+  // and an areaServed listing several places names none of them.
+  var PLACE_TYPES = ['Place', 'City', 'Town', 'AdministrativeArea', 'Locality'];
+  function pageContext() {
+    var found = { town: null, service: null };
+    var pageTown = null;
+    var clip = function (v) {
+      if (typeof v !== 'string') return null;
+      v = v.replace(/[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, '').trim();
+      return v && v.length <= 60 ? v : null;
+    };
+    var isA = function (node, types) {
+      return [].concat((node && node['@type']) || []).some(function (t) {
+        return types.indexOf(t) >= 0;
+      });
+    };
+    function onePlace(value) {
+      var places = [].concat(value || []);
+      return places.length === 1 && isA(places[0], PLACE_TYPES) ? clip(places[0].name) : null;
+    }
+    var seen = 0;
+    function visit(node, depth, topLevel) {
+      if (!node || typeof node !== 'object' || depth > 6 || ++seen > 500) return;
+      if (Array.isArray(node)) return node.forEach(function (n) {
+        visit(n, depth + 1, topLevel);
+      });
+      if (topLevel && isA(node, ['Service'])) {
+        found.service = found.service || clip(node.name);
+        pageTown = pageTown || onePlace(node.areaServed);
+      }
+      if (isA(node, ['WebPage', 'CollectionPage'])) pageTown = pageTown || onePlace(node.about);
+      if (!found.town) found.town = onePlace(node.about) || onePlace(node.areaServed);
+      Object.keys(node).forEach(function (k) {
+        if (typeof node[k] === 'object') visit(node[k], depth + 1, k === '@graph' && depth === 0);
+      });
+    }
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(function (script) {
+      try {
+        visit(JSON.parse(script.textContent || 'null'), 0, true);
+      } catch (e) {}
+    });
+    if (pageTown) found.town = pageTown;
+    return found;
+  }
+
+  // Fills {town} and {service}; null when the page doesn't supply one the text needs.
+  function fillText(template, context) {
+    if (!template) return null;
+    var missing = false;
+    var text = template.replace(/\{(town|service)\}/g, function (_, key) {
+      if (!context[key]) missing = true;
+      return context[key] || '';
+    });
+    return missing ? null : text;
   }
 
   // Per-tab storage for continuing a chat on the next page; never required to work.
@@ -408,7 +495,8 @@
     panel.appendChild(disclosure);
     panel.appendChild(messages);
     panel.appendChild(inputRow);
-    panel.appendChild(announcer);
+    // On the root, not the panel: the teaser is announced while the panel is closed.
+    root.appendChild(announcer);
     root.appendChild(panel);
     root.appendChild(bubble);
     // First in the page so keyboard users reach the chat without tabbing through every link.
@@ -518,6 +606,8 @@
       var lead = card.lead || {};
       var wrap = el('div', 'orc-card');
       var submitted = card.type === 'lead_submitted';
+      // They've sent their details, so never prompt them again for a while.
+      if (submitted) memory.hold('lead-sent', 30);
       wrap.appendChild(el('div', 'orc-card-title', submitted ? 'Details sent' : 'Send these details to the team?'));
       [lead.name, lead.phone, lead.email, lead.bestTime ? 'Best time: ' + lead.bestTime : null, lead.message].forEach(function (line) {
         if (line) wrap.appendChild(el('div', 'orc-card-line', String(line)));
@@ -655,6 +745,8 @@
 
     function setAvailable(ok) {
       available = ok && !refused;
+      // A chat that comes up after a slow start can still say hello.
+      if (available && typeof armAttention === 'function') setTimeout(armAttention, 0);
       // Never yank the panel away mid-conversation; the button hides once the panel is closed.
       root.hidden = !available && panel.dataset.open !== 'true';
     }
@@ -832,6 +924,9 @@
     function open(opts) {
       panel.dataset.open = 'true';
       store.set('open', '1');
+      store.set('prompted', '1');
+      hideTeaser();
+      hideLabel();
       bubble.setAttribute('aria-expanded', 'true');
       bubble.setAttribute('aria-label', 'Close chat');
       if (!greeted) {
@@ -854,6 +949,183 @@
       bubble.focus();
     }
 
+    // ---- Getting noticed ------------------------------------------------------------------
+    // At most one teaser per tab, never after it was closed (7 days) or details were sent
+    // (30 days), never on privacy/contact pages, never moving focus or opening the panel.
+    var teaser = null;
+    var labelTimer = null;
+    var attentionArmed = false;
+    var settingsReady = false;
+    var NO_PROMPT_PAGES = /(privacy|terms|cookie|contact|get-quotes|quote-request)/i;
+    var mobile = function () {
+      return !!(window.matchMedia && window.matchMedia('(max-width: 480px), (pointer: coarse)').matches);
+    };
+    var reducedMotion = function () {
+      return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    };
+
+    function promptAllowed() {
+      return (
+        available &&
+        !root.hidden &&
+        panel.dataset.open !== 'true' &&
+        !store.get('prompted') &&
+        !memory.until('teaser-closed') &&
+        !memory.until('lead-sent') &&
+        !NO_PROMPT_PAGES.test(location.pathname) &&
+        document.visibilityState !== 'hidden'
+      );
+    }
+
+    // Closed on purpose (× or Escape): remembered for a week, and keyboard focus goes to the button.
+    function dismissTeaser() {
+      if (!teaser) return;
+      var hadFocus = teaser.contains(document.activeElement);
+      memory.hold('teaser-closed', 7);
+      hideTeaser();
+      if (hadFocus) bubble.focus();
+    }
+
+    function hideTeaser() {
+      var leaving = teaser;
+      teaser = null;
+      if (!leaving) return;
+      if (reducedMotion()) return leaving.remove();
+      leaving.classList.add('orc-leaving');
+      setTimeout(function () {
+        leaving.remove();
+      }, 160);
+    }
+
+    // A site's own sticky bar (call now, cookies) under where the teaser would sit wins.
+    function coveringFixedBar() {
+      var r = bubble.getBoundingClientRect();
+      var x = Math.max(0, r.right - 140);
+      var y = r.top - 40;
+      var hit = document.elementFromPoint && document.elementFromPoint(x, y);
+      for (var n = hit; n && n !== document.body; n = n.parentElement) {
+        if (root.contains(n)) return false;
+        var pos = window.getComputedStyle(n).position;
+        if (pos === 'fixed' || pos === 'sticky') return true;
+      }
+      return false;
+    }
+
+    function showTeaser() {
+      var context = pageContext();
+      var text = fillText(TEXT.teaser, context) || fillText(TEXT.teaserFallback, context);
+      if (!text || teaser || !promptAllowed() || coveringFixedBar()) return;
+      store.set('prompted', '1');
+      hideLabel();
+      teaser = el('div', 'orc-teaser');
+      teaser.setAttribute('data-testid', 'orc-teaser');
+      var line = el('button', 'orc-teaser-text', text);
+      line.type = 'button';
+      line.addEventListener('click', function () {
+        open();
+      });
+      var dismiss = el('button', 'orc-teaser-close', '×');
+      dismiss.type = 'button';
+      dismiss.setAttribute('aria-label', 'Dismiss chat message');
+      dismiss.addEventListener('click', dismissTeaser);
+      teaser.appendChild(line);
+      teaser.appendChild(dismiss);
+      root.appendChild(teaser);
+      announce(text);
+      // The mascot waves hello with it, unless it already follows the pointer.
+      var hand = bubble.querySelector('.orc-hand');
+      if (hand && !root.classList.contains('orc-follow') && !reducedMotion()) {
+        hand.addEventListener('animationend', function () {
+          root.classList.remove('orc-wave-go');
+        }, { once: true });
+        root.classList.add('orc-wave-go');
+      }
+      // Don't linger: it goes after 25 s without counting as a dismissal, but never while the
+      // visitor is pointing at it or has moved keyboard focus into it.
+      var shown = teaser;
+      var held = false;
+      ['pointerenter', 'focusin'].forEach(function (type) {
+        shown.addEventListener(type, function () {
+          held = true;
+        });
+      });
+      ['pointerleave', 'focusout'].forEach(function (type) {
+        shown.addEventListener(type, function () {
+          held = shown.matches(':hover') || shown.contains(document.activeElement);
+        });
+      });
+      (function linger(ms) {
+        setTimeout(function () {
+          if (teaser !== shown) return;
+          if (held) return linger(5000);
+          hideTeaser();
+        }, ms);
+      })(25000);
+    }
+
+    function hideLabel() {
+      clearTimeout(labelTimer);
+      if (!bubble.classList.contains('orc-bubble-labelled')) return;
+      bubble.classList.remove('orc-bubble-labelled');
+      var label = bubble.querySelector('.orc-bubble-label');
+      if (label) label.remove();
+      bubble.setAttribute('aria-label', panel.dataset.open === 'true' ? 'Close chat' : 'Open chat');
+    }
+
+    // The button widens to show a short label for a few seconds, once per tab.
+    function showLabel() {
+      if (!TEXT.label || store.get('labelled') || !promptAllowed()) return false;
+      store.set('labelled', '1');
+      var label = el('span', 'orc-bubble-label', TEXT.label);
+      label.setAttribute('aria-hidden', 'true');
+      bubble.appendChild(label);
+      bubble.classList.add('orc-bubble-labelled');
+      // The visible words are part of the button's name while they show.
+      bubble.setAttribute('aria-label', TEXT.label + ', open chat');
+      labelTimer = setTimeout(hideLabel, 5000);
+      return true;
+    }
+
+    function armAttention() {
+      if (attentionArmed || !settingsReady || !available || TEXT.attention === 'off') return;
+      attentionArmed = true;
+      var wantLabel = TEXT.attention === 'label' || TEXT.attention === 'both';
+      var wantTeaser = TEXT.attention === 'teaser' || TEXT.attention === 'both';
+      var small = mobile();
+      var delay = small ? 20000 : 10000;
+      var depth = small ? 0.5 : 0.4;
+      var fired = false;
+      var teaserTimer = null;
+      // With both, the teaser waits until the label has been gone a while.
+      var notBefore = 0;
+      function fire() {
+        if (fired) return;
+        var wait = notBefore - Date.now();
+        if (wait > 0) {
+          clearTimeout(teaserTimer);
+          teaserTimer = setTimeout(fire, wait);
+          return;
+        }
+        fired = true;
+        clearTimeout(teaserTimer);
+        window.removeEventListener('scroll', onScroll);
+        if (wantTeaser) showTeaser();
+      }
+      function onScroll() {
+        var doc = document.documentElement;
+        var seen = (window.scrollY + window.innerHeight) / Math.max(doc.scrollHeight, 1);
+        if (wantLabel && window.scrollY > 120) label();
+        if (wantTeaser && seen >= depth) fire();
+      }
+      window.addEventListener('scroll', onScroll, { passive: true });
+      var label = function () {
+        if (fired) return;
+        if (showLabel() && wantTeaser) notBefore = Date.now() + 10000;
+      };
+      if (wantLabel) setTimeout(label, 4000);
+      if (wantTeaser) teaserTimer = setTimeout(fire, delay);
+    }
+
     bubble.setAttribute('aria-expanded', 'false');
     bubble.addEventListener('click', function () {
       if (panel.dataset.open === 'true') close();
@@ -861,6 +1133,11 @@
     });
     closeBtn.addEventListener('click', close);
     document.addEventListener('keydown', function (e) {
+      // Only an Escape meant for us: not one the page used to close its own menu or dialog.
+      var ours = root.contains(document.activeElement) || document.activeElement === document.body;
+      if (e.key === 'Escape' && teaser && panel.dataset.open !== 'true' && ours && !e.defaultPrevented) {
+        return dismissTeaser();
+      }
       if (e.key === 'Escape' && panel.dataset.open === 'true') close();
     });
     window.addEventListener('offline', function () {
@@ -907,6 +1184,8 @@
       input.setAttribute('aria-label', TEXT.placeholder);
       showPrivacyLink();
       showAvatar();
+      settingsReady = true;
+      armAttention();
       if (greetingNode && greetingNode.textContent === oldGreeting && messages.lastChild === greetingNode) {
         greetingNode.textContent = TEXT.greeting;
         saveTranscript();
@@ -915,6 +1194,7 @@
 
     checkHealth().then(function (ok) {
       setAvailable(ok);
+      armAttention();
       // Reopen quietly on larger screens only: on phones the panel would cover the page the
       // visitor just went to, so they get the button back instead.
       if (ok && reopen && !window.matchMedia('(max-width: 480px)').matches) open({ focus: false });

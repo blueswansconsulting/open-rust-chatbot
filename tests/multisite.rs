@@ -408,6 +408,10 @@ async fn config_is_public_cacheable_json() {
             "privacyUrl": null,
             "avatar": null,
             "avatarMotion": null,
+            "attention": null,
+            "teaser": null,
+            "teaserFallback": null,
+            "label": null,
         })
     );
     let avail = reqwest::get(format!("http://{}/b/alpha/availability", h.addr))
@@ -467,6 +471,51 @@ async fn avatar_settings_are_limited_to_the_bundled_mascots() {
             "{bad}"
         );
     }
+}
+
+#[tokio::test]
+async fn attention_prompts_are_one_short_plain_line_and_off_unless_asked_for() {
+    let h = start(&[]).await;
+    let config = |id: &'static str| {
+        let url = format!("http://{}/b/{id}/config", h.addr);
+        async move {
+            reqwest::get(url)
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let mut b = bot("at-on", ALPHA_ORIGIN, "# x\n\ny", "On");
+    b["attention"] = json!("both");
+    b["teaser"] = json!("  Need an electrician\nin {town}?\u{200b} ");
+    b["teaserFallback"] = json!("Need an electrician?");
+    b["label"] = json!("Get a call back");
+    h.sites.set("at-on", b);
+    let v = config("at-on").await;
+    assert_eq!(v["attention"], "both");
+    assert_eq!(v["teaser"], "Need an electrician in {town}?");
+    assert_eq!(v["teaserFallback"], "Need an electrician?");
+    assert_eq!(v["label"], "Get a call back");
+
+    // Too long is left out rather than cut mid-sentence; an unknown mode turns prompts off.
+    let mut b = bot("at-long", ALPHA_ORIGIN, "# x\n\ny", "Long");
+    b["attention"] = json!("teaser");
+    b["teaser"] = json!("x".repeat(121));
+    b["label"] = json!("y".repeat(31));
+    h.sites.set("at-long", b);
+    let v = config("at-long").await;
+    assert_eq!((&v["teaser"], &v["label"]), (&Value::Null, &Value::Null));
+    let mut b = bot("at-off", ALPHA_ORIGIN, "# x\n\ny", "Off");
+    b["attention"] = json!("popup");
+    b["teaser"] = json!("Hi");
+    h.sites.set("at-off", b);
+    let v = config("at-off").await;
+    assert_eq!(
+        (&v["attention"], &v["teaser"]),
+        (&Value::Null, &Value::Null)
+    );
 }
 
 #[tokio::test]
@@ -933,12 +982,16 @@ async fn partner_details_never_reach_the_public_config() {
     assert_eq!(
         keys,
         [
+            "attention",
             "avatar",
             "avatarMotion",
             "greeting",
+            "label",
             "placeholder",
             "privacyUrl",
             "subtitle",
+            "teaser",
+            "teaserFallback",
             "title"
         ]
     );

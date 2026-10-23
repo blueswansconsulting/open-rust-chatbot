@@ -133,6 +133,7 @@ impl Site {
             public_config: json!({
                 "title": null, "subtitle": null, "greeting": null, "placeholder": null, "privacyUrl": null,
                 "avatar": null, "avatarMotion": null,
+                "attention": null, "teaser": null, "teaserFallback": null, "label": null,
             }),
             partner_id: None,
             caps: SpendCaps::default(),
@@ -166,6 +167,24 @@ impl Site {
     pub fn allows_origin(&self, origin: &str) -> bool {
         self.allowed_origins.iter().any(|a| a == origin)
     }
+}
+
+/// How the widget asks for attention; anything unknown means it doesn't.
+fn attention_mode(value: Option<&str>) -> Option<&'static str> {
+    ["teaser", "label", "both"]
+        .into_iter()
+        .find(|m| Some(*m) == value.map(str::trim))
+}
+
+/// One line of prompt text: trimmed, no control or invisible characters, at most `max` characters.
+fn short_text(value: Option<String>, max: usize) -> Option<String> {
+    let text: String = value?
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !c.is_control() && !matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'))
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty() && text.chars().count() <= max).then_some(text)
 }
 
 /// Bot ids are `[a-z0-9-]{2,40}`; anything else is rejected before any fetch.
@@ -214,6 +233,14 @@ struct BotRecord {
     avatar: Option<String>,
     #[serde(default)]
     avatar_motion: Option<String>,
+    #[serde(default)]
+    attention: Option<String>,
+    #[serde(default)]
+    teaser: Option<String>,
+    #[serde(default)]
+    teaser_fallback: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
     #[serde(default)]
     allowed_origins: Vec<String>,
     #[serde(default)]
@@ -923,6 +950,8 @@ impl SiteStore {
         }
         let avatar = crate::avatars::preset(record.avatar.as_deref());
         let avatar_motion = avatar.map(|_| crate::avatars::motion(record.avatar_motion.as_deref()));
+        let attention = attention_mode(record.attention.as_deref());
+        let prompt_text = |text: Option<String>, max: usize| attention.and(short_text(text, max));
         let kb =
             kb.unwrap_or_else(|| Arc::new(KnowledgeBase::from_markdown(&record.knowledge_base)));
         let own_urls: Vec<&str> = allowed_origins
@@ -948,6 +977,10 @@ impl SiteStore {
                 "privacyUrl": privacy_url,
                 "avatar": avatar,
                 "avatarMotion": avatar_motion,
+                "attention": attention,
+                "teaser": prompt_text(record.teaser, 120),
+                "teaserFallback": prompt_text(record.teaser_fallback, 120),
+                "label": prompt_text(record.label, 30),
             }),
             bot_name,
             partner_id,
