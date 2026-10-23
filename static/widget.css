@@ -229,7 +229,7 @@
   padding: 0 0 0 0.75rem;
   transition: opacity 0.15s ease;
 }
-.orc-teaser.orc-leaving { opacity: 0; }
+.orc-teaser.orc-leaving { opacity: 0; transform: scale(0.85); transition: opacity 0.15s ease, transform 0.15s ease; }
 /* A speech-bubble tail pointing down at the mascot (the launcher's centre is 32px from the right). */
 .orc-teaser::after {
   content: ""; position: absolute; right: 23px; bottom: -9px;
@@ -266,11 +266,16 @@
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .orc-teaser { animation: orc-teaser-in 0.25s ease-out both; }
+  /* Pops out of the mascot like a speech bubble: grows from the tail with a small bounce. */
+  .orc-teaser { transform-origin: calc(100% - 32px) calc(100% + 10px); animation: orc-teaser-pop 0.42s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
   .orc-bubble-label { animation: orc-label-in 0.25s ease-out both; }
 }
 @media (prefers-reduced-motion: reduce) {
   .orc-bubble, .orc-teaser { transition: none; }
 }
-@keyframes orc-teaser-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes orc-teaser-pop {
+  0%   { opacity: 0; transform: scale(0.3); }
+  60%  { opacity: 1; }
+  100% { opacity: 1; transform: scale(1); }
+}
 @keyframes orc-label-in { from { opacity: 0; } to { opacity: 1; } }
