@@ -56,10 +56,21 @@
   cursor: pointer; line-height: 1; padding: 0 4px; opacity: 0.85;
 }
 .orc-close:hover { opacity: 1; }
+/* The header's two buttons share one size, hover and focus treatment. */
+.orc-header { gap: 0.5rem; }
+.orc-close {
+  width: 32px; height: 32px; padding: 0; border-radius: 8px; display: grid; place-items: center;
+}
+.orc-close:hover { background: rgba(255, 255, 255, 0.12); }
+.orc-header .orc-close:focus-visible { outline: 2px solid #FFFFFF; outline-offset: 2px; }
+@media (pointer: coarse) {
+  .orc-close, .orc-mute { width: 44px; height: 44px; }
+}
 .orc-mute {
   background: transparent; border: 0; color: #FFFFFF; cursor: pointer; opacity: 0.85;
   width: 32px; height: 32px; padding: 6px; border-radius: 8px; display: grid; place-items: center;
 }
+.orc-mute[aria-pressed="true"] svg path:first-child { opacity: 0.7; }
 .orc-mute[hidden] { display: none; }
 .orc-mute svg { width: 20px; height: 20px; display: block; }
 .orc-mute:hover { opacity: 1; background: rgba(255, 255, 255, 0.12); }

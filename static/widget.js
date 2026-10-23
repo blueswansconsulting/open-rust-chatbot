@@ -495,10 +495,12 @@
       muteBtn.appendChild(speakerIcon(muted));
       muteBtn.setAttribute('aria-pressed', muted ? 'true' : 'false');
       muteBtn.setAttribute('aria-label', 'Mute chat sounds');
+      muteBtn.title = muted ? 'Unmute chat sounds' : 'Mute chat sounds';
     }
     muteBtn.addEventListener('click', function () {
       sound.setMuted(!sound.muted());
       showMuted();
+      announce(sound.muted() ? 'Sounds muted' : 'Sounds on');
     });
     header.appendChild(muteBtn);
     header.appendChild(closeBtn);
@@ -1091,6 +1093,15 @@
     var sound = {
       ctx: null,
       last: 0,
+      // Without storage the choice couldn't be kept, so the sound stays off and no button shows.
+      storable: (function () {
+        try {
+          localStorage.getItem('orc-muted');
+          return true;
+        } catch (e) {
+          return false;
+        }
+      })(),
       muted: function () {
         try {
           return localStorage.getItem('orc-muted') === '1';
@@ -1104,13 +1115,18 @@
           else localStorage.removeItem('orc-muted');
         } catch (e) {}
       },
+      // Every gesture tries again: on phones a tap only counts once it ends, and a context made
+      // too early stays suspended until a later gesture resumes it.
       unlock: function () {
-        if (!TEXT.replySound || sound.ctx) return;
+        if (!TEXT.replySound || !sound.storable) return;
         var Ctx = window.AudioContext || window.webkitAudioContext;
         if (!Ctx) return;
         try {
-          sound.ctx = new Ctx();
-          if (sound.ctx.resume) sound.ctx.resume();
+          if (!sound.ctx) sound.ctx = new Ctx();
+          if (sound.ctx.state !== 'running' && sound.ctx.resume) {
+            var resumed = sound.ctx.resume();
+            if (resumed && resumed.catch) resumed.catch(function () {});
+          }
         } catch (e) {
           sound.ctx = null;
         }
@@ -1120,6 +1136,8 @@
         var ctx = sound.ctx;
         var now = Date.now();
         if (!TEXT.replySound || !ctx || sound.muted() || document.visibilityState !== 'hidden') return;
+        // A suspended context would only queue the notes for later, so it doesn't count.
+        if (ctx.state && ctx.state !== 'running') return;
         if (now - sound.last < 60000) return;
         sound.last = now;
         try {
@@ -1137,10 +1155,17 @@
             osc.start(t);
             osc.stop(t + 0.2);
           });
+          // Let the audio device go once the chime is done.
+          setTimeout(function () {
+            if (ctx.suspend && Date.now() - sound.last >= 400) {
+              var paused = ctx.suspend();
+              if (paused && paused.catch) paused.catch(function () {});
+            }
+          }, 450);
         } catch (e) {}
       },
     };
-    ['pointerdown', 'keydown'].forEach(function (type) {
+    ['pointerdown', 'pointerup', 'click', 'touchend', 'keydown'].forEach(function (type) {
       root.addEventListener(type, function (e) {
         if (e.isTrusted && e.key !== 'Escape') sound.unlock();
       });
@@ -1374,8 +1399,8 @@
       input.setAttribute('aria-label', TEXT.placeholder);
       showPrivacyLink();
       showAvatar();
-      muteBtn.hidden = !TEXT.replySound;
-      if (TEXT.replySound) showMuted();
+      muteBtn.hidden = !(TEXT.replySound && sound.storable);
+      if (!muteBtn.hidden) showMuted();
       settingsReady = true;
       armAttention();
       if (greetingNode && greetingNode.textContent === oldGreeting && messages.lastChild === greetingNode) {

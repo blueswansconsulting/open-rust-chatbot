@@ -831,8 +831,14 @@ await run('a site edit to the flagged title is kept when the title is put back',
 const fakeAudio = () => {
   window.__notes = 0;
   window.AudioContext = class {
-    constructor() { this.currentTime = 0; this.destination = {}; window.__audioUnlocked = true; }
-    resume() { return Promise.resolve(); }
+    constructor() { this.currentTime = 0; this.destination = {}; this.state = 'suspended'; window.__audioUnlocked = true; }
+    // A test can make the device refuse to start, like a phone without a real tap.
+    resume() {
+      if (window.__refuseAudio) return Promise.reject(new Error('not allowed'));
+      this.state = 'running';
+      return Promise.resolve();
+    }
+    suspend() { this.state = 'suspended'; return Promise.resolve(); }
     createOscillator() { return { frequency: {}, connect() {}, start() { window.__notes++; }, stop() {} }; }
     createGain() { return { gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} }; }
   };
@@ -891,4 +897,29 @@ await run('no sound and no mute button unless the site turns the reply sound on'
   await page.press('.orc-input', 'Enter');
   await page.waitForTimeout(4000);
   assert.equal(await page.evaluate(() => window.__notes), 0);
+});
+
+await run('a sound device that never starts never chimes, and spends no allowance', async (page) => {
+  await startServer(200);
+  await page.addInitScript(() => (window.__refuseAudio = true));
+  await chatOnDemo(page, { replySound: true });
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.click('[data-testid=orc-bubble]');
+  await page.fill('.orc-input', 'Hello there');
+  await setHidden(page, true);
+  await page.press('.orc-input', 'Enter');
+  await page.waitForTimeout(4000);
+  assert.equal(await page.evaluate(() => window.__notes), 0);
+  assert.deepEqual(errors, [], 'no unhandled errors on the host page');
+});
+
+await run('without storage there is no mute button and no sound', async (page) => {
+  await startServer(200);
+  await page.addInitScript(() => {
+    Object.defineProperty(window, 'localStorage', { get() { throw new Error('blocked'); } });
+  });
+  await chatOnDemo(page, { replySound: true });
+  await page.click('[data-testid=orc-bubble]');
+  assert.equal(await page.isVisible('.orc-mute'), false);
 });
