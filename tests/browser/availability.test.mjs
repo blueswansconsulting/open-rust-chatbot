@@ -745,3 +745,181 @@ await run('with both, the teaser waits until well after the label', async (page)
   await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 15000 });
   assert.equal(await page.locator('.orc-bubble-labelled').count(), 0);
 });
+
+// Playwright pages are always visible, so the tests switch the page's visibility by hand.
+async function setHidden(page, hidden) {
+  await page.evaluate((h) => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (h ? 'hidden' : 'visible') });
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => h });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+}
+
+await run('away on another tab, the title says there is a message, the teaser waits, and both are put back on return', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', { ...teaserOpts, tabAlert: true });
+  assert.equal(await page.title(), 'host');
+  await setHidden(page, true);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForFunction(() => document.title === '(1) New message · host', null, { timeout: 15000 });
+  assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0, 'not shown to nobody');
+  // The site changing its own title while we're away becomes the title to restore.
+  await page.evaluate(() => (document.title = 'Bolton electricians'));
+  await page.waitForFunction(() => document.title === '(1) New message · Bolton electricians');
+  await setHidden(page, false);
+  assert.equal(await page.title(), 'Bolton electricians');
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 3000 });
+});
+
+await run('a reply that arrives while the visitor is away flags the tab', async (page) => {
+  await startServer(300);
+  // The built-in demo page, so the chat socket can connect (a routed test page can't).
+  await page.addInitScript(() => {
+    window.openRustChatbot = { tabAlert: true };
+  });
+  await page.goto(BASE + '/');
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+  const original = await page.title();
+  await page.click('[data-testid=orc-bubble]');
+  await page.fill('.orc-input', 'Hello there');
+  await page.press('.orc-input', 'Enter');
+  await setHidden(page, true);
+  await page.waitForFunction(() => document.title.startsWith('(1) New message · '), null, { timeout: 15000 });
+  await setHidden(page, false);
+  assert.equal(await page.title(), original);
+});
+
+await run('the tab title is left alone unless the site turns the alert on', async (page) => {
+  await startServer(300);
+  await hostPage(page, '/electricians/bolton', teaserOpts);
+  await setHidden(page, true);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForTimeout(1500);
+  assert.equal(await page.title(), 'host');
+});
+
+await run('away, the tab is never flagged for a teaser that may not show (contact page, closed, details sent)', async (page) => {
+  await startServer();
+  await hostPage(page, '/contact', { ...teaserOpts, tabAlert: true });
+  await setHidden(page, true);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForTimeout(1500);
+  assert.equal(await page.title(), 'host', 'contact page');
+  for (const key of ['orc-teaser-closed', 'orc-lead-sent']) {
+    await page.evaluate((k) => { sessionStorage.clear(); localStorage.clear(); localStorage.setItem(k, String(Date.now() + 864e5)); }, key);
+    await hostPage(page, '/electricians/bolton', { ...teaserOpts, tabAlert: true });
+    await setHidden(page, true);
+    await page.mouse.wheel(0, 2000);
+    await page.waitForTimeout(1500);
+    assert.equal(await page.title(), 'host', key);
+  }
+});
+
+await run('a site edit to the flagged title is kept when the title is put back', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', { ...teaserOpts, tabAlert: true });
+  await setHidden(page, true);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForFunction(() => document.title === '(1) New message · host', null, { timeout: 15000 });
+  await page.evaluate(() => (document.title += ' | Rewires'));
+  await page.waitForTimeout(100);
+  await setHidden(page, false);
+  assert.equal(await page.title(), 'host | Rewires');
+});
+
+// A stand-in audio device that counts the notes played and whether it was unlocked.
+const fakeAudio = () => {
+  window.__notes = 0;
+  window.AudioContext = class {
+    constructor() { this.currentTime = 0; this.destination = {}; this.state = 'suspended'; window.__audioUnlocked = true; }
+    // A test can make the device refuse to start, like a phone without a real tap.
+    resume() {
+      if (window.__refuseAudio) return Promise.reject(new Error('not allowed'));
+      this.state = 'running';
+      return Promise.resolve();
+    }
+    suspend() { this.state = 'suspended'; return Promise.resolve(); }
+    createOscillator() { return { frequency: {}, connect() {}, start() { window.__notes++; }, stop() {} }; }
+    createGain() { return { gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} }; }
+  };
+};
+
+async function chatOnDemo(page, opts) {
+  await page.addInitScript(fakeAudio);
+  await page.addInitScript((o) => { window.openRustChatbot = o; }, opts);
+  await page.goto(BASE + '/');
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+}
+
+await run('a reply chimes once, softly, only while away and only after the visitor used the chat', async (page) => {
+  await startServer(200);
+  await chatOnDemo(page, { replySound: true });
+  assert.equal(await page.evaluate(() => !!window.__audioUnlocked), false, 'nothing unlocked before a click');
+  await page.click('[data-testid=orc-bubble]');
+  await page.fill('.orc-input', 'Hello there');
+  await page.press('.orc-input', 'Enter');
+  // Visible: no sound.
+  await page.waitForFunction(() => !document.querySelector('.orc-typing') && document.querySelectorAll('.orc-msg-assistant').length > 1, null, { timeout: 15000 });
+  assert.equal(await page.evaluate(() => window.__notes), 0);
+  // Away: one chime (two notes), then quiet for a minute.
+  await setHidden(page, true);
+  await page.fill('.orc-input', 'And another');
+  await page.press('.orc-input', 'Enter');
+  await page.waitForFunction(() => window.__notes === 2, null, { timeout: 15000 });
+  await page.fill('.orc-input', 'One more');
+  await page.press('.orc-input', 'Enter');
+  await page.waitForTimeout(3000);
+  assert.equal(await page.evaluate(() => window.__notes), 2, 'at most once a minute');
+});
+
+await run('the mute button silences replies and is remembered', async (page) => {
+  await startServer(200);
+  await chatOnDemo(page, { replySound: true });
+  await page.click('[data-testid=orc-bubble]');
+  assert.equal(await page.getAttribute('.orc-mute', 'aria-pressed'), 'false');
+  await page.click('.orc-mute');
+  assert.equal(await page.getAttribute('.orc-mute', 'aria-pressed'), 'true');
+  assert.equal(await page.evaluate(() => localStorage.getItem('orc-muted')), '1');
+  await page.fill('.orc-input', 'Hello there');
+  await setHidden(page, true);
+  await page.press('.orc-input', 'Enter');
+  await page.waitForTimeout(4000);
+  assert.equal(await page.evaluate(() => window.__notes), 0);
+});
+
+await run('no sound and no mute button unless the site turns the reply sound on', async (page) => {
+  await startServer(200);
+  await chatOnDemo(page, {});
+  await page.click('[data-testid=orc-bubble]');
+  assert.equal(await page.isVisible('.orc-mute'), false);
+  await page.fill('.orc-input', 'Hello there');
+  await setHidden(page, true);
+  await page.press('.orc-input', 'Enter');
+  await page.waitForTimeout(4000);
+  assert.equal(await page.evaluate(() => window.__notes), 0);
+});
+
+await run('a sound device that never starts never chimes, and spends no allowance', async (page) => {
+  await startServer(200);
+  await page.addInitScript(() => (window.__refuseAudio = true));
+  await chatOnDemo(page, { replySound: true });
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.click('[data-testid=orc-bubble]');
+  await page.fill('.orc-input', 'Hello there');
+  await setHidden(page, true);
+  await page.press('.orc-input', 'Enter');
+  await page.waitForTimeout(4000);
+  assert.equal(await page.evaluate(() => window.__notes), 0);
+  assert.deepEqual(errors, [], 'no unhandled errors on the host page');
+});
+
+await run('without storage there is no mute button and no sound', async (page) => {
+  await startServer(200);
+  await page.addInitScript(() => {
+    Object.defineProperty(window, 'localStorage', { get() { throw new Error('blocked'); } });
+  });
+  await chatOnDemo(page, { replySound: true });
+  await page.click('[data-testid=orc-bubble]');
+  assert.equal(await page.isVisible('.orc-mute'), false);
+});
