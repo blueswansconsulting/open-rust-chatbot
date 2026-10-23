@@ -614,7 +614,7 @@ await run('the teaser and button show above a site’s own cookie banner', async
       body: `<!doctype html><title>host</title><script>window.openRustChatbot=${JSON.stringify(teaserOpts)}</script>` +
         '<div style="height:4000px">content</div>' +
         `<script src="${BASE}/widget.js" defer></script>` +
-        '<div style="position:fixed;left:0;right:0;bottom:0;height:260px;background:#eee;z-index:2147483647">Cookies</div>',
+        '<div style="position:fixed;left:12px;right:12px;bottom:12px;height:218px;background:#eee;z-index:2147483647">Cookies</div>',
     }),
   );
   await page.goto(BASE + '/with-bar');
