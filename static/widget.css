@@ -52,7 +52,6 @@
 .orc-header-title { font-weight: 600; font-size: 15px; line-height: 1.2; }
 .orc-header-subtitle { font-size: 12px; opacity: 0.85; margin-top: 2px; }
 /* The header's two buttons (close and mute) share one size, hover and focus treatment. */
-.orc-header { gap: 0.5rem; }
 .orc-close {
   background: transparent; border: 0; color: #FFFFFF; font-size: 22px; line-height: 1;
   cursor: pointer; opacity: 0.85;
