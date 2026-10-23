@@ -997,29 +997,10 @@
       }, 160);
     }
 
-    // A site's own sticky bar (call now, cookies) under where the teaser would sit wins.
-    function coveringFixedBar() {
-      var r = bubble.getBoundingClientRect();
-      var x = Math.max(0, r.right - 140);
-      var y = r.top - 40;
-      var hit = document.elementFromPoint && document.elementFromPoint(x, y);
-      for (var n = hit; n && n !== document.body; n = n.parentElement) {
-        if (root.contains(n)) return false;
-        var pos = window.getComputedStyle(n).position;
-        if (pos === 'fixed' || pos === 'sticky') return true;
-      }
-      return false;
-    }
-
     function showTeaser() {
       var context = pageContext();
       var text = fillText(TEXT.teaser, context) || fillText(TEXT.teaserFallback, context);
       if (!text || teaser || !promptAllowed()) return;
-      // A cookie banner or call bar is in the way: try again shortly, a few times, as it may go.
-      if (coveringFixedBar()) {
-        if ((showTeaser.retries = (showTeaser.retries || 0) + 1) <= 6) setTimeout(showTeaser, 5000);
-        return;
-      }
       store.set('prompted', '1');
       hideLabel();
       teaser = el('div', 'orc-teaser');

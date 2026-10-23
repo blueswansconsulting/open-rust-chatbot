@@ -606,25 +606,27 @@ await run('the teaser shows once per tab, even without a close', async (page) =>
   assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0);
 });
 
-await run('the teaser stays away when the site has its own sticky bar there', async (page) => {
+await run('the teaser and button show above a site’s own cookie banner', async (page) => {
   await startServer();
   await page.route(BASE + '/with-bar', (route) =>
     route.fulfill({
       contentType: 'text/html',
       body: `<!doctype html><title>host</title><script>window.openRustChatbot=${JSON.stringify(teaserOpts)}</script>` +
         '<div style="height:4000px">content</div>' +
-        '<div style="position:fixed;left:0;right:0;bottom:0;height:200px;background:#eee">Call now</div>' +
+        '<div style="position:fixed;left:0;right:0;bottom:0;height:260px;background:#eee;z-index:2147483646">Cookies</div>' +
         `<script src="${BASE}/widget.js" defer></script>`,
     }),
   );
   await page.goto(BASE + '/with-bar');
   await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
   await page.mouse.wheel(0, 2000);
-  await page.waitForTimeout(1200);
-  assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0);
-  // Once the bar goes (a cookie banner answered), the teaser still gets its turn.
-  await page.evaluate(() => document.querySelector('div[style*="position:fixed"]').remove());
-  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 8000 });
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  // The topmost element at the button's and teaser's centres is ours, not the banner.
+  for (const sel of ['[data-testid=orc-bubble]', '.orc-teaser-text']) {
+    const box = await page.locator(sel).boundingBox();
+    const ours = await page.evaluate(([x, y]) => !!document.elementFromPoint(x, y).closest('.orc-root'), [box.x + box.width / 2, box.y + box.height / 2]);
+    assert.ok(ours, `${sel} is hidden behind the banner`);
+  }
 });
 
 await run('the close button and message are comfortable to tap', async (page) => {
