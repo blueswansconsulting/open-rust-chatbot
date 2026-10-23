@@ -536,3 +536,196 @@ await run('a host page can turn the bot avatar off', async (page) => {
     sites.close();
   }
 });
+
+// A tall host page with schema.org data, served from the chatbot's own origin.
+async function hostPage(page, path, opts, { jsonLd = true } = {}) {
+  const ld = jsonLd
+    ? '<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"Service","name":"Rewires","areaServed":{"@type":"Place","name":"Bolton"}}]}</script>'
+    : '';
+  await page.route(BASE + path, (route) =>
+    route.fulfill({
+      contentType: 'text/html',
+      body: `<!doctype html><title>host</title>${ld}<script>window.openRustChatbot=${JSON.stringify(opts)}</script>` +
+        `<div style="height:4000px">content</div><script src="${BASE}/widget.js" defer></script>`,
+    }),
+  );
+  await page.goto(BASE + path);
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+}
+
+const teaserOpts = {
+  attention: 'teaser',
+  teaser: 'Need help with {service} in {town}?',
+  teaserFallback: 'Need an electrician? Ask me.',
+};
+
+await run('the teaser names the page’s town and service, never takes focus, and opens the chat', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', teaserOpts);
+  await page.focus('body');
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  assert.equal(await page.textContent('.orc-teaser-text'), 'Need help with Rewires in Bolton?');
+  assert.equal(await page.evaluate(() => document.activeElement === document.body), true);
+  await page.click('.orc-teaser-text');
+  assert.equal(await page.getAttribute('.orc-panel', 'data-open'), 'true');
+  await page.waitForSelector('[data-testid=orc-teaser]', { state: 'detached', timeout: 2000 });
+});
+
+await run('without town or service data the fallback is used', async (page) => {
+  await startServer();
+  await hostPage(page, '/about', teaserOpts, { jsonLd: false });
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  assert.equal(await page.textContent('.orc-teaser-text'), 'Need an electrician? Ask me.');
+});
+
+await run('a closed teaser stays closed on the next page, and shows once per tab', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', teaserOpts);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  await page.click('.orc-teaser-close');
+  await page.waitForSelector('[data-testid=orc-teaser]', { state: 'detached', timeout: 2000 });
+  // Like a new tab (fresh sessionStorage): the close is still remembered.
+  await page.evaluate(() => sessionStorage.clear());
+  await hostPage(page, '/electricians/bury', teaserOpts);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0);
+});
+
+await run('the teaser shows once per tab, even without a close', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', teaserOpts);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  await hostPage(page, '/electricians/bury', teaserOpts);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0);
+});
+
+await run('the teaser stays away when the site has its own sticky bar there', async (page) => {
+  await startServer();
+  await page.route(BASE + '/with-bar', (route) =>
+    route.fulfill({
+      contentType: 'text/html',
+      body: `<!doctype html><title>host</title><script>window.openRustChatbot=${JSON.stringify(teaserOpts)}</script>` +
+        '<div style="height:4000px">content</div>' +
+        '<div style="position:fixed;left:0;right:0;bottom:0;height:200px;background:#eee">Call now</div>' +
+        `<script src="${BASE}/widget.js" defer></script>`,
+    }),
+  );
+  await page.goto(BASE + '/with-bar');
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+  await page.mouse.wheel(0, 2000);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0);
+});
+
+await run('the close button and message are comfortable to tap', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', teaserOpts);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  for (const sel of ['.orc-teaser-close', '.orc-teaser-text']) {
+    const box = await page.locator(sel).boundingBox();
+    assert.ok(box.height >= 44, `${sel} is ${box.height}px tall`);
+  }
+  assert.ok((await page.locator('.orc-teaser-close').boundingBox()).width >= 44);
+});
+
+await run('no prompts on privacy or contact pages', async (page) => {
+  await startServer();
+  await hostPage(page, '/privacy', teaserOpts);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0);
+});
+
+await run('the button shows its label for a few seconds, once, then shrinks back', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', { attention: 'label', label: 'Get a call back' });
+  await page.mouse.wheel(0, 400);
+  await page.waitForSelector('.orc-bubble-labelled .orc-bubble-label', { timeout: 5000 });
+  assert.equal(await page.getAttribute('[data-testid=orc-bubble]', 'aria-label'), 'Get a call back, open chat');
+  await page.waitForSelector('.orc-bubble-labelled', { state: 'detached', timeout: 8000 });
+  assert.equal(await page.getAttribute('[data-testid=orc-bubble]', 'aria-label'), 'Open chat');
+  await page.mouse.wheel(0, 400);
+  await page.waitForTimeout(800);
+  assert.equal(await page.locator('.orc-bubble-labelled').count(), 0);
+});
+
+await run('attention is off unless asked for', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', { teaser: 'Hi {town}' });
+  await page.mouse.wheel(0, 2000);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.locator('[data-testid=orc-teaser], .orc-bubble-labelled').count(), 0);
+});
+
+await run('screen readers hear the teaser: its live region is not inside the closed panel', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', teaserOpts);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  await page.waitForFunction(() => document.querySelector('.orc-sr-only[aria-live]').textContent.includes('Bolton'), null, { timeout: 2000 });
+  assert.equal(await page.evaluate(() => !document.querySelector('.orc-sr-only[aria-live]').closest('.orc-panel')), true);
+});
+
+await run('Escape dismisses the teaser for a week and focus moves to the chat button', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', teaserOpts);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  await page.focus('.orc-teaser-close');
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('[data-testid=orc-teaser]', { state: 'detached', timeout: 2000 });
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.testid), 'orc-bubble');
+  assert.ok(await page.evaluate(() => Number(localStorage.getItem('orc-teaser-closed')) > Date.now()));
+});
+
+await run('a business-wide list of towns names none of them; the page’s own place wins', async (page) => {
+  await startServer();
+  let opts = teaserOpts;
+  await page.route(BASE + '/bury', (route) =>
+    route.fulfill({
+      contentType: 'text/html',
+      body:
+        '<!doctype html><title>host</title><script type="application/ld+json">' +
+        JSON.stringify({ '@context': 'https://schema.org', '@graph': [
+          { '@type': 'Electrician', name: 'Sparks', areaServed: [{ '@type': 'City', name: 'Bolton' }, { '@type': 'City', name: 'Bury' }],
+            hasOfferCatalog: { itemListElement: [{ '@type': 'Service', name: 'Catalogue item' }] } },
+          { '@type': 'WebPage', about: { '@type': 'City', name: 'Bury' } },
+        ] }) +
+        `</script><script>window.openRustChatbot=${JSON.stringify(opts)}</script>` +
+        `<div style="height:4000px">content</div><script src="${BASE}/widget.js" defer></script>`,
+    }),
+  );
+  await page.goto(BASE + '/bury');
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  // No page-level Service, so the {service} text can't be filled: the fallback is used.
+  assert.equal(await page.textContent('.orc-teaser-text'), 'Need an electrician? Ask me.');
+  // With a town-only teaser, the page's own place is used, not the first of the business's towns.
+  await page.evaluate(() => sessionStorage.clear());
+  opts = { attention: 'teaser', teaser: 'Need an electrician in {town}?', teaserFallback: 'x' };
+  await page.reload();
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  assert.equal(await page.textContent('.orc-teaser-text'), 'Need an electrician in Bury?');
+});
+
+await run('with both, the teaser waits until well after the label', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', { ...teaserOpts, attention: 'both', label: 'Get a call back' });
+  await page.mouse.wheel(0, 2000);
+  await page.waitForSelector('.orc-bubble-labelled', { timeout: 5000 });
+  await page.waitForTimeout(1000);
+  assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0, 'no teaser while the label shows');
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 15000 });
+  assert.equal(await page.locator('.orc-bubble-labelled').count(), 0);
+});

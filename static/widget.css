@@ -211,3 +211,57 @@
 .orc-disclosure { padding: 0.375rem 1rem; font-size: 12px; line-height: 1.35; color: #374151; background: #F5F8FB; border-bottom: 1px solid #E3E8EF; }
 .orc-disclosure-link { color: inherit; text-decoration: underline; }
 .orc-msg-notice { align-self: center; max-width: 92%; font-size: 12px; color: #4B5563; background: transparent; text-align: center; }
+
+/* Getting noticed: a one-line teaser beside the button, and a button that briefly shows a label.
+   Sites with a sticky bottom bar can lift the chat with --orc-offset-bottom. */
+.orc-root { bottom: calc(var(--orc-offset-bottom, 1.5rem) + env(safe-area-inset-bottom, 0px)); }
+@media (max-width: 480px) {
+  .orc-root { bottom: calc(var(--orc-offset-bottom, 0.75rem) + env(safe-area-inset-bottom, 0px)); }
+}
+.orc-teaser {
+  position: absolute; right: 0; bottom: 76px;
+  display: flex; align-items: stretch; gap: 0;
+  max-width: min(280px, calc(100vw - 2rem));
+  background: #FFFFFF; color: #1A2540; border: 1px solid #E3E8EF; border-radius: 14px 14px 4px 14px;
+  box-shadow: 0 10px 28px rgba(10, 37, 64, 0.18);
+  padding: 0 0 0 0.75rem;
+  transition: opacity 0.15s ease;
+}
+.orc-teaser.orc-leaving { opacity: 0; }
+.orc-teaser-text {
+  align-self: stretch; min-height: 44px; flex: 1;
+  background: transparent; border: 0; padding: 0.375rem 0; margin: 0; cursor: pointer;
+  font: inherit; font-size: 15px; color: inherit; text-align: left; line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.orc-teaser-close {
+  flex-shrink: 0; min-width: 44px; min-height: 44px; display: grid; place-items: center;
+  background: transparent; border: 0; cursor: pointer; color: #6B7280;
+  font-size: 20px; line-height: 1; padding: 0; border-radius: 0 14px 4px 0;
+}
+.orc-teaser-close:hover, .orc-teaser-close:focus-visible { color: #0A2540; background: #F5F8FB; }
+.orc-teaser-close:active { background: #E3E8EF; }
+.orc-teaser-text:focus-visible, .orc-teaser-close:focus-visible {
+  outline: 2px solid #116149; outline-offset: 2px; box-shadow: 0 0 0 2px #FFFFFF;
+}
+.orc-panel[data-open="true"] ~ .orc-teaser { display: none; }
+
+.orc-bubble { max-width: 64px; transition: max-width 0.25s ease-out, transform 0.15s ease, box-shadow 0.15s ease; }
+.orc-bubble.orc-bubble-labelled {
+  width: auto; max-width: min(320px, calc(100vw - 1.5rem)); border-radius: 32px; gap: 4px; padding-right: 20px;
+}
+.orc-bubble-label {
+  font-weight: 600; font-size: 15px; line-height: 1; color: #0A2540;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .orc-teaser { animation: orc-teaser-in 0.25s ease-out both; }
+  .orc-bubble-label { animation: orc-label-in 0.25s ease-out both; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .orc-bubble, .orc-teaser { transition: none; }
+}
+@keyframes orc-teaser-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes orc-label-in { from { opacity: 0; } to { opacity: 1; } }
