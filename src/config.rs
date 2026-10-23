@@ -318,9 +318,15 @@ impl Config {
                     60,
                     &mut errors,
                 )),
-                max_cache_bytes: env
-                    .num::<usize>("SITES_CACHE_MAX_MB", 256, &mut errors)
-                    .saturating_mul(1024 * 1024),
+                max_cache_bytes: {
+                    let bytes = env
+                        .num::<usize>("SITES_CACHE_MAX_MB", 96, &mut errors)
+                        .saturating_mul(1024 * 1024);
+                    if let Err(e) = cache_fits(bytes, container_memory_limit()) {
+                        errors.push(e);
+                    }
+                    bytes
+                },
             }
         });
 
@@ -945,5 +951,55 @@ mod tests {
         .unwrap();
         assert_eq!(c.host, "127.0.0.1");
         assert!(c.system_prompt.starts_with("You are Sparky"));
+    }
+}
+
+/// The container's memory limit, from cgroup v2 (`memory.max`) or v1, when there is one.
+fn container_memory_limit() -> Option<usize> {
+    [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .find_map(|path| std::fs::read_to_string(path).ok())
+    .and_then(|v| v.trim().parse::<usize>().ok())
+    // cgroup v1 reports "no limit" as a huge number.
+    .filter(|&v| v < (1usize << 50))
+}
+
+/// The bot cache must leave room for everything else in the container (sockets, replies,
+/// datasets): at most three quarters of its memory.
+fn cache_fits(cache_bytes: usize, limit: Option<usize>) -> Result<(), String> {
+    match limit {
+        Some(limit) if cache_bytes > limit / 4 * 3 => Err(format!(
+            "SITES_CACHE_MAX_MB ({} MB) is more than three quarters of this container's memory ({} MB); lower it or raise the memory limit",
+            cache_bytes / (1024 * 1024),
+            limit / (1024 * 1024)
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod cache_limit_tests {
+    use super::cache_fits;
+
+    const MB: usize = 1024 * 1024;
+
+    #[test]
+    fn the_cache_must_fit_well_inside_the_container() {
+        assert!(
+            cache_fits(96 * MB, Some(192 * MB)).is_ok(),
+            "the default fits a 192 MB container"
+        );
+        assert!(
+            cache_fits(256 * MB, Some(192 * MB)).is_err(),
+            "the old default did not"
+        );
+        assert!(cache_fits(150 * MB, Some(192 * MB)).is_err());
+        assert!(
+            cache_fits(256 * MB, None).is_ok(),
+            "no limit known: nothing to check"
+        );
     }
 }
