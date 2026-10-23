@@ -1014,7 +1014,12 @@
     function showTeaser() {
       var context = pageContext();
       var text = fillText(TEXT.teaser, context) || fillText(TEXT.teaserFallback, context);
-      if (!text || teaser || !promptAllowed() || coveringFixedBar()) return;
+      if (!text || teaser || !promptAllowed()) return;
+      // A cookie banner or call bar is in the way: try again shortly, a few times, as it may go.
+      if (coveringFixedBar()) {
+        if ((showTeaser.retries = (showTeaser.retries || 0) + 1) <= 6) setTimeout(showTeaser, 5000);
+        return;
+      }
       store.set('prompted', '1');
       hideLabel();
       teaser = el('div', 'orc-teaser');

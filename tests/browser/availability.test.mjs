@@ -622,6 +622,9 @@ await run('the teaser stays away when the site has its own sticky bar there', as
   await page.mouse.wheel(0, 2000);
   await page.waitForTimeout(1200);
   assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0);
+  // Once the bar goes (a cookie banner answered), the teaser still gets its turn.
+  await page.evaluate(() => document.querySelector('div[style*="position:fixed"]').remove());
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 8000 });
 });
 
 await run('the close button and message are comfortable to tap', async (page) => {
@@ -633,6 +636,10 @@ await run('the close button and message are comfortable to tap', async (page) =>
     const box = await page.locator(sel).boundingBox();
     assert.ok(box.height >= 44, `${sel} is ${box.height}px tall`);
   }
+  // Laid out as a bubble beside the button, not squeezed into the button's 64px column.
+  const bubbleBox = await page.locator('[data-testid=orc-teaser]').boundingBox();
+  assert.ok(bubbleBox.width >= 200, `teaser is only ${bubbleBox.width}px wide`);
+  assert.ok(bubbleBox.height <= 80, `teaser is ${bubbleBox.height}px tall`);
   assert.ok((await page.locator('.orc-teaser-close').boundingBox()).width >= 44);
 });
 
