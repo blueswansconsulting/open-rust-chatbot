@@ -613,20 +613,25 @@ await run('the teaser and button show above a site’s own cookie banner', async
       contentType: 'text/html',
       body: `<!doctype html><title>host</title><script>window.openRustChatbot=${JSON.stringify(teaserOpts)}</script>` +
         '<div style="height:4000px">content</div>' +
-        '<div style="position:fixed;left:0;right:0;bottom:0;height:260px;background:#eee;z-index:2147483646">Cookies</div>' +
-        `<script src="${BASE}/widget.js" defer></script>`,
+        `<script src="${BASE}/widget.js" defer></script>` +
+        '<div style="position:fixed;left:0;right:0;bottom:0;height:260px;background:#eee;z-index:2147483647">Cookies</div>',
     }),
   );
   await page.goto(BASE + '/with-bar');
   await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
   await page.mouse.wheel(0, 2000);
   await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  // The chat rose above the banner, and goes back down once it's answered.
+  const bannerTop = await page.evaluate(() => document.querySelector('div[style*="position:fixed"]').getBoundingClientRect().top);
+  assert.ok((await page.locator('[data-testid=orc-bubble]').boundingBox()).y + 64 <= bannerTop + 1, 'button is above the banner');
   // The topmost element at the button's and teaser's centres is ours, not the banner.
   for (const sel of ['[data-testid=orc-bubble]', '.orc-teaser-text']) {
     const box = await page.locator(sel).boundingBox();
     const ours = await page.evaluate(([x, y]) => !!document.elementFromPoint(x, y).closest('.orc-root'), [box.x + box.width / 2, box.y + box.height / 2]);
     assert.ok(ours, `${sel} is hidden behind the banner`);
   }
+  await page.evaluate(() => document.querySelector('div[style*="position:fixed"]').remove());
+  await page.waitForFunction(() => !document.querySelector('.orc-root').style.bottom, null, { timeout: 3000 });
 });
 
 await run('the close button and message are comfortable to tap', async (page) => {

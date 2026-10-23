@@ -927,6 +927,7 @@
       store.set('prompted', '1');
       hideTeaser();
       hideLabel();
+      if (typeof liftAboveBars === 'function') liftAboveBars();
       bubble.setAttribute('aria-expanded', 'true');
       bubble.setAttribute('aria-label', 'Close chat');
       if (!greeted) {
@@ -939,6 +940,7 @@
 
     function close() {
       panel.dataset.open = 'false';
+      setTimeout(liftAboveBars, 0);
       store.set('open', null);
       bubble.setAttribute('aria-expanded', 'false');
       bubble.setAttribute('aria-label', 'Open chat');
@@ -996,6 +998,41 @@
         leaving.remove();
       }, 160);
     }
+
+    // A site's cookie banner or call bar fixed along the bottom would cover the chat (it can sit at
+    // the same z-index and later in the page), so the chat rises above it while it shows.
+    var liftedBy = 0;
+    function bottomBarTop() {
+      var x = window.innerWidth - 40;
+      var y = window.innerHeight - 40;
+      var stack = document.elementsFromPoint ? document.elementsFromPoint(x, y) : [];
+      for (var i = 0; i < stack.length; i++) {
+        if (root.contains(stack[i])) continue;
+        for (var n = stack[i]; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+          var pos = window.getComputedStyle(n).position;
+          if (pos !== 'fixed' && pos !== 'sticky') continue;
+          var r = n.getBoundingClientRect();
+          // Only a bar along the bottom, not a full-screen overlay or a side panel.
+          if (r.bottom >= window.innerHeight - 8 && r.top > window.innerHeight * 0.3) return r.top;
+        }
+      }
+      return null;
+    }
+    function liftAboveBars() {
+      // An open panel stays where it is, so it never rises off the top of a phone screen.
+      var top = panel.dataset.open === 'true' ? null : bottomBarTop();
+      var lift = top === null ? 0 : Math.round(window.innerHeight - top);
+      if (lift === liftedBy) return;
+      liftedBy = lift;
+      root.style.bottom = lift ? 'calc(' + lift + 'px + 0.75rem)' : '';
+    }
+    liftAboveBars();
+    var liftChecks = setInterval(liftAboveBars, 1000);
+    setTimeout(function () {
+      clearInterval(liftChecks);
+      setInterval(liftAboveBars, 4000);
+    }, 120000);
+    window.addEventListener('resize', liftAboveBars);
 
     function showTeaser() {
       var context = pageContext();
