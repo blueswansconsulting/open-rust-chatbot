@@ -51,17 +51,14 @@
 .orc-header-text { flex: 1; min-width: 0; }
 .orc-header-title { font-weight: 600; font-size: 15px; line-height: 1.2; }
 .orc-header-subtitle { font-size: 12px; opacity: 0.85; margin-top: 2px; }
-.orc-close {
-  background: transparent; border: 0; color: #FFFFFF; font-size: 22px;
-  cursor: pointer; line-height: 1; padding: 0 4px; opacity: 0.85;
-}
-.orc-close:hover { opacity: 1; }
-/* The header's two buttons share one size, hover and focus treatment. */
+/* The header's two buttons (close and mute) share one size, hover and focus treatment. */
 .orc-header { gap: 0.5rem; }
 .orc-close {
+  background: transparent; border: 0; color: #FFFFFF; font-size: 22px; line-height: 1;
+  cursor: pointer; opacity: 0.85;
   width: 32px; height: 32px; padding: 0; border-radius: 8px; display: grid; place-items: center;
 }
-.orc-close:hover { background: rgba(255, 255, 255, 0.12); }
+.orc-close:hover { opacity: 1; background: rgba(255, 255, 255, 0.12); }
 .orc-header .orc-close:focus-visible { outline: 2px solid #FFFFFF; outline-offset: 2px; }
 @media (pointer: coarse) {
   .orc-close, .orc-mute { width: 44px; height: 44px; }
@@ -209,7 +206,7 @@
   0%, 94%, 100% { transform: scaleY(1); }
   97%           { transform: scaleY(.1); }
 }
-.orc-bubble:focus-visible, .orc-close:focus-visible, .orc-send:focus-visible, .orc-card-action:focus-visible {
+.orc-bubble:focus-visible, .orc-send:focus-visible, .orc-card-action:focus-visible {
   outline: 2px solid #116149; outline-offset: 2px;
 }
 .orc-input-row { margin: 0; }
