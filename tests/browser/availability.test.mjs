@@ -639,6 +639,8 @@ await run('the close button and message are comfortable to tap', async (page) =>
   await hostPage(page, '/electricians/bolton', teaserOpts);
   await page.mouse.wheel(0, 2000);
   await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 5000 });
+  // Measured once the pop-in animation has finished.
+  await page.waitForFunction(() => document.querySelector('[data-testid=orc-teaser]').getAnimations().every((a) => a.playState === 'finished'));
   for (const sel of ['.orc-teaser-close', '.orc-teaser-text']) {
     const box = await page.locator(sel).boundingBox();
     assert.ok(box.height >= 44, `${sel} is ${box.height}px tall`);
