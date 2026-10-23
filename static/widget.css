@@ -11,7 +11,8 @@
 */
 
 .orc-root {
-  position: fixed; bottom: 1.5rem; right: 1.5rem; z-index: 2147483000;
+  /* Above a site's own cookie banner or sticky bar, so the chat is never hidden behind one. */
+  position: fixed; bottom: 1.5rem; right: 1.5rem; z-index: 2147483647;
   font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   color: #1A2540;
 }
