@@ -797,3 +797,32 @@ await run('the tab title is left alone unless the site turns the alert on', asyn
   await page.waitForTimeout(1500);
   assert.equal(await page.title(), 'host');
 });
+
+await run('away, the tab is never flagged for a teaser that may not show (contact page, closed, details sent)', async (page) => {
+  await startServer();
+  await hostPage(page, '/contact', { ...teaserOpts, tabAlert: true });
+  await setHidden(page, true);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForTimeout(1500);
+  assert.equal(await page.title(), 'host', 'contact page');
+  for (const key of ['orc-teaser-closed', 'orc-lead-sent']) {
+    await page.evaluate((k) => { sessionStorage.clear(); localStorage.clear(); localStorage.setItem(k, String(Date.now() + 864e5)); }, key);
+    await hostPage(page, '/electricians/bolton', { ...teaserOpts, tabAlert: true });
+    await setHidden(page, true);
+    await page.mouse.wheel(0, 2000);
+    await page.waitForTimeout(1500);
+    assert.equal(await page.title(), 'host', key);
+  }
+});
+
+await run('a site edit to the flagged title is kept when the title is put back', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', { ...teaserOpts, tabAlert: true });
+  await setHidden(page, true);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForFunction(() => document.title === '(1) New message · host', null, { timeout: 15000 });
+  await page.evaluate(() => (document.title += ' | Rewires'));
+  await page.waitForTimeout(100);
+  await setHidden(page, false);
+  assert.equal(await page.title(), 'host | Rewires');
+});

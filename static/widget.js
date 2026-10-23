@@ -973,7 +973,8 @@
       return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
     };
 
-    function promptAllowed() {
+    // Everything that decides whether this visitor may be prompted on this page at all.
+    function promptRules() {
       return (
         available &&
         !root.hidden &&
@@ -981,9 +982,12 @@
         !store.get('prompted') &&
         !memory.until('teaser-closed') &&
         !memory.until('lead-sent') &&
-        !NO_PROMPT_PAGES.test(location.pathname) &&
-        document.visibilityState !== 'hidden'
+        !NO_PROMPT_PAGES.test(location.pathname)
       );
+    }
+
+    function promptAllowed() {
+      return promptRules() && document.visibilityState !== 'hidden';
     }
 
     // Closed on purpose (× or Escape): remembered for a week, and keyboard focus goes to the button.
@@ -1054,9 +1058,17 @@
       document.title = PREFIX + tabTitle;
       var node = document.querySelector('title');
       if (node && window.MutationObserver) {
+        var reapplied = 0;
         titleWatch = new MutationObserver(function () {
-          if (tabTitle === null || document.title.indexOf(PREFIX) === 0) return;
+          if (tabTitle === null) return;
+          // The site edited the title while it carried our prefix: keep its edit.
+          if (document.title.indexOf(PREFIX) === 0) {
+            tabTitle = document.title.slice(PREFIX.length);
+            return;
+          }
           tabTitle = document.title;
+          // Another script that keeps resetting the title wins after a few rounds.
+          if (++reapplied > 5) return titleWatch.disconnect();
           document.title = PREFIX + tabTitle;
         });
         titleWatch.observe(node, { childList: true, characterData: true, subtree: true });
@@ -1076,9 +1088,14 @@
       var context = pageContext();
       var text = fillText(TEXT.teaser, context) || fillText(TEXT.teaserFallback, context);
       if (!text || teaser) return;
-      if (document.visibilityState === 'hidden' && TEXT.tabAlert && !store.get('prompted')) {
-        teaserWaiting = true;
-        return flagTab();
+      // Away: only a teaser that could be shown here flags the tab, so it never promises one
+      // that won't appear (privacy or contact pages, closed, details already sent).
+      if (document.visibilityState === 'hidden') {
+        if (TEXT.tabAlert && promptRules()) {
+          teaserWaiting = true;
+          flagTab();
+        }
+        return;
       }
       if (!promptAllowed()) return;
       store.set('prompted', '1');
