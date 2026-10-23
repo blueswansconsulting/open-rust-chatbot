@@ -221,7 +221,8 @@
 .orc-teaser {
   position: absolute; right: 0; bottom: 76px;
   display: flex; align-items: stretch; gap: 0;
-  max-width: min(280px, calc(100vw - 2rem));
+  /* Its own width, not the 64px launcher column it is positioned in. */
+  width: max-content; max-width: min(280px, calc(100vw - 2rem)); box-sizing: border-box;
   background: #FFFFFF; color: #1A2540; border: 1px solid #E3E8EF; border-radius: 14px 14px 4px 14px;
   box-shadow: 0 10px 28px rgba(10, 37, 64, 0.18);
   padding: 0 0 0 0.75rem;
