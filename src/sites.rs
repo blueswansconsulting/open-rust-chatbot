@@ -134,7 +134,7 @@ impl Site {
                 "title": null, "subtitle": null, "greeting": null, "placeholder": null, "privacyUrl": null,
                 "avatar": null, "avatarMotion": null,
                 "attention": null, "teaser": null, "teaserFallback": null, "label": null,
-                "tabAlert": false,
+                "tabAlert": false, "replySound": false,
             }),
             partner_id: None,
             caps: SpendCaps::default(),
@@ -244,6 +244,8 @@ struct BotRecord {
     label: Option<String>,
     #[serde(default)]
     tab_alert: bool,
+    #[serde(default)]
+    reply_sound: bool,
     #[serde(default)]
     allowed_origins: Vec<String>,
     #[serde(default)]
@@ -985,6 +987,7 @@ impl SiteStore {
                 "teaserFallback": prompt_text(record.teaser_fallback, 120),
                 "label": prompt_text(record.label, 30),
                 "tabAlert": record.tab_alert,
+                "replySound": record.reply_sound,
             }),
             bot_name,
             partner_id,
