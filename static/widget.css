@@ -56,6 +56,14 @@
   cursor: pointer; line-height: 1; padding: 0 4px; opacity: 0.85;
 }
 .orc-close:hover { opacity: 1; }
+.orc-mute {
+  background: transparent; border: 0; color: #FFFFFF; cursor: pointer; opacity: 0.85;
+  width: 32px; height: 32px; padding: 6px; border-radius: 8px; display: grid; place-items: center;
+}
+.orc-mute[hidden] { display: none; }
+.orc-mute svg { width: 20px; height: 20px; display: block; }
+.orc-mute:hover { opacity: 1; background: rgba(255, 255, 255, 0.12); }
+.orc-mute:focus-visible { outline: 2px solid #FFFFFF; outline-offset: 2px; }
 
 .orc-messages {
   flex: 1; overflow-y: auto; padding: 1rem;

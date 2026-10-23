@@ -4,7 +4,7 @@
  * Optional config, set before the script tag:
  *   window.openRustChatbot = { title, subtitle, greeting, placeholder, serverUrl, turnstileToken,
  *                              avatar, avatarMotion, attention, teaser, teaserFallback, label,
- *                              tabAlert };
+ *                              tabAlert, replySound };
  * serverUrl may include a path when the server is behind a sub-path, e.g. https://example.com/chat
  * Any of title, subtitle, greeting, placeholder and privacyUrl left out are read once from
  * <base>/config when the server provides it (multi-site mode); options set here always win.
@@ -15,6 +15,9 @@
  * page's schema.org data; teaserFallback is used when the page has neither.
  * tabAlert: true sets the page title to "(1) New message · <title>" when a teaser or reply arrives
  * while the visitor is on another tab, and puts it back when they return.
+ * replySound: true plays a short, soft chime when a reply arrives while the visitor is on another tab,
+ * only once they have clicked or typed in the chat (browsers allow sound only then), at most once a
+ * minute, with a mute button in the header that is remembered.
  * turnstileToken may be a string or a function returning a fresh token (or a Promise of one);
  * Turnstile tokens are single-use, so use a function if the visitor may reconnect.
  *
@@ -86,6 +89,7 @@
     TEXT.avatar = typeof avatar === 'string' && avatar !== 'none' && AVATAR_NAME.test(avatar) ? avatar : null;
     var motion = options.avatarMotion || remote.avatarMotion;
     TEXT.avatarMotion = MOTIONS.indexOf(motion) >= 0 ? motion : 'still';
+    TEXT.replySound = options.replySound !== undefined ? options.replySound === true : remote.replySound === true;
     TEXT.tabAlert = options.tabAlert !== undefined ? options.tabAlert === true : remote.tabAlert === true;
     var attention = options.attention || remote.attention;
     TEXT.attention = ATTENTION.indexOf(attention) >= 0 ? attention : 'off';
@@ -463,6 +467,40 @@
     closeBtn.type = 'button';
     closeBtn.setAttribute('aria-label', 'Close chat');
     header.appendChild(headerText);
+    // Shown only for bots with the reply sound on; the choice is remembered in this browser.
+    var muteBtn = el('button', 'orc-mute');
+    muteBtn.type = 'button';
+    muteBtn.hidden = true;
+    function speakerIcon(muted) {
+      var ns = 'http://www.w3.org/2000/svg';
+      var svg = document.createElementNS(ns, 'svg');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('aria-hidden', 'true');
+      var body = document.createElementNS(ns, 'path');
+      body.setAttribute('d', 'M4 9v6h4l5 4V5L8 9H4z');
+      body.setAttribute('fill', 'currentColor');
+      svg.appendChild(body);
+      var mark = document.createElementNS(ns, 'path');
+      mark.setAttribute('d', muted ? 'M16 9l5 6M21 9l-5 6' : 'M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12');
+      mark.setAttribute('fill', 'none');
+      mark.setAttribute('stroke', 'currentColor');
+      mark.setAttribute('stroke-width', '2');
+      mark.setAttribute('stroke-linecap', 'round');
+      svg.appendChild(mark);
+      return svg;
+    }
+    function showMuted() {
+      var muted = sound.muted();
+      muteBtn.textContent = '';
+      muteBtn.appendChild(speakerIcon(muted));
+      muteBtn.setAttribute('aria-pressed', muted ? 'true' : 'false');
+      muteBtn.setAttribute('aria-label', 'Mute chat sounds');
+    }
+    muteBtn.addEventListener('click', function () {
+      sound.setMuted(!sound.muted());
+      showMuted();
+    });
+    header.appendChild(muteBtn);
     header.appendChild(closeBtn);
 
     var messages = el('div', 'orc-messages');
@@ -675,6 +713,7 @@
         setWaiting(false);
         saveTranscript();
         flagTab();
+        sound.chime();
       } else if (frame.type === 'error') {
         current = null;
         setWaiting(false);
@@ -1046,6 +1085,67 @@
     }, 120000);
     window.addEventListener('resize', liftAboveBars);
 
+    // ---- Reply sound ----------------------------------------------------------------------
+    // Browsers allow sound only after the visitor has clicked or typed on the page, so the audio
+    // is unlocked by their first click or keypress in the chat, never by the teaser.
+    var sound = {
+      ctx: null,
+      last: 0,
+      muted: function () {
+        try {
+          return localStorage.getItem('orc-muted') === '1';
+        } catch (e) {
+          return true;
+        }
+      },
+      setMuted: function (on) {
+        try {
+          if (on) localStorage.setItem('orc-muted', '1');
+          else localStorage.removeItem('orc-muted');
+        } catch (e) {}
+      },
+      unlock: function () {
+        if (!TEXT.replySound || sound.ctx) return;
+        var Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        try {
+          sound.ctx = new Ctx();
+          if (sound.ctx.resume) sound.ctx.resume();
+        } catch (e) {
+          sound.ctx = null;
+        }
+      },
+      // Two soft notes, about a third of a second in all.
+      chime: function () {
+        var ctx = sound.ctx;
+        var now = Date.now();
+        if (!TEXT.replySound || !ctx || sound.muted() || document.visibilityState !== 'hidden') return;
+        if (now - sound.last < 60000) return;
+        sound.last = now;
+        try {
+          [[659.25, 0], [880, 0.14]].forEach(function (note) {
+            var osc = ctx.createOscillator();
+            var gain = ctx.createGain();
+            var t = ctx.currentTime + note[1];
+            osc.type = 'sine';
+            osc.frequency.value = note[0];
+            gain.gain.setValueAtTime(0.0001, t);
+            gain.gain.exponentialRampToValueAtTime(0.08, t + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(t);
+            osc.stop(t + 0.2);
+          });
+        } catch (e) {}
+      },
+    };
+    ['pointerdown', 'keydown'].forEach(function (type) {
+      root.addEventListener(type, function (e) {
+        if (e.isTrusted && e.key !== 'Escape') sound.unlock();
+      });
+    });
+
     // ---- Tab title ------------------------------------------------------------------------
     // One steady change (no flashing) while the visitor is on another tab, put back as soon as
     // they return. If the site changes its own title meanwhile, that becomes the one to restore.
@@ -1274,6 +1374,8 @@
       input.setAttribute('aria-label', TEXT.placeholder);
       showPrivacyLink();
       showAvatar();
+      muteBtn.hidden = !TEXT.replySound;
+      if (TEXT.replySound) showMuted();
       settingsReady = true;
       armAttention();
       if (greetingNode && greetingNode.textContent === oldGreeting && messages.lastChild === greetingNode) {

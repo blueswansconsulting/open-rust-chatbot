@@ -413,6 +413,7 @@ async fn config_is_public_cacheable_json() {
             "teaserFallback": null,
             "label": null,
             "tabAlert": false,
+            "replySound": false,
         })
     );
     let avail = reqwest::get(format!("http://{}/b/alpha/availability", h.addr))
@@ -991,6 +992,7 @@ async fn partner_details_never_reach_the_public_config() {
             "label",
             "placeholder",
             "privacyUrl",
+            "replySound",
             "subtitle",
             "tabAlert",
             "teaser",
