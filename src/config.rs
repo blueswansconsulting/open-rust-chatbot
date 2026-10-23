@@ -319,13 +319,20 @@ impl Config {
                     &mut errors,
                 )),
                 max_cache_bytes: {
-                    let bytes = env
-                        .num::<usize>("SITES_CACHE_MAX_MB", 96, &mut errors)
-                        .saturating_mul(1024 * 1024);
-                    if let Err(e) = cache_fits(bytes, container_memory_limit()) {
-                        errors.push(e);
+                    let limit = container_memory_limit();
+                    match env.get("SITES_CACHE_MAX_MB") {
+                        // Unset: a default that always fits the container it runs in.
+                        None => default_cache_bytes(limit),
+                        Some(_) => {
+                            let bytes = env
+                                .num::<usize>("SITES_CACHE_MAX_MB", 96, &mut errors)
+                                .saturating_mul(1024 * 1024);
+                            if let Err(e) = cache_fits(bytes, limit) {
+                                errors.push(e);
+                            }
+                            bytes
+                        }
                     }
-                    bytes
                 },
             }
         });
@@ -954,17 +961,33 @@ mod tests {
     }
 }
 
+const CGROUP_LIMIT_FILES: [&str; 2] = [
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+];
+
 /// The container's memory limit, from cgroup v2 (`memory.max`) or v1, when there is one.
 fn container_memory_limit() -> Option<usize> {
-    [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .iter()
-    .find_map(|path| std::fs::read_to_string(path).ok())
-    .and_then(|v| v.trim().parse::<usize>().ok())
-    // cgroup v1 reports "no limit" as a huge number.
-    .filter(|&v| v < (1usize << 50))
+    CGROUP_LIMIT_FILES
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .and_then(|v| parse_memory_limit(&v))
+}
+
+/// A cgroup memory limit file's value: "max" (v2) and v1's huge number both mean no limit.
+fn parse_memory_limit(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|&v| v < (1usize << 50))
+}
+
+/// 96 MB, or half the container's memory if that is less, so an unset cache always leaves
+/// room for everything else.
+fn default_cache_bytes(limit: Option<usize>) -> usize {
+    let default = 96 * 1024 * 1024;
+    limit.map_or(default, |l| default.min(l / 2))
 }
 
 /// The bot cache must leave room for everything else in the container (sockets, replies,
@@ -972,9 +995,10 @@ fn container_memory_limit() -> Option<usize> {
 fn cache_fits(cache_bytes: usize, limit: Option<usize>) -> Result<(), String> {
     match limit {
         Some(limit) if cache_bytes > limit / 4 * 3 => Err(format!(
-            "SITES_CACHE_MAX_MB ({} MB) is more than three quarters of this container's memory ({} MB); lower it or raise the memory limit",
+            "SITES_CACHE_MAX_MB ({} MB) is more than three quarters of this container's memory ({} MB, from {}); lower it or raise the memory limit",
             cache_bytes / (1024 * 1024),
-            limit / (1024 * 1024)
+            limit / (1024 * 1024),
+            CGROUP_LIMIT_FILES.join(" or ")
         )),
         _ => Ok(()),
     }
@@ -982,7 +1006,7 @@ fn cache_fits(cache_bytes: usize, limit: Option<usize>) -> Result<(), String> {
 
 #[cfg(test)]
 mod cache_limit_tests {
-    use super::cache_fits;
+    use super::{cache_fits, default_cache_bytes, parse_memory_limit};
 
     const MB: usize = 1024 * 1024;
 
@@ -1000,6 +1024,32 @@ mod cache_limit_tests {
         assert!(
             cache_fits(256 * MB, None).is_ok(),
             "no limit known: nothing to check"
+        );
+    }
+
+    #[test]
+    fn an_unset_cache_always_fits_the_container() {
+        assert_eq!(default_cache_bytes(None), 96 * MB);
+        assert_eq!(default_cache_bytes(Some(192 * MB)), 96 * MB);
+        assert_eq!(default_cache_bytes(Some(120 * MB)), 60 * MB);
+        assert_eq!(default_cache_bytes(Some(64 * MB)), 32 * MB);
+        for limit in [64, 96, 120, 128, 192, 512] {
+            assert!(cache_fits(default_cache_bytes(Some(limit * MB)), Some(limit * MB)).is_ok());
+        }
+    }
+
+    #[test]
+    fn cgroup_limit_files_are_read_as_written() {
+        assert_eq!(parse_memory_limit("201326592\n"), Some(192 * MB));
+        assert_eq!(
+            parse_memory_limit("max\n"),
+            None,
+            "cgroup v2 without a limit"
+        );
+        assert_eq!(
+            parse_memory_limit("9223372036854771712"),
+            None,
+            "cgroup v1 without a limit"
         );
     }
 }
