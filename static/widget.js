@@ -1012,8 +1012,9 @@
           var pos = window.getComputedStyle(n).position;
           if (pos !== 'fixed' && pos !== 'sticky') continue;
           var r = n.getBoundingClientRect();
-          // Only a bar along the bottom, not a full-screen overlay or a side panel.
-          if (r.bottom >= window.innerHeight - 8 && r.top > window.innerHeight * 0.3) return r.top;
+          // Only a bar along the bottom (floating banners leave a small gap below them), not a
+          // full-screen overlay or a side panel.
+          if (r.bottom >= window.innerHeight - 48 && r.top > window.innerHeight * 0.3) return r.top;
         }
       }
       return null;
