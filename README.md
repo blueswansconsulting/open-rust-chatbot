@@ -140,7 +140,7 @@ single-site settings above work exactly as before.
 | `SITES_CACHE_SECONDS` | Default 30. A fetched bot is reused for this long. |
 | `SITES_STALE_SECONDS` | Default 600. While the sites API is unreachable the last good copy is served this long, then `503`. |
 | `SITES_PARTNER_STALE_SECONDS` | Default 60. The same limit for bots that carry a `partnerId`, so disabling a partner takes effect quickly. |
-| `SITES_CACHE_MAX_MB` | Default 256. Approximate memory for cached bots; the least recently used bots are dropped first. |
+| `SITES_CACHE_MAX_MB` | Default 96, or half the container's memory if that is less. Approximate memory for cached bots, counted as parsed (several times the markdown); the least recently used bots are dropped first. Must be at most three quarters of the container's memory, or the server refuses to start. |
 | `USAGE_TOKEN` | Optional, at least 32 characters and different from `INTERNAL_API_TOKEN`. Turns on usage reporting (below). |
 | `USAGE_API_URL` | Where usage is sent. Default: `SITES_API_URL` with its trailing `/bots` replaced by `/usage`. |
 | `USAGE_FLUSH_SECONDS` | Default 60. How often usage is sent. |

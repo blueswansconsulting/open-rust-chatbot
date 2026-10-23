@@ -919,10 +919,6 @@ impl SiteStore {
         listings: Option<Arc<Listings>>,
     ) -> Site {
         let version_key = record.version_key();
-        let size = record.knowledge_base.len() * 3
-            + record.instructions.as_deref().map_or(0, str::len)
-            + listings.as_ref().map_or(0, |l| l.approx_bytes())
-            + 4096;
         let bot_name = non_empty(record.bot_name)
             .or_else(|| non_empty(record.name.clone()))
             .unwrap_or_else(|| "Assistant".into());
@@ -959,6 +955,13 @@ impl SiteStore {
         let prompt_text = |text: Option<String>, max: usize| attention.and(short_text(text, max));
         let kb =
             kb.unwrap_or_else(|| Arc::new(KnowledgeBase::from_markdown(&record.knowledge_base)));
+        // What this bot really holds in memory (the parsed knowledge base is several times its
+        // markdown), so the cache evicts before the container runs out.
+        let size = kb.approx_bytes()
+            + record.knowledge_base.len()
+            + system_prompt.len()
+            + listings.as_ref().map_or(0, |l| l.approx_bytes())
+            + 4096;
         let own_urls: Vec<&str> = allowed_origins
             .iter()
             .map(String::as_str)

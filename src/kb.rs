@@ -10,12 +10,48 @@ pub struct KnowledgeChunk {
     header_tokens: Vec<String>,
 }
 
+impl KnowledgeChunk {
+    fn approx_bytes(&self) -> usize {
+        let s = |v: &String| STRING + v.len();
+        std::mem::size_of::<KnowledgeChunk>()
+            + s(&self.id)
+            + s(&self.text)
+            + self.header_path.iter().map(s).sum::<usize>()
+            + self.tokens.iter().map(s).sum::<usize>()
+            + self.header_tokens.iter().map(s).sum::<usize>()
+    }
+}
+
+/// A heap `String` costs its header plus the allocator's per-allocation overhead.
+const STRING: usize = std::mem::size_of::<String>() + 16;
+
 pub struct KnowledgeBase {
     chunks: Vec<KnowledgeChunk>,
     /// Inverse document frequency per token: rare words (place names, "eicr") count for more.
     idf: std::collections::HashMap<String, f64>,
     /// What the links and emails in the text allow a reply to carry (see `LinkPolicy::allowed_in`).
     link_hosts: Vec<String>,
+}
+
+impl KnowledgeBase {
+    /// Roughly how much memory this knowledge base holds once parsed: every token is its own
+    /// heap string, so this is several times the markdown it came from.
+    pub fn approx_bytes(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(KnowledgeChunk::approx_bytes)
+            .sum::<usize>()
+            + self
+                .idf
+                .keys()
+                .map(|k| STRING + k.len() + 8 + 16)
+                .sum::<usize>()
+            + self
+                .link_hosts
+                .iter()
+                .map(|h| STRING + h.len())
+                .sum::<usize>()
+    }
 }
 
 const DEFAULT_CHUNK_WORDS: usize = 512;
@@ -883,5 +919,25 @@ We keep enquiry details for as long as needed and no longer than six years.\n";
         assert!(kb.retrieve("the and of to it is").is_empty());
         assert!(kb.retrieve("日本語 العربية 😀").is_empty());
         assert_eq!(kb.retrieve(&"leeds ".repeat(5000)).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::KnowledgeBase;
+
+    #[test]
+    fn the_memory_estimate_reflects_the_parsed_size_not_the_markdown() {
+        let page =
+            "## Rewires in Bolton\n\nWe rewire houses and flats across Bolton, Bury and Wigan, \
+            with EICR testing, consumer unit upgrades and emergency call-outs. ";
+        let markdown: String = (0..800)
+            .map(|i| format!("# Page {i}\n\n{page}\n\n"))
+            .collect();
+        let kb = KnowledgeBase::from_markdown(&markdown);
+        let ratio = kb.approx_bytes() as f64 / markdown.len() as f64;
+        // Measured with a counting allocator at about 7x for real directory pages.
+        assert!(ratio > 4.0, "estimate is only {ratio:.1}x the markdown");
+        assert!(ratio < 20.0, "estimate is {ratio:.1}x the markdown");
     }
 }
