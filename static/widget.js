@@ -3,7 +3,8 @@
  * Embed:  <script src="https://chat.example.com/widget.js" defer></script>
  * Optional config, set before the script tag:
  *   window.openRustChatbot = { title, subtitle, greeting, placeholder, serverUrl, turnstileToken,
- *                              avatar, avatarMotion, attention, teaser, teaserFallback, label };
+ *                              avatar, avatarMotion, attention, teaser, teaserFallback, label,
+ *                              tabAlert };
  * serverUrl may include a path when the server is behind a sub-path, e.g. https://example.com/chat
  * Any of title, subtitle, greeting, placeholder and privacyUrl left out are read once from
  * <base>/config when the server provides it (multi-site mode); options set here always win.
@@ -12,6 +13,8 @@
  * attention is 'off' (default), 'teaser' (a one-line bubble beside the button), 'label' (the button
  * briefly widens to show `label`) or 'both'. teaser may use {town} and {service}, read from the
  * page's schema.org data; teaserFallback is used when the page has neither.
+ * tabAlert: true sets the page title to "(1) New message · <title>" when a teaser or reply arrives
+ * while the visitor is on another tab, and puts it back when they return.
  * turnstileToken may be a string or a function returning a fresh token (or a Promise of one);
  * Turnstile tokens are single-use, so use a function if the visitor may reconnect.
  *
@@ -83,6 +86,7 @@
     TEXT.avatar = typeof avatar === 'string' && avatar !== 'none' && AVATAR_NAME.test(avatar) ? avatar : null;
     var motion = options.avatarMotion || remote.avatarMotion;
     TEXT.avatarMotion = MOTIONS.indexOf(motion) >= 0 ? motion : 'still';
+    TEXT.tabAlert = options.tabAlert !== undefined ? options.tabAlert === true : remote.tabAlert === true;
     var attention = options.attention || remote.attention;
     TEXT.attention = ATTENTION.indexOf(attention) >= 0 ? attention : 'off';
     [['teaser', 120], ['teaserFallback', 120], ['label', 30]].forEach(function (entry) {
@@ -670,6 +674,7 @@
         current = null;
         setWaiting(false);
         saveTranscript();
+        flagTab();
       } else if (frame.type === 'error') {
         current = null;
         setWaiting(false);
@@ -927,6 +932,8 @@
       store.set('prompted', '1');
       hideTeaser();
       hideLabel();
+      teaserWaiting = false;
+      clearTab();
       if (typeof liftAboveBars === 'function') liftAboveBars();
       bubble.setAttribute('aria-expanded', 'true');
       bubble.setAttribute('aria-label', 'Close chat');
@@ -1035,10 +1042,45 @@
     }, 120000);
     window.addEventListener('resize', liftAboveBars);
 
+    // ---- Tab title ------------------------------------------------------------------------
+    // One steady change (no flashing) while the visitor is on another tab, put back as soon as
+    // they return. If the site changes its own title meanwhile, that becomes the one to restore.
+    var tabTitle = null;
+    var titleWatch = null;
+    var PREFIX = '(1) New message · ';
+    function flagTab() {
+      if (!TEXT.tabAlert || document.visibilityState !== 'hidden' || tabTitle !== null) return;
+      tabTitle = document.title;
+      document.title = PREFIX + tabTitle;
+      var node = document.querySelector('title');
+      if (node && window.MutationObserver) {
+        titleWatch = new MutationObserver(function () {
+          if (tabTitle === null || document.title.indexOf(PREFIX) === 0) return;
+          tabTitle = document.title;
+          document.title = PREFIX + tabTitle;
+        });
+        titleWatch.observe(node, { childList: true, characterData: true, subtree: true });
+      }
+    }
+    function clearTab() {
+      if (titleWatch) titleWatch.disconnect();
+      titleWatch = null;
+      if (tabTitle === null) return;
+      if (document.title.indexOf(PREFIX) === 0) document.title = tabTitle;
+      tabTitle = null;
+    }
+    // A teaser due while the visitor was away waits for them, with the tab title saying so.
+    var teaserWaiting = false;
+
     function showTeaser() {
       var context = pageContext();
       var text = fillText(TEXT.teaser, context) || fillText(TEXT.teaserFallback, context);
-      if (!text || teaser || !promptAllowed()) return;
+      if (!text || teaser) return;
+      if (document.visibilityState === 'hidden' && TEXT.tabAlert && !store.get('prompted')) {
+        teaserWaiting = true;
+        return flagTab();
+      }
+      if (!promptAllowed()) return;
       store.set('prompted', '1');
       hideLabel();
       teaser = el('div', 'orc-teaser');
@@ -1187,6 +1229,13 @@
       }
     });
     document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') {
+        clearTab();
+        if (teaserWaiting) {
+          teaserWaiting = false;
+          showTeaser();
+        }
+      }
       if (document.visibilityState === 'visible' && !outage && Date.now() - lastCheckAt > 15000) watchHealth(true);
     });
 

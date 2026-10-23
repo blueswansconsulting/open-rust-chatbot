@@ -412,6 +412,7 @@ async fn config_is_public_cacheable_json() {
             "teaser": null,
             "teaserFallback": null,
             "label": null,
+            "tabAlert": false,
         })
     );
     let avail = reqwest::get(format!("http://{}/b/alpha/availability", h.addr))
@@ -498,6 +499,7 @@ async fn attention_prompts_are_one_short_plain_line_and_off_unless_asked_for() {
     assert_eq!(v["teaser"], "Need an electrician in {town}?");
     assert_eq!(v["teaserFallback"], "Need an electrician?");
     assert_eq!(v["label"], "Get a call back");
+    assert_eq!(v["tabAlert"], false, "off unless the bot asks for it");
 
     // Too long is left out rather than cut mid-sentence; an unknown mode turns prompts off.
     let mut b = bot("at-long", ALPHA_ORIGIN, "# x\n\ny", "Long");
@@ -990,6 +992,7 @@ async fn partner_details_never_reach_the_public_config() {
             "placeholder",
             "privacyUrl",
             "subtitle",
+            "tabAlert",
             "teaser",
             "teaserFallback",
             "title"

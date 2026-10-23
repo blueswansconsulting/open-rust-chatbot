@@ -745,3 +745,55 @@ await run('with both, the teaser waits until well after the label', async (page)
   await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 15000 });
   assert.equal(await page.locator('.orc-bubble-labelled').count(), 0);
 });
+
+// Playwright pages are always visible, so the tests switch the page's visibility by hand.
+async function setHidden(page, hidden) {
+  await page.evaluate((h) => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (h ? 'hidden' : 'visible') });
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => h });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+}
+
+await run('away on another tab, the title says there is a message, the teaser waits, and both are put back on return', async (page) => {
+  await startServer();
+  await hostPage(page, '/electricians/bolton', { ...teaserOpts, tabAlert: true });
+  assert.equal(await page.title(), 'host');
+  await setHidden(page, true);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForFunction(() => document.title === '(1) New message · host', null, { timeout: 15000 });
+  assert.equal(await page.locator('[data-testid=orc-teaser]').count(), 0, 'not shown to nobody');
+  // The site changing its own title while we're away becomes the title to restore.
+  await page.evaluate(() => (document.title = 'Bolton electricians'));
+  await page.waitForFunction(() => document.title === '(1) New message · Bolton electricians');
+  await setHidden(page, false);
+  assert.equal(await page.title(), 'Bolton electricians');
+  await page.waitForSelector('[data-testid=orc-teaser]', { timeout: 3000 });
+});
+
+await run('a reply that arrives while the visitor is away flags the tab', async (page) => {
+  await startServer(300);
+  // The built-in demo page, so the chat socket can connect (a routed test page can't).
+  await page.addInitScript(() => {
+    window.openRustChatbot = { tabAlert: true };
+  });
+  await page.goto(BASE + '/');
+  await page.waitForSelector('[data-testid=orc-bubble]', { state: 'visible', timeout: 5000 });
+  const original = await page.title();
+  await page.click('[data-testid=orc-bubble]');
+  await page.fill('.orc-input', 'Hello there');
+  await page.press('.orc-input', 'Enter');
+  await setHidden(page, true);
+  await page.waitForFunction(() => document.title.startsWith('(1) New message · '), null, { timeout: 15000 });
+  await setHidden(page, false);
+  assert.equal(await page.title(), original);
+});
+
+await run('the tab title is left alone unless the site turns the alert on', async (page) => {
+  await startServer(300);
+  await hostPage(page, '/electricians/bolton', teaserOpts);
+  await setHidden(page, true);
+  await page.mouse.wheel(0, 2000);
+  await page.waitForTimeout(1500);
+  assert.equal(await page.title(), 'host');
+});
