@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Base images are pinned by digest; Dependabot keeps them current.
-FROM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS build
+FROM rust:1.100-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
